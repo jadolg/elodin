@@ -144,10 +144,7 @@ test_replies_from_a_zone_below_an_empty_non_terminal_validate :: proc(t: ^testin
 		{"en_nx", "nx.deep.mid.entest.", "an NXDOMAIN proven by"},
 	}
 	for c in cases {
-		v := scenario_validator(&ENT_FIXTURES, ENT_ANCHOR)
-		defer destroy_validator(v)
-
-		result := validate(v, c.qname, .A, scenario_fixture(ENT_FIXTURES, c.key), fixture_now())
+		result := scenario_validate(&ENT_FIXTURES, c.qname, .A, scenario_fixture(ENT_FIXTURES, c.key), ENT_ANCHOR)
 		testing.expectf(
 			t,
 			result.status == .Secure,

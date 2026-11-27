@@ -5,6 +5,7 @@ import "core:slice"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 Policy coverage: sink lists, block response modes, rewrites and the cache.
@@ -747,7 +748,7 @@ run_cache_cases :: proc(r: ^Runner) {
 	fix := fixture("a")
 	upstream_port := next_port(r)
 	mock := mock_make("cache", upstream_port)
-	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
+	mock_reply(mock, fix.qname, fix.qtype, testkit.unhex(fix.response, context.allocator))
 	mock_reply(mock, "nx.example.com.", u16(dns.Type.A), denial_reply("nx.example.com.", .No_Error, data = false))
 	mock_reply(mock, POISONED_NAME, u16(dns.Type.A), denial_reply(POISONED_NAME, .NX_Domain, data = true))
 	mock_reply(mock, "nosoa.example.com.", u16(dns.Type.A), nil)

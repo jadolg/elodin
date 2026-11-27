@@ -239,32 +239,15 @@ test_nsec_name_error_refuses_an_empty_non_terminal :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-@(test)
-test_nsec_name_error_refuses_a_wildcard_shown_as_a_node :: proc(t: ^testing.T) {
-	// `x.*.example.` exists, so `*.example.` is an empty non-terminal wildcard
-	// and answers `nx.example.` with NODATA (RFC 4592 section 2.2.2).
-	zone := []Nsec_Rr {
-		nsec_rr("example.", "x.*.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
-		nsec_rr("x.*.example.", "a.example.", {.A, .RRSIG, .NSEC}),
-		nsec_rr("a.example.", "example.", {.A, .RRSIG, .NSEC}),
-	}
-	testing.expect(t, nsec_shows_node(zone, "*.example."))
-	testing.expect_value(t, nsec_proves_name_error(zone, "nx.example."), Proof.Failed)
-	free_all(context.temp_allocator)
-}
 
 @(test)
 test_ent_nodata_replayed_as_nxdomain_is_bogus :: proc(t: ^testing.T) {
 	{
-		v := scenario_validator(&EX_FIXTURES, EX_ANCHOR)
-		defer destroy_validator(v)
-		nodata := validate(v, "b.enxtest.", .A, scenario_fixture(EX_FIXTURES, "ex_b_nodata"), fixture_now())
+		nodata := scenario_validate(&EX_FIXTURES, "b.enxtest.", .A, scenario_fixture(EX_FIXTURES, "ex_b_nodata"), EX_ANCHOR)
 		testing.expectf(t, nodata.status == .Secure, "premise: the NODATA should validate, got %v (%q / %q)", nodata.status, nodata.reason, nodata.detail)
 	}
 	{
-		v := scenario_validator(&EX_FIXTURES, EX_ANCHOR)
-		defer destroy_validator(v)
-		nx := validate(v, "b.enxtest.", .A, scenario_fixture(EX_FIXTURES, "ex_b_nx"), fixture_now())
+		nx := scenario_validate(&EX_FIXTURES, "b.enxtest.", .A, scenario_fixture(EX_FIXTURES, "ex_b_nx"), EX_ANCHOR)
 		testing.expectf(t, nx.status == .Bogus, "NXDOMAIN for an existing empty non-terminal: got %v (%q)", nx.status, nx.reason)
 	}
 	free_all(context.temp_allocator)
@@ -273,22 +256,18 @@ test_ent_nodata_replayed_as_nxdomain_is_bogus :: proc(t: ^testing.T) {
 @(test)
 test_wildcard_answer_below_an_empty_non_terminal_is_bogus :: proc(t: ^testing.T) {
 	{
-		v := scenario_validator(&EX_FIXTURES, EX_ANCHOR)
-		defer destroy_validator(v)
-		wild := validate(v, "x.enxtest.", .A, scenario_fixture(EX_FIXTURES, "ex_x_wildcard"), fixture_now())
+		wild := scenario_validate(&EX_FIXTURES, "x.enxtest.", .A, scenario_fixture(EX_FIXTURES, "ex_x_wildcard"), EX_ANCHOR)
 		testing.expectf(t, wild.status == .Secure, "premise: the wildcard answer should validate, got %v (%q / %q)", wild.status, wild.reason, wild.detail)
 	}
 	{
-		v := scenario_validator(&EX_FIXTURES, EX_ANCHOR)
-		defer destroy_validator(v)
-		forged := validate(v, "x.b.enxtest.", .A, scenario_fixture(EX_FIXTURES, "ex_xb_wildcard"), fixture_now())
+		forged := scenario_validate(&EX_FIXTURES, "x.b.enxtest.", .A, scenario_fixture(EX_FIXTURES, "ex_xb_wildcard"), EX_ANCHOR)
 		testing.expectf(t, forged.status == .Bogus, "wildcard answer below an empty non-terminal: got %v (%q)", forged.status, forged.reason)
 	}
 	free_all(context.temp_allocator)
 }
 
 @(test)
-test_nsec_no_data_from_a_wildcard_shown_as_a_node :: proc(t: ^testing.T) {
+test_a_wildcard_shown_as_a_node_proves_nodata_not_nxdomain :: proc(t: ^testing.T) {
 	// `x.*.example.` exists, so `*.example.` is an empty non-terminal wildcard
 	// and `nx.example.` is answered from it with NODATA (RFC 4592 section 2.2.2).
 	zone := []Nsec_Rr {
@@ -298,21 +277,19 @@ test_nsec_no_data_from_a_wildcard_shown_as_a_node :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, nsec_shows_node(zone, "*.example."))
 	testing.expect_value(t, nsec_proves_no_data(zone, "nx.example.", .A), Proof.Proven)
+	// And not NXDOMAIN: the wildcard exists, so the name it answers does too.
+	testing.expect_value(t, nsec_proves_name_error(zone, "nx.example."), Proof.Failed)
 	free_all(context.temp_allocator)
 }
 
 @(test)
 test_empty_non_terminal_wildcard_answers_nodata_not_nxdomain :: proc(t: ^testing.T) {
 	{
-		v := scenario_validator(&EX_FIXTURES, EX_ANCHOR)
-		defer destroy_validator(v)
-		nodata := validate(v, "nx.exwild.", .A, scenario_fixture(EX_FIXTURES, "ex_nx_nodata"), fixture_now())
+		nodata := scenario_validate(&EX_FIXTURES, "nx.exwild.", .A, scenario_fixture(EX_FIXTURES, "ex_nx_nodata"), EX_ANCHOR)
 		testing.expectf(t, nodata.status == .Secure, "NODATA from an empty non-terminal wildcard: got %v (%q / %q)", nodata.status, nodata.reason, nodata.detail)
 	}
 	{
-		v := scenario_validator(&EX_FIXTURES, EX_ANCHOR)
-		defer destroy_validator(v)
-		nx := validate(v, "ny.exwild.", .A, scenario_fixture(EX_FIXTURES, "ex_ny_nx"), fixture_now())
+		nx := scenario_validate(&EX_FIXTURES, "ny.exwild.", .A, scenario_fixture(EX_FIXTURES, "ex_ny_nx"), EX_ANCHOR)
 		testing.expectf(t, nx.status == .Bogus, "NXDOMAIN under an empty non-terminal wildcard: got %v (%q)", nx.status, nx.reason)
 	}
 	free_all(context.temp_allocator)

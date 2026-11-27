@@ -4,6 +4,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 A signed cut below a step the ceiling kept the parent's keys past.
@@ -129,7 +130,7 @@ test_a_signed_cut_below_the_ceiling_is_judged_on_its_own_keys :: proc(t: ^testin
 @(private = "file")
 c3_wrong_child_keys :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	if type == .DNSKEY && dns.name_equal_fold(name, "s.e.c3test.") {
-		return decode_hex(fixture("c3_dnskey", C3_FIXTURES).wire, allocator)
+		return testkit.unhex(fixture("c3_dnskey", C3_FIXTURES).wire, allocator), true
 	}
 	return fixture_answer(C3_FIXTURES, name, type, allocator)
 }

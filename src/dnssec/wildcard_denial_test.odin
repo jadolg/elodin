@@ -467,9 +467,7 @@ wc_reply :: proc(key: string) -> []u8 {
 // Validate `wire` under `WC_ANCHOR`, or the fixture under `key` with `wc_validate`.
 @(private = "file")
 wc_validate_wire :: proc(qname: string, type: dns.Type, wire: []u8) -> Result {
-	v := scenario_validator(&WC_FIXTURES, WC_ANCHOR)
-	defer destroy_validator(v)
-	return validate(v, qname, type, wire, fixture_now())
+	return scenario_validate(&WC_FIXTURES, qname, type, wire, WC_ANCHOR)
 }
 
 @(private = "file")
@@ -783,14 +781,20 @@ verdict with nothing to say for it.
 test_a_broken_chain_keeps_its_detail_past_a_later_rrset :: proc(t: ^testing.T) {
 	evil, eerr := dns.decode_message(wc_reply("wd_evil_answer"), context.temp_allocator)
 	fine, ferr := dns.decode_message(wc_reply("wd_fine_answer"), context.temp_allocator)
-	testing.expect_value(t, eerr, dns.Decode_Error.None)
-	testing.expect_value(t, ferr, dns.Decode_Error.None)
+	if !testing.expect_value(t, eerr, dns.Decode_Error.None) {
+		return
+	}
+	if !testing.expect_value(t, ferr, dns.Decode_Error.None) {
+		return
+	}
 	answer := make([dynamic]dns.Record, 0, len(evil.answer) + len(fine.answer), context.temp_allocator)
 	append(&answer, ..evil.answer)
 	append(&answer, ..fine.answer)
 	evil.answer = answer[:]
 	wire, _, encerr := dns.encode_message(evil, context.temp_allocator, compress = false)
-	testing.expect_value(t, encerr, dns.Encode_Error.None)
+	if !testing.expect_value(t, encerr, dns.Encode_Error.None) {
+		return
+	}
 
 	result := wc_validate_wire("evil.wdtest.", .A, wire)
 
@@ -836,9 +840,7 @@ a DS the root does not have.
 test_a_root_that_matches_no_anchor_says_so :: proc(t: ^testing.T) {
 	// The real anchor's key tag and algorithm, with a digest that is not its key's.
 	stale := ". IN DS 38604 15 2 0000000000000000000000000000000000000000000000000000000000000000"
-	v := scenario_validator(&WC_FIXTURES, stale)
-	defer destroy_validator(v)
-	result := validate(v, "fine.wdtest.", .A, wc_reply("wd_fine_answer"), fixture_now())
+	result := scenario_validate(&WC_FIXTURES, "fine.wdtest.", .A, wc_reply("wd_fine_answer"), stale)
 
 	testing.expect_value(t, result.status, Status.Bogus)
 	testing.expect_value(t, result.reason, BROKEN_CHAIN)
@@ -863,14 +865,18 @@ second chance fails and the verdict is still the CNAME's broken chain.
 @(test)
 test_a_dname_check_does_not_take_the_cnames_detail :: proc(t: ^testing.T) {
 	msg, derr := dns.decode_message(wc_reply("wd_evil_answer"), context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	msg.question[0].name = "x.evil.wdtest."
 	msg.answer = []dns.Record {
 		{name = "x.evil.wdtest.", type = .CNAME, class = .IN, ttl = 3600, data = dns.Rdata_Name{name = "x.evil.other.example."}},
 		{name = "wdtest.", type = .DNAME, class = .IN, ttl = 3600, data = dns.Rdata_Name{name = "other.example."}},
 	}
 	wire, _, encerr := dns.encode_message(msg, context.temp_allocator, compress = false)
-	testing.expect_value(t, encerr, dns.Encode_Error.None)
+	if !testing.expect_value(t, encerr, dns.Encode_Error.None) {
+		return
+	}
 
 	result := wc_validate_wire("x.evil.wdtest.", .A, wire)
 

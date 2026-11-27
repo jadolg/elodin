@@ -6,17 +6,18 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:testkit"
 
 @(private = "file")
 keeper :: proc(secret_hex: string) -> Cookie_Keeper {
 	key: [COOKIE_SECRET_LEN]u8
-	copy(key[:], unhex(secret_hex))
+	copy(key[:], testkit.unhex(secret_hex))
 	return secret_keeper(key)
 }
 
 @(private = "file")
 request :: proc(client_cookie_hex: string, ip: string) -> (req: Cookie_Request) {
-	copy(req.client[:], unhex(client_cookie_hex))
+	copy(req.client[:], testkit.unhex(client_cookie_hex))
 	n, ok := cookie_client_ip(ip, req.ip[:])
 	if !ok {
 		return {}
@@ -35,7 +36,7 @@ test_cookie_rfc9018_a1 :: proc(t: ^testing.T) {
 	k := keeper(RFC9018_SECRET)
 	req := request(RFC9018_CLIENT_COOKIE, RFC9018_CLIENT)
 	got := make_cookie(&k, req, 1559731985)
-	want := unhex("2464c4abcf10c957010000005cf79f111f8130c3eee29480")
+	want := testkit.unhex("2464c4abcf10c957010000005cf79f111f8130c3eee29480")
 	testing.expect(t, mem.compare(got[:], want) == 0, "the server cookie does not match RFC 9018 A.1")
 	free_all(context.temp_allocator)
 }
@@ -46,11 +47,11 @@ test_cookie_rfc9018_a2 :: proc(t: ^testing.T) {
 	k := keeper(RFC9018_SECRET)
 	req := request(RFC9018_CLIENT_COOKIE, RFC9018_CLIENT)
 
-	sent := unhex("2464c4abcf10c957010000005cf79f111f8130c3eee29480")
+	sent := testkit.unhex("2464c4abcf10c957010000005cf79f111f8130c3eee29480")
 	testing.expect(t, verify_cookie(&k, sent, req, 1559734385), "a cookie we issued was rejected")
 
 	got := make_cookie(&k, req, 1559734385)
-	want := unhex("2464c4abcf10c957010000005cf7a871d4a564a1442aca77")
+	want := testkit.unhex("2464c4abcf10c957010000005cf7a871d4a564a1442aca77")
 	testing.expect(t, mem.compare(got[:], want) == 0, "the renewed cookie does not match RFC 9018 A.2")
 	free_all(context.temp_allocator)
 }
@@ -64,14 +65,14 @@ test_cookie_rfc9018_a3_reserved_bytes :: proc(t: ^testing.T) {
 	k := keeper(RFC9018_SECRET)
 	req := request("fc93fc62807ddb86", "203.0.113.203:9999")
 
-	sent := unhex("fc93fc62807ddb8601abcdef5cf78f71a314227b6679ebf5")
+	sent := testkit.unhex("fc93fc62807ddb8601abcdef5cf78f71a314227b6679ebf5")
 	// Checked just after the cookie was minted, so only the hash is under test;
 	// the age this one has in the RFC's narration is a separate matter.
 	testing.expect(t, verify_cookie(&k, sent, req, 1559727985 + 60), "reserved bytes were not hashed as received")
 
 	// What we hand back has them zeroed, as this version requires.
 	got := make_cookie(&k, req, 1559734700)
-	want := unhex("fc93fc62807ddb86010000005cf7a9acf73a7810aca2381e")
+	want := testkit.unhex("fc93fc62807ddb86010000005cf7a9acf73a7810aca2381e")
 	testing.expect(t, mem.compare(got[:], want) == 0, "the renewed cookie does not match RFC 9018 A.3")
 	free_all(context.temp_allocator)
 }
@@ -84,11 +85,11 @@ test_cookie_rfc9018_a4_ipv6 :: proc(t: ^testing.T) {
 	testing.expect_value(t, req.ip_len, 16)
 
 	got := make_cookie(&k, req, 1559741961)
-	want := unhex("22681ab97d52c298010000005cf7c609a6bb79d16625507a")
+	want := testkit.unhex("22681ab97d52c298010000005cf7c609a6bb79d16625507a")
 	testing.expect(t, mem.compare(got[:], want) == 0, "the server cookie does not match RFC 9018 A.4")
 
 	// Issued under a secret this keeper does not hold.
-	stale := unhex("22681ab97d52c298010000005cf7c57926556bd0934c72f8")
+	stale := testkit.unhex("22681ab97d52c298010000005cf7c57926556bd0934c72f8")
 	testing.expect(t, !verify_cookie(&k, stale, req, 1559741961), "a cookie from a retired secret verified")
 	free_all(context.temp_allocator)
 }
@@ -177,7 +178,7 @@ test_cookie_inspection :: proc(t: ^testing.T) {
 	testing.expect_value(t, no_cookie.verdict, Cookie_Verdict.Absent)
 
 	// Eight bytes is a client cookie on its own: legal, but nothing to check.
-	only_client := inspect_cookie(&k, query_with_cookie(unhex(RFC9018_CLIENT_COOKIE)), client)
+	only_client := inspect_cookie(&k, query_with_cookie(testkit.unhex(RFC9018_CLIENT_COOKIE)), client)
 	testing.expect_value(t, only_client.verdict, Cookie_Verdict.Unproven)
 
 	// Shorter than 8, between 9 and 15, or beyond 40 is malformed (RFC 7873
@@ -278,7 +279,7 @@ response_rcode :: proc(wire: []u8) -> dns.Rcode {
 @(test)
 test_cookie_roundtrip_issues_one :: proc(t: ^testing.T) {
 	client := RFC9018_CLIENT
-	sent := unhex(RFC9018_CLIENT_COOKIE)
+	sent := testkit.unhex(RFC9018_CLIENT_COOKIE)
 	out, ok := roundtrip(t, Roundtrip{cookie = sent, client = client, proto = .UDP})
 	if !testing.expect(t, ok, "no response") {
 		return
@@ -314,7 +315,7 @@ test_cookie_roundtrip_leaves_plain_clients_alone :: proc(t: ^testing.T) {
 test_cookie_roundtrip_disabled :: proc(t: ^testing.T) {
 	out, ok := roundtrip(
 		t,
-		Roundtrip{cookie = unhex(RFC9018_CLIENT_COOKIE), client = RFC9018_CLIENT, proto = .UDP, disabled = true},
+		Roundtrip{cookie = testkit.unhex(RFC9018_CLIENT_COOKIE), client = RFC9018_CLIENT, proto = .UDP, disabled = true},
 	)
 	if !testing.expect(t, ok, "no response") {
 		return
@@ -345,7 +346,7 @@ test_cookie_require_turns_away_unproven_udp :: proc(t: ^testing.T) {
 	client := RFC9018_CLIENT
 	out, ok := roundtrip(
 		t,
-		Roundtrip{cookie = unhex(RFC9018_CLIENT_COOKIE), client = client, proto = .UDP, require = true},
+		Roundtrip{cookie = testkit.unhex(RFC9018_CLIENT_COOKIE), client = client, proto = .UDP, require = true},
 	)
 	if !testing.expect(t, ok, "no response") {
 		return
@@ -389,7 +390,7 @@ test_cookie_require_spares_plain_and_stream_clients :: proc(t: ^testing.T) {
 	// Over TCP the client already proved it can receive at this address.
 	stream, stream_ok := roundtrip(
 		t,
-		Roundtrip{cookie = unhex(RFC9018_CLIENT_COOKIE), client = client, proto = .TCP, require = true},
+		Roundtrip{cookie = testkit.unhex(RFC9018_CLIENT_COOKIE), client = client, proto = .TCP, require = true},
 	)
 	if testing.expect(t, stream_ok, "no response") {
 		testing.expect_value(t, response_rcode(stream), dns.Rcode.No_Error)
@@ -406,11 +407,11 @@ carry one client's cookie out to the next.
 test_cookie_is_not_shared_through_the_cache :: proc(t: ^testing.T) {
 	first, first_ok := roundtrip(
 		t,
-		Roundtrip{cookie = unhex(RFC9018_CLIENT_COOKIE), client = RFC9018_CLIENT, proto = .UDP},
+		Roundtrip{cookie = testkit.unhex(RFC9018_CLIENT_COOKIE), client = RFC9018_CLIENT, proto = .UDP},
 	)
 	second, second_ok := roundtrip(
 		t,
-		Roundtrip{cookie = unhex("fc93fc62807ddb86"), client = "203.0.113.203:9999", proto = .UDP},
+		Roundtrip{cookie = testkit.unhex("fc93fc62807ddb86"), client = "203.0.113.203:9999", proto = .UDP},
 	)
 	if !testing.expect(t, first_ok && second_ok, "no response") {
 		return
@@ -455,7 +456,7 @@ be checked.
 @(test)
 test_cookie_unbindable_address_is_kept_apart :: proc(t: ^testing.T) {
 	k := keeper(RFC9018_SECRET)
-	sent := unhex(RFC9018_CLIENT_COOKIE)
+	sent := testkit.unhex(RFC9018_CLIENT_COOKIE)
 
 	// An unclosed bracket is in here so a bracketed form is: `[::1]` binds as
 	// `::1` does.
@@ -511,7 +512,7 @@ test_cookie_require_refuses_everything_unproven :: proc(t: ^testing.T) {
 test_cookie_require_turns_away_an_unbindable_address :: proc(t: ^testing.T) {
 	out, ok := roundtrip(
 		t,
-		Roundtrip{cookie = unhex(RFC9018_CLIENT_COOKIE), client = "not-an-address", proto = .UDP, require = true},
+		Roundtrip{cookie = testkit.unhex(RFC9018_CLIENT_COOKIE), client = "not-an-address", proto = .UDP, require = true},
 	)
 	if !testing.expect(t, ok, "no response") {
 		return
@@ -535,7 +536,7 @@ test_cookie_require_turns_away_an_unbindable_address :: proc(t: ^testing.T) {
 test_cookie_unbindable_address_is_answered_when_not_required :: proc(t: ^testing.T) {
 	out, ok := roundtrip(
 		t,
-		Roundtrip{cookie = unhex(RFC9018_CLIENT_COOKIE), client = "not-an-address", proto = .UDP},
+		Roundtrip{cookie = testkit.unhex(RFC9018_CLIENT_COOKIE), client = "not-an-address", proto = .UDP},
 	)
 	if !testing.expect(t, ok, "no response") {
 		return
@@ -613,7 +614,7 @@ expect_primed :: proc(t: ^testing.T, out: []u8, rcode: dns.Rcode, client: string
 @(test)
 test_cookie_priming_query :: proc(t: ^testing.T) {
 	client := RFC9018_CLIENT
-	sent := unhex(RFC9018_CLIENT_COOKIE)
+	sent := testkit.unhex(RFC9018_CLIENT_COOKIE)
 
 	out, ok := roundtrip(t, Roundtrip{cookie = sent, client = client, proto = .UDP, questions = 0})
 	if testing.expect(t, ok, "no response") {
@@ -659,7 +660,7 @@ test_cookie_priming_query :: proc(t: ^testing.T) {
 @(test)
 test_cookie_priming_needs_a_cookie_and_no_question :: proc(t: ^testing.T) {
 	client := RFC9018_CLIENT
-	sent := unhex(RFC9018_CLIENT_COOKIE)
+	sent := testkit.unhex(RFC9018_CLIENT_COOKIE)
 	cases := []Roundtrip {
 		{client = client, proto = .UDP, questions = 0},
 		{cookie = sent, client = client, proto = .UDP, questions = 0, disabled = true},
@@ -739,7 +740,7 @@ test_a_previous_secret_is_accepted_and_not_issued :: proc(t: ^testing.T) {
 
 	k := keeper(RFC9018_SECRET)
 	testing.expect(t, !verify_cookie(&k, from_other[:], req, 1_000_000), "the premise: a cookie under another secret verified")
-	copy(k.accepted[:], unhex("000102030405060708090a0b0c0d0e0f"))
+	copy(k.accepted[:], testkit.unhex("000102030405060708090a0b0c0d0e0f"))
 	k.has_accepted = true
 	testing.expect(t, verify_cookie(&k, from_other[:], req, 1_000_000), "a cookie under the previous secret was refused")
 

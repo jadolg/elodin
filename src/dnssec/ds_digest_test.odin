@@ -3,6 +3,7 @@ package dnssec
 import "core:fmt"
 import "core:log"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 
 /*
@@ -265,15 +266,11 @@ test_a_sha1_trust_anchor_is_ignored_beside_a_stronger_one :: proc(t: ^testing.T)
 	}
 	answer := scenario_fixture(DD_FIXTURES, "dd_sha1_answer")
 	{
-		v := scenario_validator(&DD_FIXTURES, DD_ANCHOR_SHA1)
-		defer destroy_validator(v)
-		result := validate(v, "www.ddsha1.", .A, answer, fixture_now())
+		result := scenario_validate(&DD_FIXTURES, "www.ddsha1.", .A, answer, DD_ANCHOR_SHA1)
 		testing.expectf(t, result.status == .Secure, "a SHA-1 anchor alone: got %v (%q / %q)", result.status, result.reason, result.detail)
 	}
 	{
-		v := scenario_validator(&DD_FIXTURES, DD_ANCHOR_SHA1, DD_ANCHOR_WRONG_SHA256)
-		defer destroy_validator(v)
-		result := validate(v, "www.ddsha1.", .A, answer, fixture_now())
+		result := scenario_validate(&DD_FIXTURES, "www.ddsha1.", .A, answer, DD_ANCHOR_SHA1, DD_ANCHOR_WRONG_SHA256)
 		testing.expectf(t, result.status == .Bogus, "a SHA-1 anchor beside a SHA-256 one: got %v (%q)", result.status, result.reason)
 		testing.expectf(t, strings.contains(result.detail, SHA1_DS_IGNORED), "the detail does not say SHA-1 was set aside: %q", result.detail)
 	}
@@ -317,6 +314,9 @@ wrong here.
 */
 @(private = "file")
 dd_supported :: proc() -> bool {
+	// Read under the lock the policy tests change the table under.
+	sync.mutex_lock(&policy_lock)
+	defer sync.mutex_unlock(&policy_lock)
 	probe_algorithms()
 	for digest in ([]u8{DIGEST_SHA1, DIGEST_SHA256, DIGEST_SHA384}) {
 		if !digest_supported(digest) {

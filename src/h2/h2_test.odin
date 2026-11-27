@@ -8,6 +8,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 HPACK tests built on the worked examples in RFC 7541 appendix C, so the codec is
@@ -30,7 +31,7 @@ test_huffman_rfc_examples :: proc(t: ^testing.T) {
 		{"d07abe941054d444a8200595040b8166e082a62d1bff", "Mon, 21 Oct 2013 20:13:21 GMT"},
 	}
 	for c in cases {
-		got, err := huffman_decode(from_hex(c.encoded), context.temp_allocator)
+		got, err := huffman_decode(testkit.unhex(c.encoded), context.temp_allocator)
 		testing.expectf(t, err == .None, "%q failed to decode: %v", c.want, err)
 		testing.expect_value(t, got, c.want)
 	}
@@ -80,12 +81,12 @@ test_decode_rfc_c4_huffman_request_sequence :: proc(t: ^testing.T) {
 	table: Dynamic_Table
 	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
 
-	first, e1 := decode(&table, from_hex("828684418cf1e3c2e5f23a6ba0ab90f4ff"), context.temp_allocator)
+	first, e1 := decode(&table, testkit.unhex("828684418cf1e3c2e5f23a6ba0ab90f4ff"), context.temp_allocator)
 	testing.expectf(t, e1 == .None, "first request failed: %v", e1)
 	testing.expect_value(t, len(first), 4)
 	testing.expect_value(t, first[3].value, "www.example.com")
 
-	second, e2 := decode(&table, from_hex("828684be5886a8eb10649cbf"), context.temp_allocator)
+	second, e2 := decode(&table, testkit.unhex("828684be5886a8eb10649cbf"), context.temp_allocator)
 	testing.expectf(t, e2 == .None, "second request failed: %v", e2)
 	testing.expect_value(t, len(second), 5)
 	// Index 62 refers back to the authority stored by the first request.
@@ -96,7 +97,7 @@ test_decode_rfc_c4_huffman_request_sequence :: proc(t: ^testing.T) {
 
 	third, e3 := decode(
 		&table,
-		from_hex("828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf"),
+		testkit.unhex("828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf"),
 		context.temp_allocator,
 	)
 	testing.expectf(t, e3 == .None, "third request failed: %v", e3)

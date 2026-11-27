@@ -110,8 +110,8 @@ test_a_frame_with_no_room_is_not_built :: proc(t: ^testing.T) {
 		{"opening", opening, "50524920" + "000006040000000000" + "000200000000" + "000004080000000000" + "000f0001"},
 	}
 	for c in fixed {
-		want := from_hex(c.want)
-		testing.expectf(t, want != nil && string(c.frame) == string(want), "%s built as %x", c.name, c.frame)
+		want := testkit.unhex(c.want)
+		testing.expectf(t, string(c.frame) == string(want), "%s built as %x", c.name, c.frame)
 	}
 
 	for end_stream in ([]bool{true, false}) {
@@ -128,8 +128,8 @@ test_a_frame_with_no_room_is_not_built :: proc(t: ^testing.T) {
 			arm(&f, 1, 1)
 			refused_headers = headers_frame(3, chunk, end_stream = end_stream)
 		}
-		want_data := from_hex("000003000100000001616263" if end_stream else "000003000000000001616263")
-		want_headers := from_hex("000003010500000003616263" if end_stream else "000003010400000003616263")
+		want_data := testkit.unhex("000003000100000001616263" if end_stream else "000003000000000001616263")
+		want_headers := testkit.unhex("000003010500000003616263" if end_stream else "000003010400000003616263")
 		testing.expectf(t, string(data) == string(want_data), "DATA built as %x", data)
 		testing.expectf(t, string(headers) == string(want_headers), "HEADERS built as %x", headers)
 		testing.expectf(t, refused_data == nil && refused_headers == nil, "built without room: %x, %x", refused_data, refused_headers)
@@ -236,10 +236,7 @@ test_a_header_list_with_no_room_is_not_decoded :: proc(t: ^testing.T) {
 		{":authority", "www.example.com"},
 	}
 	for hex in ([]string{REQUEST_BLOCK, "828684418cf1e3c2e5f23a6ba0ab90f4ff"}) {
-		block := from_hex(hex)
-		if !testing.expectf(t, block != nil, "cannot read %s", hex) {
-			return
-		}
+		block := testkit.unhex(hex)
 		refusals := 0
 		for run in RUNS {
 			for at in 1 ..= MAX_SWEEP {

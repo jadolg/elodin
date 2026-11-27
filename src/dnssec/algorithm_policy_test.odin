@@ -5,6 +5,7 @@ import "core:sync"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 The algorithm a zone publishes, the algorithm the library will run, and what
@@ -156,10 +157,7 @@ LEGACY_A_SIG ::
 
 @(private = "file")
 raw_record :: proc(name: string, type: dns.Type, rdata_hex: string, allocator: mem.Allocator) -> dns.Record {
-	rdata, ok := decode_hex(rdata_hex, allocator)
-	if !ok {
-		panic("a fixture record is not hex")
-	}
+	rdata := testkit.unhex(rdata_hex, allocator)
 	return dns.Record{name = name, type = type, class = .IN, ttl = CHAIN_TTL, data = dns.Rdata_Raw{data = rdata}}
 }
 
@@ -255,10 +253,7 @@ apex_answer :: proc(zone: string, addr: [4]u8, sigs: []string, allocator: mem.Al
 
 @(private = "file")
 chain_validator :: proc(allocator: mem.Allocator, tamper: ^Tamper = nil) -> ^Validator {
-	digest, ok := decode_hex(ANCHOR_DIGEST, allocator)
-	if !ok {
-		panic("the trust anchor is not hex")
-	}
+	digest := testkit.unhex(ANCHOR_DIGEST, allocator)
 	anchors := make([]Trust_Anchor, 1, allocator)
 	anchors[0] = Trust_Anchor {
 		zone = ".",
@@ -289,7 +284,7 @@ own vectors are 8, 13 and 15 too. Nothing here may refuse any of those, and the
 next fixture added in RSA/SHA-1 will have to take this lock or move the tests
 here onto an algorithm nobody else wants.
 */
-@(private = "file")
+@(private)
 policy_lock: sync.Mutex
 
 // Take the table, and answer whether this build's libcrypto runs RSA/SHA-1 at
@@ -372,10 +367,10 @@ test_the_table_reports_what_the_library_answered :: proc(t: ^testing.T) {
 	defer sync.mutex_unlock(&policy_lock)
 	probe_algorithms()
 
-	data, _ := decode_hex(PROBE_DATA, context.temp_allocator)
+	data := testkit.unhex(PROBE_DATA)
 	for probe in ALGORITHM_PROBES {
-		key, _ := decode_hex(probe.key, context.temp_allocator)
-		signature, _ := decode_hex(probe.signature, context.temp_allocator)
+		key := testkit.unhex(probe.key)
+		signature := testkit.unhex(probe.signature)
 		ran := verify_now(probe.algorithm, key, signature, data, context.temp_allocator) == .Ok
 		testing.expectf(
 			t,
@@ -390,7 +385,7 @@ test_the_table_reports_what_the_library_answered :: proc(t: ^testing.T) {
 
 	for probe in DIGEST_PROBES {
 		out: [64]u8
-		want, _ := decode_hex(probe.want, context.temp_allocator)
+		want := testkit.unhex(probe.want)
 		size := digest_size(probe.digest_type)
 		computed := digest(probe.digest_type, data, out[:size])
 		matched := computed && mem.compare(out[:size], want) == 0
@@ -677,7 +672,7 @@ test_one_refused_ds_does_not_make_a_mixed_delegation_insecure :: proc(t: ^testin
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "migrating.", fixture_now(), context.temp_allocator)
+	status, _, _ := zone_trust(v, &budget, "migrating.", fixture_now(), context.temp_allocator) // lint:allow a Bogus walk establishes nothing; the status is the verdict
 	testing.expectf(
 		t,
 		status == .Bogus,
@@ -790,10 +785,7 @@ test_refused_signatures_cannot_spend_the_verification_budget :: proc(t: ^testing
 	unix := u32(FIXTURE_TIME)
 
 	sig_of :: proc(rdata_hex: string) -> Rrsig {
-		rdata, ok := decode_hex(rdata_hex, context.temp_allocator)
-		if !ok {
-			panic("a fixture signature is not hex")
-		}
+		rdata := testkit.unhex(rdata_hex)
 		sig, err := parse_rrsig(rdata, context.temp_allocator)
 		if err != .None {
 			panic("a fixture signature did not parse")

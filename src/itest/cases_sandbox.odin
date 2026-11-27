@@ -8,6 +8,7 @@ import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 `server.sandbox` on the shipped binary (#417): which layers each mode puts on
@@ -157,7 +158,7 @@ sandbox_hashed_ca_case :: proc(r: ^Runner) {
 	}
 
 	fix := fixture("a")
-	payload := from_hex(fix.response, context.allocator)
+	payload := testkit.unhex(fix.response, context.allocator)
 	defer delete(payload)
 	upstream_port := next_port(r)
 	mock := doh2_mock_make(upstream_port, "/dns-query", payload)

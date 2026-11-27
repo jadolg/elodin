@@ -7,6 +7,7 @@ import "core:strings"
 import "core:sys/posix"
 import "core:time"
 import "elodin:config"
+import "elodin:testkit"
 
 /*
 Command-line behaviour: the checks an operator relies on before a deploy.
@@ -461,7 +462,7 @@ run_shutdown_cases :: proc(r: ^Runner) {
 	f := fixture("a")
 	upstream_port := next_port(r)
 	mock := mock_make("shutdown", upstream_port)
-	mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	if !mock_start_or_skip(r, mock, "shutdown") {
 		return
 	}
@@ -479,7 +480,7 @@ run_shutdown_cases :: proc(r: ^Runner) {
 
 	start_case(r, "signals: only the main thread takes SIGTERM, SIGINT and SIGHUP")
 	{
-		res := query_udp(udp_port, from_hex(f.query))
+		res := query_udp(udp_port, testkit.unhex(f.query))
 		check(r, res.ok, "the server did not answer")
 		main_takes, others, taking, read := threads_taking_signals(srv.process.pid)
 		if check(r, read, "cannot read the server's thread masks") {
@@ -494,7 +495,7 @@ run_shutdown_cases :: proc(r: ^Runner) {
 	{
 		// Answer something first, so the shutdown has a warmed-up server with
 		// its caches populated to take down.
-		res := query_udp(udp_port, from_hex(f.query))
+		res := query_udp(udp_port, testkit.unhex(f.query))
 		check(r, res.ok, "the server did not answer before being asked to stop")
 
 		state, exited := signal_shutdown(&srv, 15 * time.Second)

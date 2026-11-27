@@ -16,7 +16,9 @@ malicious authoritative server for a zone it owns, or anyone on the path to a
 plain UDP upstream who leaves the signed answer alone - would get its own
 unsigned records stamped as authenticated.
 
-The answer itself is genuine in both tests below, so the verdict is `Secure` and
+The answer itself is genuine in the prune tests below
+(`test_unsigned_authority_records_do_not_reach_the_client` and
+`test_a_proven_denial_keeps_its_proof_and_its_soa`), so the verdict is `Secure` and
 stays that way: what is checked here is that the records nobody signed are not
 part of the message that verdict is written onto, and that the ones a client
 cannot do without - the denial, and the SOA it is remembered by - still are.
@@ -227,8 +229,9 @@ The prune keeps a signature by what it says it covers rather than by having been
 the one that verified, so that an algorithm rollover does not lose the signature
 a downstream validator can check. That is the only thing here that leaves
 unchecked, which is why the two things sayable about a signature without
-verifying it are checked: its signer has to lie in the owner's ancestry, and no
-more than `MAX_SIGNATURES_PER_RRSET` are kept for one RRset.
+verifying it are checked: its signer has to be the signer of the signature that
+carried the set, and no more than `MAX_SIGNATURES_PER_RRSET` are kept for one
+RRset.
 
 Without those an attacker who can add records - a zone it owns, or the path to a
 plain UDP upstream - would append as many as it liked at an authenticated owner
@@ -269,12 +272,13 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 	}
 
 	genuine := len(msg.answer)
-	answer := make([dynamic]dns.Record, 0, genuine + 40, context.temp_allocator)
+	answer := make([dynamic]dns.Record, 0, genuine + 48, context.temp_allocator)
 	append(&answer, ..msg.answer)
-	// Thirty-two more, all claiming to cover the answer's A RRset. Half name a
-	// signer inside the owner's ancestry and half name one outside it.
+	// Forty-eight more, all claiming to cover the answer's A RRset: by the
+	// genuine signer, by an ancestor of it, and by a name outside the ancestry.
 	for _ in 0 ..< 16 {
 		append(&answer, forged_rrsig("www.example.com.", "example.com."))
+		append(&answer, forged_rrsig("www.example.com.", "com."))
 		append(&answer, forged_rrsig("www.example.com.", "attacker.example."))
 	}
 	msg.answer = answer[:]
@@ -298,9 +302,11 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 		if serr != .None {
 			continue
 		}
+		// Equality, not ancestry: the forgeries signed by `com.`, above the
+		// genuine signer, are what an ancestry check would keep.
 		testing.expectf(
 			t,
-			dns.name_at_or_below(rec.name, sig.signer),
+			dns.name_equal_fold(sig.signer, "example.com."),
 			"a signature signed by %s survived over an RRset at %s",
 			sig.signer,
 			rec.name,
@@ -414,7 +420,8 @@ forged_like :: proc(real: dns.Record) -> dns.Record {
 }
 
 /*
-Cloudflare's captured NODATA with eight `forged_denial_rrsig`s by `signer`
+Cloudflare's captured NODATA with `MAX_SIGNATURES_PER_RRSET`
+`forged_denial_rrsig`s by `signer`
 planted ahead of everything the zone sent, owned by the first NSEC.
 */
 @(private = "file")
@@ -423,17 +430,17 @@ ad_plant_ahead_of_nsec :: proc(t: ^testing.T, signer: string) -> (wire: []u8, ok
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return nil, false
 	}
-	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 8, context.temp_allocator)
+	authority := make([dynamic]dns.Record, 0, len(msg.authority) + MAX_SIGNATURES_PER_RRSET, context.temp_allocator)
 	for rec in msg.authority {
 		if rec.type != .NSEC {
 			continue
 		}
-		for _ in 0 ..< 8 {
+		for _ in 0 ..< MAX_SIGNATURES_PER_RRSET {
 			append(&authority, forged_denial_rrsig(rec.name, signer))
 		}
 		break
 	}
-	if !testing.expect(t, len(authority) == 8, "the fixture carried no NSEC record, so nothing was planted") {
+	if !testing.expect(t, len(authority) == MAX_SIGNATURES_PER_RRSET, "the fixture carried no NSEC record, so nothing was planted") {
 		return nil, false
 	}
 	append(&authority, ..msg.authority)
@@ -522,53 +529,7 @@ still be the record that verified.
 */
 @(test)
 test_copies_of_the_real_signature_do_not_inherit_its_exemption :: proc(t: ^testing.T) {
-	v := scenario_validator(&FIXTURES)
-	defer destroy_validator(v)
-
-	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
-	if !testing.expect(t, derr == .None, "the fixture did not decode") {
-		return
-	}
-
-	answer := make([dynamic]dns.Record, 0, len(msg.answer) + 40, context.temp_allocator)
-	append(&answer, ..msg.answer)
-	planted := 0
-	for rec in msg.answer {
-		if rec.type != .RRSIG {
-			continue
-		}
-		for _ in 0 ..< 40 {
-			append(&answer, forged_like(rec))
-			planted += 1
-		}
-		break
-	}
-	if !testing.expect(t, planted == 40, "the fixture carried no RRSIG to copy") {
-		return
-	}
-	msg.answer = answer[:]
-
-	out, pruned, pruned_ok := ad_prune(t, v, msg, "www.example.com.", .A)
-	if !pruned_ok {
-		return
-	}
-
-	sigs := 0
-	for rec in pruned.answer {
-		if rec.type == .RRSIG {
-			sigs += 1
-		}
-	}
-	testing.expectf(
-		t,
-		sigs <= MAX_SIGNATURES_PER_RRSET + 1,
-		"%d signatures survived: forgeries copying the real tag and algorithm took the exemption",
-		sigs,
-	)
-	// And the one that matters is still there.
-	after := validate(v, "www.example.com.", .A, out, fixture_now())
-	testing.expectf(t, after.status == .Secure, "the pruned answer no longer validates (%v)", after.status)
-	free_all(context.temp_allocator)
+	expect_copies_capped(t, forged_like, "forgeries copying the real tag and algorithm took the exemption")
 }
 
 /*
@@ -585,6 +546,20 @@ It fires once, and the copies are charged against the cap like anything else.
 */
 @(test)
 test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
+	verbatim :: proc(rec: dns.Record) -> dns.Record {
+		return rec
+	}
+	expect_copies_capped(t, verbatim, "copies of the real one each took the exemption")
+}
+
+/*
+Append 40 `copy_of`s of the answer's first RRSIG and prune: no more than
+`MAX_SIGNATURES_PER_RRSET` plus the exempt one may survive, and the genuine
+signature has to be among them, which the pruned answer validating shows. `why`
+is what a breach means.
+*/
+@(private = "file")
+expect_copies_capped :: proc(t: ^testing.T, copy_of: proc(rec: dns.Record) -> dns.Record, why: string) {
 	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
@@ -595,18 +570,18 @@ test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
 
 	answer := make([dynamic]dns.Record, 0, len(msg.answer) + 40, context.temp_allocator)
 	append(&answer, ..msg.answer)
-	copies := 0
+	planted := 0
 	for rec in msg.answer {
 		if rec.type != .RRSIG {
 			continue
 		}
 		for _ in 0 ..< 40 {
-			append(&answer, rec)
-			copies += 1
+			append(&answer, copy_of(rec))
+			planted += 1
 		}
 		break
 	}
-	if !testing.expect(t, copies == 40, "the fixture carried no RRSIG to copy") {
+	if !testing.expect(t, planted == 40, "the fixture carried no RRSIG to copy") {
 		return
 	}
 	msg.answer = answer[:]
@@ -615,18 +590,18 @@ test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
 	if !pruned_ok {
 		return
 	}
-	sigs := 0
+	sigs := holds_signature_over(pruned.answer, "www.example.com.", .A)
+	testing.expectf(t, sigs <= MAX_SIGNATURES_PER_RRSET + 1, "%d signatures survived: %s", sigs, why)
+	// Every RRSIG left, parseable or not, at any owner: a copy the count above
+	// cannot read is still one the client is handed.
+	left := 0
 	for rec in pruned.answer {
 		if rec.type == .RRSIG {
-			sigs += 1
+			left += 1
 		}
 	}
-	testing.expectf(
-		t,
-		sigs <= MAX_SIGNATURES_PER_RRSET + 1,
-		"%d signatures survived: copies of the real one each took the exemption",
-		sigs,
-	)
+	testing.expectf(t, left <= MAX_SIGNATURES_PER_RRSET + 1, "%d RRSIGs left in the answer: %s", left, why)
+	// And the one that matters is still there.
 	after := validate(v, "www.example.com.", .A, out, fixture_now())
 	testing.expectf(t, after.status == .Secure, "the pruned answer no longer validates (%v)", after.status)
 	free_all(context.temp_allocator)
@@ -722,83 +697,70 @@ chain is about.
 */
 @(test)
 test_chain_walk_reads_only_the_chain :: proc(t: ^testing.T) {
-	cname := dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "target.other.example."},
+	cname := chain_rr("www.brand.example.", .CNAME, "target.other.example.")
+	aaaa := chain_rr("target.other.example.", .AAAA)
+	// An unrelated record of the right type does not answer the question: a
+	// predicate that scanned the section for the type would stop at it.
+	unrelated := chain_rr("x.evil.example.", .AAAA)
+	other_class := chain_rr("target.other.example.", .AAAA)
+	other_class.class = .CH
+	Case :: struct {
+		what:    string,
+		records: []dns.Record,
+		qname:   string,
+		qtype:   dns.Type,
+		shape:   Answer_Shape,
+		// Where the walk ended; "" leaves it unchecked.
+		end:     string,
 	}
-	aaaa := dns.Record {
-		name  = "target.other.example.",
-		type  = .AAAA,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_AAAA{addr = {}},
+	cases := []Case {
+		// The chain reaches the type: an answer, and AD may cover it.
+		{what = "a chain to the type", records = {cname, aaaa}, qname = "www.brand.example.", qtype = .AAAA, shape = .Direct, end = "target.other.example."},
+		{what = "a direct answer", records = {aaaa}, qname = "target.other.example.", qtype = .AAAA, shape = .Direct, end = "target.other.example."},
+		// A name is not the bytes it was written with.
+		{what = "case folded", records = {aaaa}, qname = "TARGET.Other.EXAMPLE.", qtype = .AAAA, shape = .Direct, end = "TARGET.Other.EXAMPLE."},
+		/*
+		The chain stops short: a redirection, and whatever explains the missing
+		type was never checked. Deleting records does not make the answer look
+		more complete either - strip the AAAA and its signature, and a predicate
+		that asked whether a denial had been *claimed* would see nothing to
+		object to. The chain still stops short, which is all this asks.
+		*/
+		{what = "a chain stopping short", records = {cname}, qname = "www.brand.example.", qtype = .AAAA, shape = .Chain_Only, end = "target.other.example."},
+		{what = "an unrelated record beside a short chain", records = {cname, unrelated}, qname = "www.brand.example.", qtype = .AAAA, shape = .Chain_Only, end = "target.other.example."},
+		// Class is part of the question.
+		{what = "the type in another class", records = {cname, other_class}, qname = "www.brand.example.", qtype = .AAAA, shape = .Chain_Only, end = "target.other.example."},
+		{what = "a direct answer in another class", records = {other_class}, qname = "target.other.example.", qtype = .AAAA, shape = .None, end = "target.other.example."},
+		// Nothing addressing the question at all: signed records, wrong name.
+		{what = "only an unrelated record", records = {unrelated}, qname = "www.brand.example.", qtype = .AAAA, shape = .None, end = "www.brand.example."},
+		// A chain that leads somewhere has to start at the name asked about.
+		{what = "a detached chain", records = {chain_rr("other.brand.example.", .CNAME, "target.other.example."), aaaa}, qname = "www.brand.example.", qtype = .AAAA, shape = .None, end = "www.brand.example."},
+		// A CNAME or ANY question is answered by the chain itself.
+		{what = "a CNAME question", records = {cname}, qname = "www.brand.example.", qtype = .CNAME, shape = .Direct, end = "www.brand.example."},
+		{what = "an ANY question", records = {cname}, qname = "www.brand.example.", qtype = .ANY, shape = .Direct, end = "www.brand.example."},
+		// A loop terminates rather than spins, and proves nothing.
+		{what = "a loop", records = {chain_rr("a.brand.example.", .CNAME, "b.brand.example."), chain_rr("b.brand.example.", .CNAME, "a.brand.example.")}, qname = "a.brand.example.", qtype = .AAAA, shape = .None},
 	}
-
-	// The chain reaches the type: an answer, and AD may cover it.
-	shape, end := chain_walk([]dns.Record{cname, aaaa}, "www.brand.example.", .AAAA, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Direct)
-	testing.expect_value(t, end, "target.other.example.")
-
-	/*
-	The chain stops short: a redirection, and whatever explains the missing type
-	was never checked.
-
-	Deleting records does not make the answer look more complete either. This is
-	the direction an on-path attacker reaches for: strip the AAAA and its
-	signature, and a predicate that asked whether a denial had been *claimed*
-	would see nothing to object to. The chain still stops short, which is all
-	this asks.
-	*/
-	shape, end = chain_walk([]dns.Record{cname}, "www.brand.example.", .AAAA, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Chain_Only)
-	testing.expect_value(t, end, "target.other.example.")
-
-	/*
-	An unrelated record of the right type does not answer the question.
-
-	A predicate that scanned the whole section for the type would stop here: an
-	attacker with a signed zone appends `x.evil.example. A`, every RRset
-	verifies, and the guard is talked out of firing by a record with nothing to
-	do with the name asked about.
-	*/
-	unrelated := dns.Record {
-		name  = "x.evil.example.",
-		type  = .AAAA,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_AAAA{addr = {}},
+	for c in cases {
+		shape, end := chain_walk(c.records, c.qname, c.qtype, .IN)
+		testing.expectf(t, shape == c.shape, "%s: shape %v, want %v", c.what, shape, c.shape)
+		if c.end != "" {
+			testing.expectf(t, end == c.end, "%s: ended at %q, want %q", c.what, end, c.end)
+		}
 	}
-	shape, end = chain_walk([]dns.Record{cname, unrelated}, "www.brand.example.", .AAAA, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Chain_Only)
-	testing.expect_value(t, end, "target.other.example.")
-
-	// Nothing addressing the question at all.
-	shape, _ = chain_walk([]dns.Record{unrelated}, "www.brand.example.", .AAAA, .IN)
-	testing.expect_value(t, shape, Answer_Shape.None)
-
-	// A CNAME or ANY question is answered by the chain itself.
-	shape, end = chain_walk([]dns.Record{cname}, "www.brand.example.", .CNAME, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Direct)
-	testing.expect_value(t, end, "www.brand.example.")
-	shape, end = chain_walk([]dns.Record{cname}, "www.brand.example.", .ANY, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Direct)
-	testing.expect_value(t, end, "www.brand.example.")
-
-	// Class is part of the question.
-	other_class := dns.Record {
-		name  = "target.other.example.",
-		type  = .AAAA,
-		class = .CH,
-		ttl   = 60,
-		data  = dns.Rdata_AAAA{addr = {}},
-	}
-	shape, end = chain_walk([]dns.Record{cname, other_class}, "www.brand.example.", .AAAA, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Chain_Only)
-	testing.expect_value(t, end, "target.other.example.")
 	free_all(context.temp_allocator)
+}
+
+// A record at `name` of `type` for `chain_walk` to read; a CNAME points at `target`.
+@(private = "file")
+chain_rr :: proc(name: string, type: dns.Type, target := "") -> dns.Record {
+	out := dns.Record{name = name, type = type, class = .IN, ttl = 60}
+	if type == .CNAME {
+		out.data = dns.Rdata_Name{name = target}
+	} else if type == .AAAA {
+		out.data = dns.Rdata_AAAA{addr = {}}
+	}
+	return out
 }
 
 /*

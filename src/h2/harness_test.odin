@@ -1,6 +1,5 @@
 package h2
 
-import "core:encoding/hex"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -8,6 +7,7 @@ import "core:testing"
 import "core:time"
 
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 Fixtures shared by the server and client tests: a tracking allocator for the
@@ -36,22 +36,13 @@ expect_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, what: str
 	testing.expectf(t, len(track.bad_free_array) == 0, "%s: %d bad frees", what, len(track.bad_free_array), loc = loc)
 }
 
-@(private)
-from_hex :: proc(s: string) -> []u8 {
-	out, ok := hex.decode(transmute([]u8)s, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	return out
-}
-
 // RFC 7541 C.3.1: GET http / www.example.com, four fields.
 @(private)
 REQUEST_BLOCK :: "828684410f7777772e6578616d706c652e636f6d"
 
 @(private)
 request_block :: proc() -> []u8 {
-	return from_hex(REQUEST_BLOCK)
+	return testkit.unhex(REQUEST_BLOCK)
 }
 
 @(private)

@@ -6,6 +6,7 @@ import "core:testing"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 `hex.decode` hands back the buffer it allocated when it meets a bad digit, so
@@ -21,14 +22,11 @@ test_decode_hex_refuses_and_frees :: proc(t: ^testing.T) {
 	}
 	out, ok := decode_hex("00fF", context.allocator)
 	defer delete(out)
-	testing.expect(t, ok && len(out) == 2 && out[0] == 0 && out[1] == 0xff, "00fF did not decode to 00 ff")
+	if !testing.expect(t, ok && len(out) == 2 && out[0] == 0 && out[1] == 0xff, "00fF did not decode to 00 ff") {
+		return
+	}
 	empty, empty_ok := decode_hex("", context.allocator)
 	testing.expect(t, empty_ok && len(empty) == 0, "an empty string did not decode to nothing")
-}
-
-@(private = "file")
-test_validator :: proc(anchors: []Trust_Anchor = nil) -> ^Validator {
-	return make_validator(scenario_query, &FIXTURES, Options{anchors = anchors})
 }
 
 // Walks the chain with a fresh budget, the way `validate` does.
@@ -41,7 +39,7 @@ trust :: proc(v: ^Validator, name: string) -> (Status, []Dnskey, string) {
 @(private = "file")
 validate_fixture :: proc(v: ^Validator, key: string, qname: string, qtype: dns.Type) -> Result {
 	f := fixture(key)
-	return validate(v, qname, qtype, unhex(f.wire), fixture_now())
+	return validate(v, qname, qtype, testkit.unhex(f.wire), fixture_now())
 }
 
 // ---------------------------------------------------------------------------
@@ -54,7 +52,9 @@ test_key_tag_matches_published_anchor :: proc(t: ^testing.T) {
 	// 20326, so computing tags over real RDATA is checked against a number
 	// nobody here chose.
 	msg, err := dns.decode_message(scenario_fixture(FIXTURES, "root_dnskey"), context.temp_allocator)
-	testing.expect_value(t, err, dns.Decode_Error.None)
+	if !testing.expect_value(t, err, dns.Decode_Error.None) {
+		return
+	}
 
 	found := false
 	for rec in msg.answer {
@@ -62,7 +62,9 @@ test_key_tag_matches_published_anchor :: proc(t: ^testing.T) {
 			continue
 		}
 		rdata, ok := raw_rdata(rec)
-		testing.expect(t, ok, "DNSKEY rdata should be raw")
+		if !testing.expect(t, ok, "DNSKEY rdata should be raw") {
+			return
+		}
 		key, perr := parse_dnskey(rdata)
 		testing.expect_value(t, perr, Parse_Error.None)
 		if key.tag == 20326 {
@@ -77,13 +79,19 @@ test_key_tag_matches_published_anchor :: proc(t: ^testing.T) {
 
 @(test)
 test_root_ksk_matches_trust_anchor :: proc(t: ^testing.T) {
-	msg, _ := dns.decode_message(scenario_fixture(FIXTURES, "root_dnskey"), context.temp_allocator)
+	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "root_dnskey"), context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	matched := 0
 	for rec in msg.answer {
 		if rec.type != .DNSKEY {
 			continue
 		}
-		rdata, _ := raw_rdata(rec)
+		rdata, is_raw := raw_rdata(rec)
+		if !is_raw {
+			continue
+		}
 		key, perr := parse_dnskey(rdata)
 		if perr != .None {
 			continue
@@ -114,11 +122,15 @@ test_name_compare_canonical_order :: proc(t: ^testing.T) {
 	}
 	for i in 1 ..< len(ordered) {
 		order, ok := name_compare(ordered[i - 1], ordered[i])
-		testing.expect(t, ok, "these names should all be comparable")
+		if !testing.expect(t, ok, "these names should all be comparable") {
+			return
+		}
 		testing.expect(t, order < 0, "canonical order broken around index")
 	}
 	same, ok := name_compare("EXAMPLE.com.", "example.COM.")
-	testing.expect(t, ok, "case-different names should compare")
+	if !testing.expect(t, ok, "case-different names should compare") {
+		return
+	}
 	testing.expect_value(t, same, 0)
 
 	// A name that cannot be put on the wire - here an empty label - has no
@@ -147,7 +159,9 @@ test_bitmap_membership :: proc(t: ^testing.T) {
 test_base32hex_roundtrip :: proc(t: ^testing.T) {
 	buf: [20]u8
 	n, ok := base32hex_decode("00000000000000000000000000000000", buf[:])
-	testing.expect(t, ok, "all-zero hash should decode")
+	if !testing.expect(t, ok, "all-zero hash should decode") {
+		return
+	}
 	testing.expect_value(t, n, 20)
 
 	n2, ok2 := base32hex_decode("vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv", buf[:])
@@ -165,7 +179,9 @@ test_parse_trust_anchor :: proc(t: ^testing.T) {
 		". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
 		context.temp_allocator,
 	)
-	testing.expect(t, ok, "presentation-form anchor should parse")
+	if !testing.expect(t, ok, "presentation-form anchor should parse") {
+		return
+	}
 	testing.expect_value(t, anchor.zone, ".")
 	testing.expect_value(t, anchor.ds.key_tag, u16(20326))
 	testing.expect_value(t, anchor.ds.algorithm, u8(8))
@@ -176,7 +192,9 @@ test_parse_trust_anchor :: proc(t: ^testing.T) {
 		"38696 8 2 683D2D0ACB8C9B712A1948B27F741219 298D0A450D612C483AF444A4C0FB2B16",
 		context.temp_allocator,
 	)
-	testing.expect(t, bare_ok, "bare fields with a split digest should parse")
+	if !testing.expect(t, bare_ok, "bare fields with a split digest should parse") {
+		return
+	}
 	testing.expect_value(t, bare.ds.key_tag, u16(38696))
 	testing.expect_value(t, len(bare.ds.digest), 32)
 
@@ -186,7 +204,9 @@ test_parse_trust_anchor :: proc(t: ^testing.T) {
 		". IN ds 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
 		context.temp_allocator,
 	)
-	testing.expect(t, lower_ok, "a lower-case type should parse")
+	if !testing.expect(t, lower_ok, "a lower-case type should parse") {
+		return
+	}
 	_, long_s_ok := parse_trust_anchor(
 		". IN D\u017f 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
 		context.temp_allocator,
@@ -236,7 +256,7 @@ test_trust_anchor_digest_length_mismatch_frees_the_digest :: proc(t: ^testing.T)
 @(test)
 test_validates_rsa_chain :: proc(t: ^testing.T) {
 	// Root and com are signed with RSA/SHA-256; this walks both.
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	status, keys, zone := trust(v, "com.")
@@ -320,13 +340,13 @@ test_a_walk_past_the_question_deadline_asks_nobody :: proc(t: ^testing.T) {
 	f := fixture("example_a")
 
 	passed := time.tick_add(time.tick_now(), -time.Millisecond)
-	result := validate(v, "www.example.com.", .A, unhex(f.wire), fixture_now(), deadline = &passed)
+	result := validate(v, "www.example.com.", .A, testkit.unhex(f.wire), fixture_now(), deadline = &passed)
 	testing.expect_value(t, result.status, Status.Indeterminate)
 	testing.expect_value(t, result.reason, DEADLINE_PASSED)
 	testing.expect_value(t, counter.calls, 0)
 
 	running := time.tick_add(time.tick_now(), time.Minute)
-	result = validate(v, "www.example.com.", .A, unhex(f.wire), fixture_now(), deadline = &running)
+	result = validate(v, "www.example.com.", .A, testkit.unhex(f.wire), fixture_now(), deadline = &running)
 	testing.expect_value(t, result.status, Status.Secure)
 	testing.expect(t, counter.calls > 0, "a walk inside its deadline asked nobody")
 	free_all(context.temp_allocator)
@@ -334,7 +354,7 @@ test_a_walk_past_the_question_deadline_asks_nobody :: proc(t: ^testing.T) {
 
 @(test)
 test_validates_ecdsa_answer :: proc(t: ^testing.T) {
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	result := validate_fixture(v, "example_a", "www.example.com.", .A)
@@ -347,7 +367,7 @@ test_validates_ecdsa_answer :: proc(t: ^testing.T) {
 
 @(test)
 test_validates_ed25519_answer :: proc(t: ^testing.T) {
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	result := validate_fixture(v, "ed25519_a", "ed25519.nl.", .A)
@@ -358,7 +378,7 @@ test_validates_ed25519_answer :: proc(t: ^testing.T) {
 @(test)
 test_validates_nsec_name_error :: proc(t: ^testing.T) {
 	// The root zone uses NSEC, so a nonexistent top-level name is denied with it.
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	result := validate_fixture(v, "nxdomain_root", "zzzz-does-not-exist-xq7.", .A)
@@ -369,7 +389,7 @@ test_validates_nsec_name_error :: proc(t: ^testing.T) {
 @(test)
 test_validates_nsec3_name_error :: proc(t: ^testing.T) {
 	// com uses NSEC3 with opt-out.
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	result := validate_fixture(v, "nxdomain_com", "zzzz-does-not-exist-xq7.com.", .A)
@@ -406,7 +426,7 @@ test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
 	qname :: "zzzz-does-not-exist-xq7.com."
 	// A validator apiece, because what one call learns about the zone is cached
 	// and the next would read the answer rather than work it out.
-	base_v := test_validator()
+	base_v := scenario_validator(&FIXTURES)
 	defer destroy_validator(base_v)
 	fresh := query_budget(base_v)
 	baseline := validate_denial(base_v, &fresh, msg, qname, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
@@ -418,7 +438,7 @@ test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
 		baseline.reason,
 	)
 
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 	// Through `query_budget`, so the ceiling is the validator's: a zero would
 	// refuse these records for their iteration count instead, which is a
@@ -451,7 +471,7 @@ test_an_nsec_denial_that_fails_is_bogus_even_with_the_hashing_spent :: proc(t: ^
 	testing.expect(t, err == .None, "the captured denial should decode")
 
 	qname :: "nosuchname-xq7.cloudflare.com."
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 	spent := query_budget(v)
 	spent.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
@@ -466,7 +486,7 @@ test_an_nsec_denial_that_fails_is_bogus_even_with_the_hashing_spent :: proc(t: ^
 test_validates_nodata :: proc(t: ^testing.T) {
 	// cloudflare.com answers a nonexistent name with NODATA and an NSEC that
 	// spans it, the "black lies" arrangement.
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	result := validate_fixture(v, "nodata_cloudflare", "nosuchname-xq7.cloudflare.com.", .A)
@@ -477,9 +497,11 @@ test_validates_nodata :: proc(t: ^testing.T) {
 // The captured root NXDOMAIN with `sig` planted in it: at the front of the
 // authority section, or as the whole answer with the proof taken out.
 @(private = "file")
-plant_in_nxdomain :: proc(t: ^testing.T, sig: dns.Record, as_answer: bool) -> []u8 {
+plant_in_nxdomain :: proc(sig: dns.Record, as_answer: bool) -> []u8 {
 	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "nxdomain_root"), context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if derr != .None {
+		panic("the NXDOMAIN fixture does not decode")
+	}
 	planted := make([dynamic]dns.Record, 0, len(msg.authority) + 1, context.temp_allocator)
 	append(&planted, sig)
 	if as_answer {
@@ -490,7 +512,9 @@ plant_in_nxdomain :: proc(t: ^testing.T, sig: dns.Record, as_answer: bool) -> []
 		msg.authority = planted[:]
 	}
 	wire, _, enc := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
+	if enc != .None {
+		panic("the planted NXDOMAIN does not encode")
+	}
 	return wire
 }
 
@@ -507,11 +531,11 @@ test_injected_signer_cannot_downgrade_a_denial :: proc(t: ^testing.T) {
 	insecure - a forged NXDOMAIN accepted on the strength of one added record.
 	The zone has to come from the name that was asked about.
 	*/
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	// reddit.com is unsigned in the captured set.
-	tampered := plant_in_nxdomain(t, junk_rrsig("zzzz-does-not-exist-xq7.", "reddit.com.", .NSEC, 1), as_answer = false)
+	tampered := plant_in_nxdomain(junk_rrsig("zzzz-does-not-exist-xq7.", "reddit.com.", .NSEC, 1), as_answer = false)
 
 	result := validate(v, "zzzz-does-not-exist-xq7.", .A, tampered, fixture_now())
 	testing.expect_value(t, result.status, Status.Secure)
@@ -534,10 +558,10 @@ test_injected_answer_record_cannot_skip_a_denial :: proc(t: ^testing.T) {
 	proves the name is absent. A forged NXDOMAIN for a name in the signed root
 	has to be refused.
 	*/
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	tampered := plant_in_nxdomain(t, junk_rrsig("zzzz-does-not-exist-xq7.", "reddit.com.", .NSEC, 1), as_answer = true)
+	tampered := plant_in_nxdomain(junk_rrsig("zzzz-does-not-exist-xq7.", "reddit.com.", .NSEC, 1), as_answer = true)
 
 	result := validate(v, "zzzz-does-not-exist-xq7.", .A, tampered, fixture_now())
 	testing.expect(
@@ -556,10 +580,10 @@ test_rrsig_question_has_nothing_to_authenticate :: proc(t: ^testing.T) {
 	answered by records that carry no signature - insecure rather than bogus,
 	and no denial of existence to demand.
 	*/
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	tampered := plant_in_nxdomain(t, junk_rrsig("example.com.", "example.com.", .A, 2), as_answer = true)
+	tampered := plant_in_nxdomain(junk_rrsig("example.com.", "example.com.", .A, 2), as_answer = true)
 
 	result := validate(v, "example.com.", .RRSIG, tampered, fixture_now())
 	testing.expect_value(t, result.status, Status.Insecure)
@@ -570,7 +594,7 @@ test_rrsig_question_has_nothing_to_authenticate :: proc(t: ^testing.T) {
 test_unsigned_delegation_is_insecure :: proc(t: ^testing.T) {
 	// reddit.com has no DS record in com, so its data is unsigned - which is a
 	// different thing from forged, and must not be refused.
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	result := validate_fixture(v, "reddit_a", "www.reddit.com.", .A)
@@ -592,7 +616,7 @@ test_a_ds_question_is_settled_by_the_parents_opt_out_span :: proc(t: ^testing.T)
 	all, which reaches the same verdict for every DS NODATA under an insecure
 	delegation, including those the parent has proven outright.
 	*/
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 	result := validate_fixture(v, "reddit_ds", "reddit.com.", .DS)
 	testing.expectf(
@@ -613,7 +637,7 @@ test_a_ds_question_is_settled_by_the_parents_opt_out_span :: proc(t: ^testing.T)
 test_upstream_errors_are_not_called_forgeries :: proc(t: ^testing.T) {
 	// A REFUSED carries nothing to authenticate. Insisting on a denial of
 	// existence would turn every upstream error into a DNSSEC failure.
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	msg := dns.Message {
@@ -634,7 +658,7 @@ test_an_answer_of_only_signatures_is_not_secure :: proc(t: ^testing.T) {
 	// An RRSIG RRset is never itself signed, so a question about one cannot be
 	// answered authentically. Reporting the empty check as a pass would put the
 	// AD bit on data nothing vouched for.
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	wire := scenario_fixture(FIXTURES, "example_a")
@@ -732,12 +756,12 @@ Canned_Ctx :: struct {
 @(private = "file")
 canned_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	canned := cast(^Canned_Ctx)ctx
-	return unhex(canned.wire, allocator), true
+	return testkit.unhex(canned.wire, allocator), true
 }
 
 @(private = "file")
 forged_ds :: proc() -> []Ds {
-	digest, _ := decode_hex(FORGED_DS_DIGEST, context.temp_allocator)
+	digest := testkit.unhex(FORGED_DS_DIGEST)
 	set := make([]Ds, 1, context.temp_allocator)
 	set[0] = Ds {
 		key_tag     = FORGED_KEY_TAG,
@@ -794,7 +818,7 @@ test_key_tag_collision_does_not_satisfy_the_ds :: proc(t: ^testing.T) {
 
 @(test)
 test_tampered_answer_is_bogus :: proc(t: ^testing.T) {
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	wire := scenario_fixture(FIXTURES, "example_a")
@@ -823,7 +847,7 @@ test_tampered_answer_is_bogus :: proc(t: ^testing.T) {
 
 @(test)
 test_stripped_signature_is_bogus :: proc(t: ^testing.T) {
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	wire := scenario_fixture(FIXTURES, "example_a")
@@ -845,13 +869,13 @@ test_stripped_signature_is_bogus :: proc(t: ^testing.T) {
 
 @(test)
 test_expired_signature_is_bogus :: proc(t: ^testing.T) {
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	f := fixture("example_a")
 	// A year past every signature in the set.
 	late := time.unix(FIXTURE_TIME + 365 * 24 * 3600, 0)
-	result := validate(v, "www.example.com.", .A, unhex(f.wire), late)
+	result := validate(v, "www.example.com.", .A, testkit.unhex(f.wire), late)
 	testing.expect_value(t, result.status, Status.Bogus)
 	free_all(context.temp_allocator)
 }
@@ -864,7 +888,7 @@ test_wrong_trust_anchor_is_bogus :: proc(t: ^testing.T) {
 	anchors := []Trust_Anchor {
 		{zone = ".", ds = {key_tag = 20326, algorithm = ALG_RSASHA256, digest_type = DIGEST_SHA256, digest = wrong}},
 	}
-	v := test_validator(anchors)
+	v := make_validator(scenario_query, &FIXTURES, Options{anchors = anchors})
 	defer destroy_validator(v)
 
 	result := validate_fixture(v, "example_a", "www.example.com.", .A)
@@ -876,7 +900,7 @@ test_wrong_trust_anchor_is_bogus :: proc(t: ^testing.T) {
 test_forged_ds_breaks_the_chain :: proc(t: ^testing.T) {
 	// Swapping the digest of example.com's DS record leaves a well-formed,
 	// correctly signed delegation that points at a key nobody holds.
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	status, _, _ := trust(v, "example.com.")
@@ -934,13 +958,15 @@ test_answer_for_another_name_is_not_authentic :: proc(t: ^testing.T) {
 	result sees an authenticated answer with nothing in it for the name it
 	asked about - a denial it never proved.
 	*/
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	// A real, signed answer for www.cloudflare.com.
 	wire := scenario_fixture(FIXTURES, "cloudflare_a")
 	msg, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 
 	// Re-asked as though it answered a name in another signed zone.
 	question := make([]dns.Question, 1, context.temp_allocator)
@@ -963,87 +989,6 @@ test_answer_for_another_name_is_not_authentic :: proc(t: ^testing.T) {
 		result.reason,
 	)
 	free_all(context.temp_allocator)
-}
-
-@(private = "file")
-rec :: proc(name: string, type: dns.Type, target: string = "") -> dns.Record {
-	out := dns.Record {
-		name  = name,
-		type  = type,
-		class = .IN,
-		ttl   = 60,
-	}
-	if type == .CNAME {
-		out.data = dns.Rdata_Name{name = target}
-	}
-	return out
-}
-
-@(test)
-test_chain_walk_follows_the_cname_chain :: proc(t: ^testing.T) {
-	/*
-	The shape of an answer that addresses its question, case by case. Chains
-	that stop short are ordinary - the zone at the end may hold nothing of the
-	type, which the authority section is what proves - so those are
-	`.Chain_Only` rather than `.None`. An answer section with nothing at the
-	queried name is `.None`, which `validate_answer` refuses.
-	*/
-	direct := []dns.Record{rec("www.example.com.", .A)}
-	shape, _ := chain_walk(direct, "www.example.com.", .A, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Direct)
-
-	// Case folding, since a name is not the bytes it was written with.
-	shape, _ = chain_walk(direct, "WWW.Example.COM.", .A, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Direct)
-
-	chain := []dns.Record {
-		rec("www.example.com.", .CNAME, "target.example.net."),
-		rec("target.example.net.", .A),
-	}
-	shape, _ = chain_walk(chain, "www.example.com.", .A, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Direct)
-
-	// The chain stops at the CNAME: the target holds no A, which the authority
-	// section proves rather than this.
-	partial := []dns.Record{rec("www.example.com.", .CNAME, "target.example.net.")}
-	shape, _ = chain_walk(partial, "www.example.com.", .A, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Chain_Only)
-
-	// The CNAME itself, when that is what was asked for.
-	shape, _ = chain_walk(partial, "www.example.com.", .CNAME, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Direct)
-
-	// Anything at the name answers ANY.
-	shape, _ = chain_walk(direct, "www.example.com.", .ANY, .IN)
-	testing.expect_value(t, shape, Answer_Shape.Direct)
-
-	// The attack: signed records, wrong name.
-	elsewhere := []dns.Record{rec("evil.attacker.example.", .A)}
-	shape, _ = chain_walk(elsewhere, "www.example.com.", .A, .IN)
-	testing.expect_value(t, shape, Answer_Shape.None)
-
-	// A chain that leads somewhere unrelated still has to start at the name
-	// that was asked about.
-	detached := []dns.Record {
-		rec("other.example.com.", .CNAME, "target.example.net."),
-		rec("target.example.net.", .A),
-	}
-	shape, _ = chain_walk(detached, "www.example.com.", .A, .IN)
-	testing.expect_value(t, shape, Answer_Shape.None)
-
-	// Class has to match too.
-	wrong_class := []dns.Record{rec("www.example.com.", .A)}
-	wrong_class[0].class = .CH
-	shape, _ = chain_walk(wrong_class, "www.example.com.", .A, .IN)
-	testing.expect_value(t, shape, Answer_Shape.None)
-
-	// A loop must terminate rather than spin.
-	loop := []dns.Record {
-		rec("a.example.com.", .CNAME, "b.example.com."),
-		rec("b.example.com.", .CNAME, "a.example.com."),
-	}
-	shape, _ = chain_walk(loop, "a.example.com.", .A, .IN)
-	testing.expect_value(t, shape, Answer_Shape.None)
 }
 
 @(test)
@@ -1084,7 +1029,10 @@ test_cached_key_set_holds_no_gaps :: proc(t: ^testing.T) {
 
 @(private = "file")
 fixture_dnskey :: proc(t: ^testing.T) -> Dnskey {
-	msg, _ := dns.decode_message(scenario_fixture(FIXTURES, "example_dnskey"), context.temp_allocator)
+	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_dnskey"), context.temp_allocator)
+	if derr != .None {
+		panic("the example DNSKEY fixture does not decode")
+	}
 	for rec in msg.answer {
 		if rec.type != .DNSKEY {
 			continue
@@ -1318,7 +1266,9 @@ failure_wire :: proc(name: string, type: dns.Type, rcode: dns.Rcode, allocator: 
 failing_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	fail := cast(^Failing_Lookup)ctx
 	if type == fail.type && dns.name_equal_fold(name, fail.name) {
-		return failure_wire(name, type, fail.rcode, allocator), true
+		// A reply that could not be built is a lookup that failed, not an empty answer.
+		wire := failure_wire(name, type, fail.rcode, allocator)
+		return wire, wire != nil
 	}
 	return fixture_answer(FIXTURES, name, type, allocator)
 }
@@ -1444,7 +1394,7 @@ walk - the root's DNSKEY set, under its trust anchor - is the one named.
 */
 @(test)
 test_a_captured_chain_out_of_its_window_names_the_window :: proc(t: ^testing.T) {
-	v := test_validator()
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 	wire := scenario_fixture(FIXTURES, "example_a")
 	late := validate(v, "www.example.com.", .A, wire, time.unix(FIXTURE_TIME + 365 * 24 * 3600, 0))

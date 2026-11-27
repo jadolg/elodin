@@ -5,6 +5,7 @@ import "core:net"
 import "core:time"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:testkit"
 
 /*
 elodin as a DoH client: ALPN decides between HTTP/2 and HTTP/1.1 against the
@@ -19,7 +20,7 @@ doh_upstream :: proc(name: string, port: int) -> string {
 
 run_upstream_doh2_cases :: proc(r: ^Runner) {
 	fix := fixture("a")
-	payload := from_hex(fix.response, context.allocator)
+	payload := testkit.unhex(fix.response, context.allocator)
 
 	// --- ALPN prefers h2 when the upstream offers it ---
 	{

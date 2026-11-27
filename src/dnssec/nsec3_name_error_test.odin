@@ -158,9 +158,9 @@ test_an_nsec3_name_error_on_unknown_flags_is_bogus :: proc(t: ^testing.T) {
 	saw_flags := false
 	for rr in msg.authority {
 		if rr.type == .NSEC3 {
-			rdata, _ := raw_rdata(rr)
+			rdata, is_raw := raw_rdata(rr)
 			parsed, perr := parse_nsec3(rdata)
-			saw_flags ||= perr == .None && parsed.flags == 0x02
+			saw_flags ||= is_raw && perr == .None && parsed.flags == 0x02
 		}
 	}
 	testing.expect(t, saw_flags, "the fixture should carry the unknown flag, or this proves nothing")
@@ -398,7 +398,9 @@ test_a_forged_unsigned_answer_past_the_ceiling_is_not_served :: proc(t: ^testing
 	answer[0] = dns.Record{name = N3_QNAME, type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = {203, 0, 113, 66}}}
 	msg.answer = answer
 	wire, _, encode_err := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, encode_err, dns.Encode_Error.None)
+	if !testing.expect_value(t, encode_err, dns.Encode_Error.None) {
+		return
+	}
 
 	strict := make_validator(scenario_query, &N3_FIXTURES, Options{anchors = anchors, max_nsec3_iterations = 5})
 	defer destroy_validator(strict)
@@ -408,9 +410,7 @@ test_a_forged_unsigned_answer_past_the_ceiling_is_not_served :: proc(t: ^testing
 
 	// The control: at the shipped ceiling the walk reads the denials, the name
 	// is in a signed zone, and an unsigned answer for it is a forgery.
-	ordinary := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
-	defer destroy_validator(ordinary)
-	held := validate(ordinary, N3_QNAME, .A, wire, fixture_now())
+	held := scenario_validate(&N3_FIXTURES, N3_QNAME, .A, wire, N3_ANCHOR)
 	testing.expectf(t, held.status == .Bogus, "got %v (%q)", held.status, held.reason)
 	free_all(context.temp_allocator)
 }
@@ -434,7 +434,9 @@ test_an_unsigned_denial_past_the_ceiling_is_not_called_forged :: proc(t: ^testin
 		msg.authority = nil
 		msg.answer = nil
 		wire, _, encode_err := dns.encode_message(msg, context.temp_allocator)
-		testing.expect_value(t, encode_err, dns.Encode_Error.None)
+		if !testing.expect_value(t, encode_err, dns.Encode_Error.None) {
+			return
+		}
 		strict := make_validator(scenario_query, &N3_FIXTURES, Options{anchors = anchors, max_nsec3_iterations = 5})
 		result := validate(strict, N3_QNAME, .A, wire, fixture_now())
 		testing.expectf(t, result.status == .Indeterminate, "rcode %v: got %v (%q)", rc, result.status, result.reason)

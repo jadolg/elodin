@@ -2,7 +2,7 @@ package dnssec
 
 import "core:strings"
 import "core:testing"
-import "core:time"
+import "elodin:testkit"
 
 /*
 Issue #360: a signature outside its validity window is reported by its window.
@@ -502,8 +502,6 @@ lp_validate :: proc(key, qname: string, now := i64(FIXTURE_TIME)) -> Result {
 // a test alters one signature without a fixture of its own.
 @(private = "file")
 lp_validate_with :: proc(key, qname, old, new: string, now := i64(FIXTURE_TIME)) -> Result {
-	v := scenario_validator(&LP_FIXTURES, LP_ANCHOR)
-	defer destroy_validator(v)
 	hex := fixture(key, LP_FIXTURES).wire
 	if old != "" {
 		// A miss would validate the untouched message, and the test would be
@@ -511,13 +509,9 @@ lp_validate_with :: proc(key, qname, old, new: string, now := i64(FIXTURE_TIME))
 		if !strings.contains(hex, old) {
 			panic("the fixture does not hold the text to replace")
 		}
-		hex, _ = strings.replace(hex, old, new, 1, context.temp_allocator)
+		hex, _ = strings.replace(hex, old, new, 1, context.temp_allocator) // lint:allow the needle is checked above; whether it allocated says nothing
 	}
-	wire, ok := decode_hex(hex, context.temp_allocator)
-	if !ok {
-		panic("the altered fixture is not hex")
-	}
-	return validate(v, qname, .A, wire, time.unix(now, 0))
+	return scenario_validate(&LP_FIXTURES, qname, .A, testkit.unhex(hex), LP_ANCHOR, now = now)
 }
 
 @(test)

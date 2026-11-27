@@ -37,20 +37,6 @@ The zone is that appendix's, and its chain in hash order is:
 	xx.example.     t644...  ->  0p9m...   (the wrap)
 */
 
-/*
-A fresh hashing allowance, held to `max_iterations` per record.
-
-Every call below gets its own, the way every client question does. The proofs
-take one rather than a bare ceiling so that no path can hash without being
-charged for it - see `MAX_NSEC3_ROUNDS_PER_QUERY`.
-*/
-@(private = "file")
-budget_at :: proc(max_iterations: int) -> ^Nsec3_Budget {
-	b := new(Nsec3_Budget, context.temp_allocator)
-	b.max_iterations = max_iterations
-	return b
-}
-
 @(private = "file")
 A_SALT := []u8{0xaa, 0xbb, 0xcc, 0xdd}
 

@@ -5,6 +5,7 @@ import "core:slice"
 import "core:time"
 import "elodin:dns"
 import "elodin:server"
+import "elodin:testkit"
 
 /*
 Wire-level coverage.
@@ -236,7 +237,7 @@ run_wire_cases :: proc(r: ^Runner) {
 
 	// Every fixture is registered, so one server serves them all.
 	for f in FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	}
 	// Too large for any UDP reply, so the mock answers TC over UDP and serves
 	// the record itself when elodin comes back over TCP - the way an upstream
@@ -286,7 +287,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	defer stop_server(&srv)
 
 	for f in FIXTURES {
-		expected := from_hex(f.response)
+		expected := testkit.unhex(f.response)
 
 		// Large answers cannot come back over UDP without EDNS, so those
 		// fixtures are checked on TCP where the framing has room.
@@ -294,7 +295,7 @@ run_wire_cases :: proc(r: ^Runner) {
 
 		start_case(r, fmt.tprintf("wire: %s (%s, %d bytes%s)", f.key, f.qname, len(expected), ", tcp" if use_tcp else ""))
 		{
-			query := from_hex(f.query)
+			query := testkit.unhex(f.query)
 			// Use a distinct ID so ID rewriting is exercised.
 			query[0], query[1] = 0x7a, 0x5c
 
@@ -396,7 +397,7 @@ run_wire_cases :: proc(r: ^Runner) {
 		// And the server is still answering afterwards: the reply cost it a
 		// bounded amount of arena and nothing that outlives the request.
 		f := fixture("a")
-		after := query_udp(udp_port, from_hex(f.query))
+		after := query_udp(udp_port, testkit.unhex(f.query))
 		check(r, after.ok, "the server stopped answering after a name bomb")
 	}
 	end_case(r)
@@ -404,7 +405,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	start_case(r, "wire: DNSSEC records survive with the DO bit set")
 	{
 		f := fixture("dnssec_a")
-		query := from_hex(f.query)
+		query := testkit.unhex(f.query)
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
 			msg, decoded := decode_reply(r, res.wire)
@@ -542,7 +543,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	start_case(r, "malformed: a response sent to the listener is ignored")
 	{
 		// QR set: this is an answer, not a question, and must not be processed.
-		reply := from_hex(fixture("a").response)
+		reply := testkit.unhex(fixture("a").response)
 		check(r, expect_no_udp_reply(udp_port, reply), "the server answered a message with QR set")
 	}
 	end_case(r)

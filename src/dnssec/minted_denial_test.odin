@@ -659,7 +659,7 @@ test_a_delegation_at_a_remembered_name_heals_on_the_next_question :: proc(t: ^te
 	insert.
 	*/
 	warm := Budget{}
-	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator) // lint:allow warming the cache; the status is checked
 	testing.expect_value(t, warmed, Status.Secure)
 	non_cut_remember(v, nil, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, DR_SUB_QNAME, now), "the table should hold the name to begin with")
@@ -707,7 +707,7 @@ test_a_denial_from_a_delegation_at_a_remembered_name_heals_too :: proc(t: ^testi
 	// walk must have nothing left to insert, or it can evict the very name
 	// under test.
 	warm := Budget{}
-	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator) // lint:allow warming the cache; the status is checked
 	testing.expect_value(t, warmed, Status.Secure)
 	non_cut_remember(v, nil, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, DR_SUB_QNAME, now), "the table should hold the name to begin with")
@@ -760,7 +760,7 @@ test_a_parents_delegation_nsec_cannot_deny_a_name_inside_the_child :: proc(t: ^t
 	// Warmed first, as in the heal tests: the walk must not be able to evict
 	// the name under test while it runs.
 	warm := Budget{}
-	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator) // lint:allow warming the cache; the status is checked
 	testing.expect_value(t, warmed, Status.Secure)
 	non_cut_remember(v, nil, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 

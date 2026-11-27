@@ -2,6 +2,7 @@ package dnssec
 
 import "core:mem"
 import "core:testing"
+import "elodin:testkit"
 
 /*
 The signature checks, and the byte wrangling in front of them.
@@ -73,7 +74,7 @@ RSA_SIG ::
 
 @(private = "file")
 check :: proc(algorithm: u8, key, sig, data: string) -> Verify_Result {
-	return verify_signature(algorithm, unhex(key), unhex(sig), unhex(data), context.temp_allocator)
+	return verify_signature(algorithm, testkit.unhex(key), testkit.unhex(sig), testkit.unhex(data), context.temp_allocator)
 }
 
 @(test)
@@ -120,21 +121,21 @@ test_verifies_an_rsa_signature :: proc(t: ^testing.T) {
 test_a_signature_over_other_data_does_not_verify :: proc(t: ^testing.T) {
 	// The whole point. Every vector above signs one specific byte string, and
 	// changing any of it must break the check.
-	altered := unhex(SIGNED_DATA)
+	altered := testkit.unhex(SIGNED_DATA)
 	altered[len(altered) - 1] ~= 0x01
 	testing.expect_value(
 		t,
-		verify_signature(ALG_ECDSAP256SHA256, unhex(P256_HIGH_BIT_KEY), unhex(P256_HIGH_BIT_SIG), altered, context.temp_allocator),
+		verify_signature(ALG_ECDSAP256SHA256, testkit.unhex(P256_HIGH_BIT_KEY), testkit.unhex(P256_HIGH_BIT_SIG), altered, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 	testing.expect_value(
 		t,
-		verify_signature(ALG_ED25519, unhex(ED25519_KEY), unhex(ED25519_SIG), altered, context.temp_allocator),
+		verify_signature(ALG_ED25519, testkit.unhex(ED25519_KEY), testkit.unhex(ED25519_SIG), altered, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 	testing.expect_value(
 		t,
-		verify_signature(ALG_RSASHA256, unhex(RSA_KEY), unhex(RSA_SIG), altered, context.temp_allocator),
+		verify_signature(ALG_RSASHA256, testkit.unhex(RSA_KEY), testkit.unhex(RSA_SIG), altered, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 	free_all(context.temp_allocator)
@@ -142,30 +143,30 @@ test_a_signature_over_other_data_does_not_verify :: proc(t: ^testing.T) {
 
 @(test)
 test_a_flipped_bit_in_the_signature_does_not_verify :: proc(t: ^testing.T) {
-	data := unhex(SIGNED_DATA)
+	data := testkit.unhex(SIGNED_DATA)
 
 	// One bit in R, and one bit in S, for each of the two curves in use.
-	ecdsa := unhex(P256_HIGH_BIT_SIG)
+	ecdsa := testkit.unhex(P256_HIGH_BIT_SIG)
 	ecdsa[0] ~= 0x01
 	testing.expect_value(
 		t,
-		verify_signature(ALG_ECDSAP256SHA256, unhex(P256_HIGH_BIT_KEY), ecdsa, data, context.temp_allocator),
+		verify_signature(ALG_ECDSAP256SHA256, testkit.unhex(P256_HIGH_BIT_KEY), ecdsa, data, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 
-	ed := unhex(ED25519_SIG)
+	ed := testkit.unhex(ED25519_SIG)
 	ed[63] ~= 0x01
 	testing.expect_value(
 		t,
-		verify_signature(ALG_ED25519, unhex(ED25519_KEY), ed, data, context.temp_allocator),
+		verify_signature(ALG_ED25519, testkit.unhex(ED25519_KEY), ed, data, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 
-	rsa := unhex(RSA_SIG)
+	rsa := testkit.unhex(RSA_SIG)
 	rsa[10] ~= 0x80
 	testing.expect_value(
 		t,
-		verify_signature(ALG_RSASHA256, unhex(RSA_KEY), rsa, data, context.temp_allocator),
+		verify_signature(ALG_RSASHA256, testkit.unhex(RSA_KEY), rsa, data, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 	free_all(context.temp_allocator)
@@ -179,34 +180,34 @@ test_a_key_or_signature_of_the_wrong_size_is_refused :: proc(t: ^testing.T) {
 	Wrapping a short key into a SubjectPublicKeyInfo would build a structure
 	whose declared length disagrees with its contents.
 	*/
-	data := unhex(SIGNED_DATA)
+	data := testkit.unhex(SIGNED_DATA)
 
-	short_key := unhex(P256_HIGH_BIT_KEY)[:63]
+	short_key := testkit.unhex(P256_HIGH_BIT_KEY)[:63]
 	testing.expect_value(
 		t,
-		verify_signature(ALG_ECDSAP256SHA256, short_key, unhex(P256_HIGH_BIT_SIG), data, context.temp_allocator),
+		verify_signature(ALG_ECDSAP256SHA256, short_key, testkit.unhex(P256_HIGH_BIT_SIG), data, context.temp_allocator),
 		Verify_Result.Bad,
 	)
-	short_sig := unhex(P256_HIGH_BIT_SIG)[:63]
+	short_sig := testkit.unhex(P256_HIGH_BIT_SIG)[:63]
 	testing.expect_value(
 		t,
-		verify_signature(ALG_ECDSAP256SHA256, unhex(P256_HIGH_BIT_KEY), short_sig, data, context.temp_allocator),
-		Verify_Result.Bad,
-	)
-	testing.expect_value(
-		t,
-		verify_signature(ALG_ED25519, unhex(ED25519_KEY)[:31], unhex(ED25519_SIG), data, context.temp_allocator),
+		verify_signature(ALG_ECDSAP256SHA256, testkit.unhex(P256_HIGH_BIT_KEY), short_sig, data, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 	testing.expect_value(
 		t,
-		verify_signature(ALG_ED25519, unhex(ED25519_KEY), unhex(ED25519_SIG)[:63], data, context.temp_allocator),
+		verify_signature(ALG_ED25519, testkit.unhex(ED25519_KEY)[:31], testkit.unhex(ED25519_SIG), data, context.temp_allocator),
+		Verify_Result.Bad,
+	)
+	testing.expect_value(
+		t,
+		verify_signature(ALG_ED25519, testkit.unhex(ED25519_KEY), testkit.unhex(ED25519_SIG)[:63], data, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 	// An empty key, which is what a DNSKEY truncated to its header would give.
 	testing.expect_value(
 		t,
-		verify_signature(ALG_RSASHA256, nil, unhex(RSA_SIG), data, context.temp_allocator),
+		verify_signature(ALG_RSASHA256, nil, testkit.unhex(RSA_SIG), data, context.temp_allocator),
 		Verify_Result.Bad,
 	)
 	free_all(context.temp_allocator)
@@ -222,9 +223,9 @@ test_an_unsupported_algorithm_is_not_reported_as_a_forgery :: proc(t: ^testing.T
 	would go dark for every client behind this server instead of degrading to
 	insecure.
 	*/
-	data := unhex(SIGNED_DATA)
+	data := testkit.unhex(SIGNED_DATA)
 	for algorithm in ([]u8{0, 1, 2, 3, 4, 6, 9, 11, 12, 17, 99, 253, 254, 255}) {
-		result := verify_signature(algorithm, unhex(P256_HIGH_BIT_KEY), unhex(P256_HIGH_BIT_SIG), data, context.temp_allocator)
+		result := verify_signature(algorithm, testkit.unhex(P256_HIGH_BIT_KEY), testkit.unhex(P256_HIGH_BIT_SIG), data, context.temp_allocator)
 		testing.expectf(t, result == .Unsupported, "algorithm %d should be unsupported, got %v", algorithm, result)
 		testing.expectf(t, !algorithm_supported(algorithm), "and the table should agree about %d", algorithm)
 	}
@@ -356,7 +357,7 @@ test_rsa_spki_refuses_an_impossible_exponent :: proc(t: ^testing.T) {
 	testing.expect(t, !oversized, "an exponent beyond the ceiling is refused")
 
 	// The real key still wraps.
-	_, good := rsa_spki(unhex(RSA_KEY), context.temp_allocator)
+	_, good := rsa_spki(testkit.unhex(RSA_KEY), context.temp_allocator)
 	testing.expect(t, good, "a well-formed key wraps")
 	free_all(context.temp_allocator)
 }
@@ -376,7 +377,7 @@ test_digest_tables_and_a_known_vector :: proc(t: ^testing.T) {
 	// up here rather than as a DS that will not match.
 	out: [32]u8
 	testing.expect(t, digest(DIGEST_SHA256, nil, out[:]), "SHA-256 of nothing should compute")
-	want := unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	want := testkit.unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 	testing.expect(t, mem.compare(out[:], want) == 0, "SHA-256 of the empty string is a published number")
 
 	// A buffer too small for the digest must be refused rather than half filled.

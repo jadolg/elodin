@@ -455,14 +455,6 @@ test_what_an_entry_costs_is_what_the_parts_come_to :: proc(t: ^testing.T) {
 		MAX_CACHED_ZONE_KEY_BYTES + MAX_KEYS_PER_ZONE * size_of(Dnskey) + size_of(Zone_Entry) + dns.MAX_NAME_PRESENTATION,
 	)
 
-	// The RDATA cap is the larger part of it but not the whole: quoted alone
-	// as 8 KB, it understates the entry by a third.
-	testing.expect(
-		t,
-		MAX_CACHED_ZONE_BYTES > MAX_CACHED_ZONE_KEY_BYTES,
-		"an entry cannot cost no more than the keys it holds",
-	)
-
 	// "about twelve kilobytes", and "about 48 MB at the default" in docs/dnssec.md.
 	// Bands rather than exact numbers: the point is that the prose is still
 	// true, not that these parts may never move.
