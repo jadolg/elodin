@@ -35,7 +35,10 @@ deadline_query :: proc() -> []u8 {
 		question = []dns.Question{{name = "hole.example.test.", type = .A, class = .IN}},
 	}
 	msg.flags.rd = true
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		panic("the deadline query does not encode")
+	}
 	return wire
 }
 
@@ -46,23 +49,15 @@ twice over (six timeouts here), and the third is never reached.
 */
 @(test)
 test_a_failover_query_waits_out_two_timeouts_and_no_more :: proc(t: ^testing.T) {
-	mocks: [3]Echo_Mock
-	ups: [3]^Upstream
-	workers: [3]^thread.Thread
-	// Only the mocks that started: a zero socket is fd 0, another test's.
-	live := 0
-	defer for i in 0 ..< live {
-		stop_udp_mock(&mocks[i], workers[i], ups[i])
+	set: Mock_Set(3)
+	for &m in set.mocks {
+		m.mute = true
 	}
-	for i in 0 ..< 3 {
-		mocks[i].mute = true
-		ok: bool
-		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], "hole")
-		if !ok {
-			return
-		}
-		live += 1
+	defer stop_mock_set(&set)
+	if !start_mock_set(t, &set, "hole", DEADLINE_TIMEOUT) {
+		return
 	}
+	mocks, ups := &set.mocks, &set.servers
 
 	g := failover_group(ups[:], DEADLINE_TIMEOUT, attempts = 2)
 	started := time.tick_now()
@@ -360,27 +355,17 @@ on every side of each judgement.
 */
 @(test)
 test_the_sweep_spends_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
-	mocks: [4]Echo_Mock
+	set: Mock_Set(4)
+	mocks, ups := &set.mocks, &set.servers
 	mocks[0].mute = true
 	mocks[1].rcode = u8(dns.Rcode.Serv_Fail)
 	mocks[1].delay = DEADLINE_TIMEOUT * 5 / 10
 	mocks[2].rcode = u8(dns.Rcode.Serv_Fail)
 	mocks[2].delay = DEADLINE_TIMEOUT * 7 / 10
 	mocks[3].mute = true
-	ups: [4]^Upstream
-	workers: [4]^thread.Thread
-	// Only the mocks that started: a zero socket is fd 0, another test's.
-	live := 0
-	defer for i in 0 ..< live {
-		stop_udp_mock(&mocks[i], workers[i], ups[i])
-	}
-	for i in 0 ..< 4 {
-		ok: bool
-		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], fmt.tprintf("m%d", i))
-		if !ok {
-			return
-		}
-		live += 1
+	defer stop_mock_set(&set)
+	if !start_mock_set(t, &set, "m", DEADLINE_TIMEOUT) {
+		return
 	}
 
 	g := failover_group(ups[:], DEADLINE_TIMEOUT, attempts = 2)
@@ -414,24 +399,14 @@ question's.
 */
 @(test)
 test_the_calls_of_one_question_share_its_deadline :: proc(t: ^testing.T) {
-	mocks: [2]Echo_Mock
+	set: Mock_Set(2)
+	mocks, ups := &set.mocks, &set.servers
 	mocks[0].mute = true
 	mocks[1].rcode = u8(dns.Rcode.Serv_Fail)
 	mocks[1].delay = DEADLINE_TIMEOUT * 9 / 10
-	ups: [2]^Upstream
-	workers: [2]^thread.Thread
-	// Only the mocks that started: a zero socket is fd 0, another test's.
-	live := 0
-	defer for i in 0 ..< live {
-		stop_udp_mock(&mocks[i], workers[i], ups[i])
-	}
-	for i in 0 ..< 2 {
-		ok: bool
-		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], fmt.tprintf("m%d", i))
-		if !ok {
-			return
-		}
-		live += 1
+	defer stop_mock_set(&set)
+	if !start_mock_set(t, &set, "m", DEADLINE_TIMEOUT) {
+		return
 	}
 	g := failover_group(ups[:], DEADLINE_TIMEOUT)
 

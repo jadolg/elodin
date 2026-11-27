@@ -1,18 +1,25 @@
 /*
 Fixtures the unit tests of more than one package share. A package's tests cannot
 reach another package's `_test.odin` files, so a helper two packages' tests need
-lives here, and only test files import it. It imports `dns`, so `dns`'s own tests
-cannot import it and keep their own copies.
+lives here, and only test files import it. It imports `dns`, `loop` and `netx`,
+so their own tests cannot import it: they keep their own copies, each saying so.
 */
 package testkit
 
+import "base:runtime"
 import "core:encoding/hex"
+import "core:fmt"
+import "core:math/rand"
 import "core:mem"
 import "core:net"
+import "core:os"
+import "core:strings"
 import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
+import "elodin:netx"
 
 /*
 A window-0 type bit map (RFC 4034 section 4.1.2) holding `types`, every one
@@ -157,4 +164,73 @@ unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
 		panic("a test's hex literal does not decode")
 	}
 	return out
+}
+
+/*
+A directory of this run's own: `prefix` (an absolute path's leading part) with
+the pid and a random suffix appended, made by this call at mode 0700, so nothing
+can already be there and nobody else can plant anything in it, and the keys a
+test writes into it are this user's to read. Held for the run, on the heap; ""
+and false when none could be made.
+*/
+private_dir :: proc(prefix: string) -> (dir: string, ok: bool) {
+	for _ in 0 ..< 8 {
+		dir = fmt.aprintf("%s%d-%x", prefix, os.get_pid(), rand.uint64(), allocator = runtime.heap_allocator())
+		#partial switch linux.mkdir(strings.clone_to_cstring(dir, context.temp_allocator), {.IRUSR, .IWUSR, .IXUSR}) {
+		case .NONE:
+			return dir, true
+		case .EEXIST:
+			delete(dir, runtime.heap_allocator())
+		case:
+			delete(dir, runtime.heap_allocator())
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// How long an ended run's private directory is left before a sweep takes it.
+PRIVATE_DIR_STALE :: time.Hour
+
+/*
+Remove the `private_dir`s under `prefix` of runs that have ended. The test runner
+leaves through `exit`, which runs neither `@(fini)` nor `atexit` handlers, so a
+run cannot remove its own; the next one removes each that is a real directory of
+this user's, named by a pid that is gone, and untouched for `PRIVATE_DIR_STALE`.
+
+Read with `lstat`, which does not follow a link: `os.remove_all` would, and a
+link planted under the prefix would have it empty whatever it points at. The age
+is what keeps a run in another pid namespace sharing the directory, whose pid
+this /proc cannot see, from losing its directory mid-run.
+*/
+sweep_private_dirs :: proc(prefix: string) {
+	slash := strings.last_index_byte(prefix, '/')
+	if slash <= 0 || !os.exists("/proc/self") {
+		return
+	}
+	entries, err := os.read_all_directory_by_path(prefix[:slash], context.temp_allocator)
+	if err != nil {
+		return
+	}
+	for e in entries {
+		if !strings.has_prefix(e.fullpath, prefix) {
+			continue
+		}
+		st: linux.Stat
+		if linux.lstat(strings.clone_to_cstring(e.fullpath, context.temp_allocator), &st) != .NONE ||
+		   !linux.S_ISDIR(st.mode) ||
+		   st.uid != linux.getuid() {
+			continue
+		}
+		name := e.fullpath[len(prefix):]
+		pid := name[:strings.index_byte(name, '-')] if strings.contains_rune(name, '-') else name
+		if _, numeric := netx.parse_decimal(pid, u64(max(i32))); !numeric || os.exists(fmt.tprintf("/proc/%s", pid)) {
+			continue
+		}
+		age := time.diff(time.unix(i64(st.mtime.time_sec), 0), loop.now())
+		if age < PRIVATE_DIR_STALE {
+			continue
+		}
+		_ = os.remove_all(e.fullpath) // lint:allow a directory left behind is only the next sweep's
+	}
 }

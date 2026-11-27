@@ -1,5 +1,6 @@
 package upstream
 
+import "core:fmt"
 import "core:net"
 import "core:sync"
 import "core:sys/linux"
@@ -137,7 +138,66 @@ silent_upstream :: proc(
 @(private)
 hold_until_stop :: proc(stop: ^bool) {
 	for !sync.atomic_load(stop) {
-		time.sleep(10 * time.Millisecond)
+		time.sleep(10 * time.Millisecond) // lint:allow the flag is set by every mock's own stopper, which posts nothing to wait on
+	}
+}
+
+/*
+Whether `ready(data)` holds within `within`, polled every millisecond: for a
+state another thread reaches, a pool worker or a reader, that signals nothing a
+test can wait on.
+*/
+@(private)
+wait_until :: proc(data: ^$T, ready: proc(data: ^T) -> bool, within: time.Duration) -> bool {
+	start := time.tick_now()
+	for !ready(data) && time.tick_since(start) < within {
+		time.sleep(time.Millisecond) // lint:allow the poll interval of a deadline-bounded wait
+	}
+	return ready(data)
+}
+
+// `msg` behind its two-byte length prefix (RFC 1035 section 4.2.2), in `allocator`.
+@(private)
+frame_tcp :: proc(msg: []u8, allocator := context.temp_allocator) -> []u8 {
+	framed := make([]u8, 2 + len(msg), allocator)
+	framed[0], framed[1] = u8(len(msg) >> 8), u8(len(msg))
+	copy(framed[2:], msg)
+	return framed
+}
+
+/*
+Echo mocks started together, an upstream in front of each, the mocks set up
+beforehand. `live` counts the ones that started, which are all `stop_mock_set`
+stops: a zero socket is fd 0, another test's under `odin test`.
+*/
+@(private)
+Mock_Set :: struct($N: int) {
+	mocks:   [N]Echo_Mock,
+	servers: [N]^Upstream,
+	workers: [N]^thread.Thread,
+	live:    int,
+}
+
+// Starts the first `count` mocks of `s` (every one for a negative `count`), as
+// members called `name` and their index, each waited on for `timeout`.
+@(private)
+start_mock_set :: proc(t: ^testing.T, s: ^Mock_Set($N), name: string, timeout := time.Second, count := -1) -> bool {
+	for i in 0 ..< (N if count < 0 else count) {
+		u, worker, ok := start_udp_mock(t, &s.mocks[i], echo_mock_loop, fmt.tprintf("%s%d", name, i), timeout)
+		if !ok {
+			return false
+		}
+		s.servers[i] = u
+		s.workers[i] = worker
+		s.live = i + 1
+	}
+	return true
+}
+
+@(private)
+stop_mock_set :: proc(s: ^Mock_Set($N)) {
+	for i in 0 ..< s.live {
+		stop_udp_mock(&s.mocks[i], s.workers[i], s.servers[i])
 	}
 }
 
@@ -162,7 +222,7 @@ Echo_Mock :: struct {
 
 @(private)
 echo_mock_loop :: proc(m: ^Echo_Mock) {
-	buf: [512]u8
+	buf: [dns.MAX_UDP_SIZE]u8
 	for !sync.atomic_load(&m.stop) {
 		n, client, err := net.recv_udp(m.socket, buf[:])
 		if err != nil || n < dns.HEADER_SIZE {
@@ -173,11 +233,11 @@ echo_mock_loop :: proc(m: ^Echo_Mock) {
 			continue
 		}
 		if m.delay > 0 {
-			time.sleep(m.delay)
+			time.sleep(m.delay) // lint:allow the delay is the latency the case gives this member
 		}
 		buf[2] |= 0x80
 		buf[3] = 0x80 | (buf[3] & 0x70) | (m.rcode & 0xf)
-		_, _ = net.send_udp(m.socket, buf[:n], client)
+		_, _ = net.send_udp(m.socket, buf[:n], client) // lint:allow a lost reply is the timeout the case would see anyway
 	}
 }
 

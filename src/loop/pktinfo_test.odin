@@ -5,6 +5,7 @@ import "core:net"
 import "core:os"
 import "core:sys/linux"
 import "core:testing"
+import "elodin:netx"
 
 // All of 127.0.0.0/8 is local on Linux: a second local address with no setup.
 @(private = "file")
@@ -70,7 +71,7 @@ test_a_wildcard_socket_answers_from_the_address_asked :: proc(t: ^testing.T) {
 			if !testing.expectf(t, rerr == nil && n == 3, "recv: %d bytes, %v", n, rerr) {
 				return
 			}
-			got, ok := unmapped_v4(local.address)
+			got, ok := netx.unmap(local.address).(net.IP4_Address)
 			testing.expectf(t, ok && got == c.asked, "%v: local end %v, want %v", family, local.address, c.asked)
 			if !c.from {
 				local = {}
@@ -128,25 +129,6 @@ test_an_ipv6_datagram_reports_its_destination_and_interface :: proc(t: ^testing.
 		return
 	}
 	testing.expectf(t, local.address == net.Address(net.IP6_Loopback) && local.ifindex != 0, "local end %v", local)
-}
-
-@(private = "file")
-unmapped_v4 :: proc(a: net.Address) -> (net.IP4_Address, bool) {
-	switch x in a {
-	case net.IP4_Address:
-		return x, true
-	case net.IP6_Address:
-		b := transmute([16]u8)x
-		for i in 0 ..< 10 {
-			if b[i] != 0 {
-				return {}, false
-			}
-		}
-		if b[10] == 0xff && b[11] == 0xff {
-			return {b[12], b[13], b[14], b[15]}, true
-		}
-	}
-	return {}, false
 }
 
 /*

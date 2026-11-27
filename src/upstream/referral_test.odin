@@ -22,7 +22,7 @@ Referral_Mock :: struct {
 
 @(private = "file")
 referral_loop :: proc(m: ^Referral_Mock) {
-	buf: [512]u8
+	buf: [dns.MAX_UDP_SIZE]u8
 	for !sync.atomic_load(&m.stop) {
 		n, client, err := net.recv_udp(m.socket, buf[:])
 		if err != nil || n < dns.HEADER_SIZE {
@@ -40,31 +40,23 @@ referral_loop :: proc(m: ^Referral_Mock) {
 		}
 		reply.flags.qr = true
 		reply.flags.rd = q.flags.rd
-		wire, _, _ := dns.encode_message(reply, context.temp_allocator)
-		_, _ = net.send_udp(m.socket, wire, client)
-		free_all(context.temp_allocator)
-	}
-}
-
-// A normal recursive answer: the query echoed back with QR and RA set.
-@(private = "file")
-echo_loop :: proc(m: ^Referral_Mock) {
-	buf: [512]u8
-	for !sync.atomic_load(&m.stop) {
-		n, client, err := net.recv_udp(m.socket, buf[:])
-		if err != nil || n < dns.HEADER_SIZE {
+		wire, _, enc := dns.encode_message(reply, context.temp_allocator)
+		if enc != .None {
+			// Not answered: the case fails on the referral never coming, on its
+			// own thread, rather than this mock taking the whole run down.
+			free_all(context.temp_allocator)
 			continue
 		}
-		sync.atomic_add(&m.hits, 1)
-		buf[2] |= 0x80
-		buf[3] |= 0x80
-		_, _ = net.send_udp(m.socket, buf[:n], client)
+		_, _ = net.send_udp(m.socket, wire, client) // lint:allow a reply that does not go out reads as the referral never coming
+		free_all(context.temp_allocator)
 	}
 }
 
 @(test)
 test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
-	referrer, answerer: Referral_Mock
+	referrer: Referral_Mock
+	// A normal recursive answer: the query echoed back with QR and RA set.
+	answerer: Echo_Mock
 	// Neither started means neither closed: a zero socket here is fd 0, which
 	// under `odin test` is another test's.
 	bad, bad_thread, bad_ok := start_udp_mock(t, &referrer, referral_loop, "referrer")
@@ -72,7 +64,7 @@ test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
 		return
 	}
 	defer stop_udp_mock(&referrer, bad_thread, bad)
-	good, good_thread, good_ok := start_udp_mock(t, &answerer, echo_loop, "answerer")
+	good, good_thread, good_ok := start_udp_mock(t, &answerer, echo_mock_loop, "answerer")
 	if !good_ok {
 		return
 	}
@@ -82,7 +74,10 @@ test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
 	g := failover_group(servers)
 	query := dns.Message{id = 0x4104, question = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}}}
 	query.flags.rd = true
-	wire, _, _ := dns.encode_message(query, context.temp_allocator)
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
+		return
+	}
 
 	// A client's own question.
 	plain, plain_winner, plain_err := resolve_readable(&g, wire, context.allocator)

@@ -1,9 +1,7 @@
 package upstream
 
-import "core:net"
 import "core:sync"
 import "core:testing"
-import "core:thread"
 import "core:time"
 import "elodin:dns"
 
@@ -15,85 +13,37 @@ answerable reply leaves which of the two the client gets to the member the
 group reaches.
 */
 
-// Answers every query with `rcode` and nothing else.
+// Starts one member per rcode, in order. `stop_mock_set` tears down whatever
+// started.
 @(private = "file")
-Fixed_Mock :: struct {
-	socket: net.UDP_Socket,
-	rcode:  u8,
-	stop:   bool,
-	hits:   int,
-}
-
-@(private = "file")
-fixed_loop :: proc(m: ^Fixed_Mock) {
-	buf: [512]u8
-	for !sync.atomic_load(&m.stop) {
-		n, client, err := net.recv_udp(m.socket, buf[:])
-		if err != nil || n < dns.HEADER_SIZE {
-			continue
-		}
-		sync.atomic_add(&m.hits, 1)
-		buf[2] |= 0x80
-		buf[3] = 0x80 | m.rcode
-		_, _ = net.send_udp(m.socket, buf[:n], client)
-	}
-}
-
-@(private = "file")
-NAMES := [3]string{"first", "second", "third"}
-
-@(private = "file")
-Fixed_Group :: struct {
-	mocks:   [3]Fixed_Mock,
-	servers: [3]^Upstream,
-	threads: [3]^thread.Thread,
-	started: int,
-}
-
-// Starts one member per rcode, in order. Whatever started is torn down by
-// `stop_fixed`, which is safe to call on a partial start: a zero socket here is
-// fd 0, another test's under `odin test`, so only what was bound is closed.
-@(private = "file")
-start_fixed :: proc(t: ^testing.T, fg: ^Fixed_Group, rcodes: []dns.Rcode) -> bool {
+start_fixed :: proc(t: ^testing.T, fg: ^Mock_Set(3), rcodes: []dns.Rcode) -> bool {
 	for rcode, i in rcodes {
-		m := &fg.mocks[i]
-		m.rcode = u8(rcode) & 0xf
-		u, worker, ok := start_udp_mock(t, m, fixed_loop, NAMES[i])
-		if !ok {
-			return false
-		}
-		fg.servers[i] = u
-		fg.threads[i] = worker
-		fg.started = i + 1
+		fg.mocks[i].rcode = u8(rcode) & 0xf
 	}
-	return true
-}
-
-@(private = "file")
-stop_fixed :: proc(fg: ^Fixed_Group) {
-	for i in 0 ..< fg.started {
-		stop_udp_mock(&fg.mocks[i], fg.threads[i], fg.servers[i])
-	}
+	return start_mock_set(t, fg, "member", count = len(rcodes))
 }
 
 @(private = "file")
 fixed_query :: proc() -> []u8 {
 	query := dns.Message{id = 0x0245, question = []dns.Question{{name = "corp.example.", type = .DS, class = .IN}}}
 	query.flags.rd = true
-	wire, _, _ := dns.encode_message(query, context.temp_allocator)
+	wire, _, err := dns.encode_message(query, context.temp_allocator)
+	if err != .None {
+		panic("the proving query does not encode")
+	}
 	return wire
 }
 
 // One exchange with each member, so that each is known to be answering: the
 // sweep holds out for a proof only from those (see `answering`).
 @(private = "file")
-warm :: proc(t: ^testing.T, fg: ^Fixed_Group) {
-	for u in fg.servers[:fg.started] {
+warm :: proc(t: ^testing.T, fg: ^Mock_Set(3)) {
+	for u in fg.servers[:fg.live] {
 		resp, err := exchange(u, fixed_query(), time.Second, context.allocator)
 		testing.expectf(t, err == .None, "warming %s: %v", u.spec.name, err)
 		delete(resp, context.allocator)
 	}
-	for &m in fg.mocks[:fg.started] {
+	for &m in fg.mocks[:fg.live] {
 		sync.atomic_store(&m.hits, 0)
 	}
 }
@@ -111,8 +61,8 @@ proves_nothing :: proc(_: []u8, _: rawptr) -> bool {
 
 @(test)
 test_an_answerable_reply_that_is_not_the_proof_does_not_end_the_sweep :: proc(t: ^testing.T) {
-	fg: Fixed_Group
-	defer stop_fixed(&fg)
+	fg: Mock_Set(3)
+	defer stop_mock_set(&fg)
 	if !start_fixed(t, &fg, {.NX_Domain, .No_Error}) {
 		return
 	}
@@ -140,8 +90,8 @@ test_an_answerable_reply_that_is_not_the_proof_does_not_end_the_sweep :: proc(t:
 
 @(test)
 test_a_proof_from_the_first_member_sweeps_nobody :: proc(t: ^testing.T) {
-	fg: Fixed_Group
-	defer stop_fixed(&fg)
+	fg: Mock_Set(3)
+	defer stop_mock_set(&fg)
 	if !start_fixed(t, &fg, {.No_Error, .NX_Domain}) {
 		return
 	}
@@ -161,8 +111,8 @@ answerable one, which would make the answer turn on the group's order past it.
 */
 @(test)
 test_a_sweep_with_no_proof_keeps_the_first_answerable_reply :: proc(t: ^testing.T) {
-	fg: Fixed_Group
-	defer stop_fixed(&fg)
+	fg: Mock_Set(3)
+	defer stop_mock_set(&fg)
 	if !start_fixed(t, &fg, {.Serv_Fail, .NX_Domain, .No_Error}) {
 		return
 	}
@@ -186,8 +136,8 @@ a later member's answerable reply has taken its place in hand: under
 */
 @(test)
 test_the_member_that_sent_the_group_looking_is_not_asked_again :: proc(t: ^testing.T) {
-	fg: Fixed_Group
-	defer stop_fixed(&fg)
+	fg: Mock_Set(3)
+	defer stop_mock_set(&fg)
 	if !start_fixed(t, &fg, {.NX_Domain, .Serv_Fail}) {
 		return
 	}
@@ -215,8 +165,8 @@ one. Neither a member never yet asked nor one whose last exchange failed.
 */
 @(test)
 test_a_member_not_known_to_be_answering_is_not_held_out_for :: proc(t: ^testing.T) {
-	fg: Fixed_Group
-	defer stop_fixed(&fg)
+	fg: Mock_Set(3)
+	defer stop_mock_set(&fg)
 	if !start_fixed(t, &fg, {.NX_Domain, .No_Error}) {
 		return
 	}

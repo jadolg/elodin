@@ -474,9 +474,9 @@ probe_mock_reply :: proc(m: ^Probe_Mock, query: []u8) -> (reply: []u8, ok: bool)
 	if !m.issue || !has_cookie {
 		return wire, true
 	}
-	option: [16]u8
-	copy(option[:8], sent[:min(8, len(sent))])
-	copy(option[8:], SERVER_COOKIE)
+	option := make([]u8, COOKIE_CLIENT_LEN + len(SERVER_COOKIE), context.temp_allocator)
+	copy(option[:COOKIE_CLIENT_LEN], sent[:min(COOKIE_CLIENT_LEN, len(sent))])
+	copy(option[COOKIE_CLIENT_LEN:], SERVER_COOKIE)
 	out, set_ok := dns.set_edns_option(wire, .Cookie, option[:], context.temp_allocator)
 	if !set_ok {
 		return wire, true

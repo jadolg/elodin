@@ -153,15 +153,8 @@ test_hold_to_floor_never_widens_a_host_policy :: proc(t: ^testing.T) {
 		if tc.want_min == TLS1_3_VERSION {
 			continue
 		}
-		got: [dynamic]string
+		got := suite_names(ptr, tls13 = false)
 		defer delete(got)
-		ciphers := SSL_CTX_get_ciphers(ptr)
-		for j in 0 ..< OPENSSL_sk_num(ciphers) {
-			cipher := (^SSL_CIPHER)(OPENSSL_sk_value(ciphers, j))
-			if SSL_CIPHER_get_kx_nid(cipher) != NID_KX_ANY {
-				append(&got, string(SSL_CIPHER_get_name(cipher)))
-			}
-		}
 		testing.expectf(t, slice.equal(got[:], tc.want_list), "%s: TLS 1.2 list %v, want %v", tc.name, got[:], tc.want_list)
 	}
 }
@@ -201,17 +194,25 @@ test_order_tls13_reorders_and_never_adds :: proc(t: ^testing.T) {
 		if err := order_tls13(ptr); !testing.expectf(t, err == .None, "%s: %v", tc.name, err) {
 			continue
 		}
-		got: [dynamic]string
+		got := suite_names(ptr, tls13 = true)
 		defer delete(got)
-		ciphers := SSL_CTX_get_ciphers(ptr)
-		for j in 0 ..< OPENSSL_sk_num(ciphers) {
-			cipher := (^SSL_CIPHER)(OPENSSL_sk_value(ciphers, j))
-			if SSL_CIPHER_get_kx_nid(cipher) == NID_KX_ANY {
-				append(&got, string(SSL_CIPHER_get_name(cipher)))
-			}
-		}
 		testing.expectf(t, slice.equal(got[:], tc.want), "%s: TLS 1.3 order %v, want %v", tc.name, got[:], tc.want)
 	}
+}
+
+// The names of `ptr`'s suites in its order: the TLS 1.3 ones, which name no key
+// exchange (`NID_KX_ANY`), or the rest. The caller deletes the list.
+@(private = "file")
+suite_names :: proc(ptr: ^SSL_CTX, tls13: bool) -> [dynamic]string {
+	names: [dynamic]string
+	ciphers := SSL_CTX_get_ciphers(ptr)
+	for j in 0 ..< OPENSSL_sk_num(ciphers) {
+		cipher := (^SSL_CIPHER)(OPENSSL_sk_value(ciphers, j))
+		if (SSL_CIPHER_get_kx_nid(cipher) == NID_KX_ANY) == tls13 {
+			append(&names, string(SSL_CIPHER_get_name(cipher)))
+		}
+	}
+	return names
 }
 
 // OpenSSL's own TLS 1.3 list, `OSSL_default_ciphersuites`, before any policy.

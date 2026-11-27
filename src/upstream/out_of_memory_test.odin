@@ -1,9 +1,7 @@
 package upstream
 
-import "base:runtime"
 import "core:mem"
 import "core:net"
-import "core:strings"
 import "core:sync"
 import "core:sys/linux"
 import "core:testing"
@@ -60,8 +58,9 @@ test_a_reply_read_without_memory_is_not_matched :: proc(t: ^testing.T) {
 	defer delete(query)
 	reply, _, rerr := dns.encode_message(dns.Message{id = 0x1234, flags = {qr = true}, question = other[:]})
 	defer delete(reply)
-	testing.expect_value(t, qerr, dns.Encode_Error.None)
-	testing.expect_value(t, rerr, dns.Encode_Error.None)
+	if !testing.expect_value(t, qerr, dns.Encode_Error.None) || !testing.expect_value(t, rerr, dns.Encode_Error.None) {
+		return
+	}
 	testing.expect(t, !response_matches(query, reply), "the fixture's question mismatch went unseen")
 
 	temp := context.temp_allocator
@@ -75,7 +74,9 @@ test_a_reply_read_without_memory_is_not_matched :: proc(t: ^testing.T) {
 	// `Bad_Response` for this server's memory.
 	ours, _, oerr := dns.encode_message(dns.Message{id = 0x1234, flags = {qr = true}, question = asked[:]})
 	defer delete(ours)
-	testing.expect_value(t, oerr, dns.Encode_Error.None)
+	if !testing.expect_value(t, oerr, dns.Encode_Error.None) {
+		return
+	}
 	context.temp_allocator = mem.nil_allocator()
 	genuine := response_matches(query, ours)
 	context.temp_allocator = temp
@@ -141,9 +142,8 @@ test_a_udp_query_without_room_is_not_sent :: proc(t: ^testing.T) {
 	}
 	defer delete(query)
 	for cookies in ([]bool{false, true}) {
-		bound: net.Endpoint
-		socket, bound_ok := net.UDP_Socket{}, false
-		if socket, bound, bound_ok = bind_loopback_udp(t); !bound_ok {
+		socket, bound, bound_ok := bind_loopback_udp(t)
+		if !bound_ok {
 			return
 		}
 		defer net.close(socket)
@@ -444,7 +444,7 @@ test_a_cookie_strip_without_memory_is_not_the_upstreams :: proc(t: ^testing.T) {
 	u := Upstream {
 		spec = config.Upstream_Spec{name = "strip", kind = .UDP},
 	}
-	option := [COOKIE_CLIENT_LEN + 8]u8{}
+	option := [COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN]u8{}
 	msg := dns.Message {
 		id         = 0x0636,
 		flags      = {qr = true},
@@ -517,44 +517,6 @@ test_an_h2_connection_without_room_is_not_built :: proc(t: ^testing.T) {
 	testing.expectf(t, len(track.allocation_map) == 0, "%d allocations kept", len(track.allocation_map))
 }
 
-@(private = "file")
-H2_Dial_Peer :: struct {
-	listener: net.TCP_Socket,
-	ctx:      ^tlsx.Context,
-	// What each connection's handshake chose, and how its reading ended.
-	alpn:     [2]string,
-	ended:    [2]tlsx.Error,
-}
-
-@(private = "file")
-h2_dial_peer_run :: proc(p: ^H2_Dial_Peer) {
-	for i in 0 ..< len(p.alpn) {
-		socket, _, aerr := net.accept_tcp(p.listener)
-		if aerr != nil {
-			return
-		}
-		if net.set_option(socket, .Receive_Timeout, 3 * time.Second) != nil {
-			net.close(socket)
-			return
-		}
-		conn, terr := tlsx.server_accept(p.ctx, socket)
-		if terr != .None {
-			net.close(socket)
-			return
-		}
-		// The test's thread frees it, which tracks a heap of its own.
-		p.alpn[i] = strings.clone(tlsx.alpn_protocol(conn), runtime.heap_allocator())
-		buf: [1024]u8
-		for {
-			if _, err := tlsx.read(conn, buf[:]); err != .None {
-				p.ended[i] = err
-				break
-			}
-		}
-		tlsx.close(conn)
-	}
-}
-
 /*
 A dial that negotiated h2 and then had no room for the connection reports
 `Out_Of_Memory` and closes the stream it dialled, rather than keep a connection
@@ -562,35 +524,25 @@ nothing reads; the next query dials afresh.
 */
 @(test)
 test_an_h2_dial_without_room_is_closed :: proc(t: ^testing.T) {
-	fx, fixture_ok := dot_fixture(t)
+	fx, fixture_ok := dot_fixture(t, client = true, alpn = {"h2"}, server_alpn = {"h2"})
 	if !fixture_ok {
 		return
 	}
 	defer dot_fixture_destroy(&fx)
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path, []string{"h2"})
-	if !testing.expectf(t, serr == .None, "server_context: %v", serr) {
-		return
-	}
-	defer tlsx.context_destroy(sctx)
-	cctx, cerr := tlsx.client_context(false, "", []string{"h2"})
-	if !testing.expectf(t, cerr == .None, "client_context: %v", cerr) {
-		return
-	}
 
-	p := H2_Dial_Peer {
+	p := Tls_Peer {
 		listener = fx.listener,
-		ctx      = sctx,
+		ctx      = fx.sctx,
+		conns    = 2,
 	}
-	peer := thread.create_and_start_with_poly_data(&p, h2_dial_peer_run)
+	peer := thread.create_and_start_with_poly_data(&p, tls_peer_run)
 	if !testing.expect(t, peer != nil, "cannot start the peer") {
-		tlsx.context_destroy(cctx)
 		return
 	}
 	defer {
 		thread.join(peer)
 		thread.destroy(peer)
-		delete(p.alpn[0], runtime.heap_allocator())
-		delete(p.alpn[1], runtime.heap_allocator())
+		tls_peer_free(&p)
 	}
 	// Dialled twice below; on an early return, the peer is woken from its accept.
 	dials := 0
@@ -605,12 +557,13 @@ test_an_h2_dial_without_room_is_closed :: proc(t: ^testing.T) {
 		context.allocator,
 	)
 	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
-		tlsx.context_destroy(cctx)
 		return
 	}
-	// One that takes the self-signed certificate; `destroy` frees it.
+	// One that takes the self-signed certificate; `destroy` frees it, so the
+	// fixture no longer does.
 	tlsx.context_destroy(u.tls_ctx)
-	u.tls_ctx = cctx
+	u.tls_ctx = fx.cctx
+	fx.cctx = nil
 
 	heap := u.allocator
 	f := testkit.Fail_Nth {

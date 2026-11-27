@@ -1,5 +1,6 @@
 package tlsx
 
+import "base:runtime"
 import "core:bytes"
 import "core:c"
 import "core:fmt"
@@ -15,6 +16,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 Tests run a real TLS session over loopback against a self-signed pair. Nothing
@@ -54,21 +56,18 @@ ssl_ctx_sess_number :: proc(ctx: ^SSL_CTX) -> int {
 Provide a certificate, the same way the integration suite does.
 
 `certs/` is gitignored, so a developer usually has one and CI never does. When
-it is missing, one is generated into the system temp directory and left there to
-be reused by later runs, which keeps key generation off the clock for everything
-but the first.
+it is missing, each run makes its own pair in a `testkit.private_dir` under
+this prefix: no run reads a directory another is writing, and the sweep takes
+the pairs of runs that have ended.
 */
 @(private = "file")
-CERT_DIR :: "/tmp/elodin-tlsx-test"
+CERT_DIR_PREFIX :: "/tmp/elodin-tlsx-test-"
 
 /*
 How long a generated certificate lives.
 
-Thirty days, since an expired one is noticed rather than handshaken with (see
-`cert_still_valid`): the reuse is there to keep key generation off the clock,
-and a lifetime of a day or two would spend it again every other day for no
-reason. Still short enough that a forgotten key in the system temp directory is
-not a permanent one.
+Thirty days: each run makes its own, so the length only has to outlast the run,
+and a key a sweep has not yet taken is not a permanent one.
 */
 @(private = "file")
 CERT_DAYS :: "30"
@@ -83,14 +82,10 @@ key_path: string
 cert_ok: bool
 
 /*
-Whether a certificate already on disk can still be handshaken with.
-
-The reuse above it is the point of the cache, and without a look at the date it
-is a time bomb: the generated certificate lives for `CERT_DAYS` and the files
-are reused whenever they exist. Reusing an expired pair would fail
-`test_verifying_context_refuses_a_name_it_cannot_bind` on its *control* case -
-the name the certificate carries, refused - on every run, until somebody
-deleted the directory by hand.
+Whether a certificate on disk can still be handshaken with: a developer's own
+`certs/` pair, which may have expired since it was made, and the fresh one.
+An expired pair would fail `test_verifying_context_refuses_a_name_it_cannot_bind`
+on its *control* case - the name the certificate carries, refused.
 
 `-checkend` asks the question directly, and asks it about an hour from now rather
 than about this instant, so a certificate cannot expire between this check and
@@ -119,13 +114,14 @@ generate_certs :: proc() {
 		return
 	}
 
-	cert_path = CERT_DIR + "/cert.pem"
-	key_path = CERT_DIR + "/key.pem"
-	if usable_pair(cert_path, key_path) {
-		cert_ok = true
+	testkit.sweep_private_dirs(CERT_DIR_PREFIX)
+	dir, made := testkit.private_dir(CERT_DIR_PREFIX)
+	if !made {
 		return
 	}
-	cert_ok = self_signed(CERT_DIR, cert_path, key_path, CERT_DAYS, "/CN=elodin.local", ELODIN_SAN)
+	cert_path = fmt.aprintf("%s/cert.pem", dir, allocator = runtime.heap_allocator())
+	key_path = fmt.aprintf("%s/key.pem", dir, allocator = runtime.heap_allocator())
+	cert_ok = self_signed(dir, cert_path, key_path, CERT_DAYS, "/CN=elodin.local", ELODIN_SAN) && usable_pair(cert_path, key_path)
 }
 
 @(private)
@@ -464,19 +460,23 @@ idle_worker :: proc(i: ^Idle_Ctx) {
 	i.n, i.err = read(i.conn, buf[:])
 }
 
+// How long `wait_until_asleep` waits.
+@(private = "file")
+ASLEEP_WAIT :: 5 * time.Second
+
 /*
-Waits for thread `tid` of this process to be asleep, as `/proc` reports it:
-nothing it runs before the wait blocks, so asleep is in the wait. False after
-five seconds.
+Waits up to `ASLEEP_WAIT` for thread `tid` of this process to be asleep, as
+`/proc` reports it: nothing it runs before the wait blocks, so asleep is in the
+wait. loop_test.odin holds the same procedure: a package's tests cannot reach
+another's.
 */
 @(private = "file")
 wait_until_asleep :: proc(tid: linux.Pid) -> bool {
 	path_buf: [64]u8
 	path := fmt.bprintf(path_buf[:], "/proc/self/task/%d/stat", tid)
-	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
-	for time.tick_diff(time.tick_now(), deadline) > 0 {
-		data, err := os.read_entire_file(path, context.temp_allocator)
-		if err == nil {
+	start := time.tick_now()
+	for time.tick_since(start) < ASLEEP_WAIT {
+		if data, err := os.read_entire_file(path, context.temp_allocator); err == nil {
 			// The state follows the command name, which may hold anything but
 			// ends at the last ')'.
 			stat := string(data)
@@ -484,7 +484,7 @@ wait_until_asleep :: proc(tid: linux.Pid) -> bool {
 				return true
 			}
 		}
-		time.sleep(time.Millisecond)
+		time.sleep(time.Millisecond) // lint:allow /proc reports a thread's state; there is no event to wait on
 	}
 	return false
 }
@@ -1649,12 +1649,6 @@ test_idle_connections_release_their_record_buffers :: proc(t: ^testing.T) {
 	}
 }
 
-/*
-RFC 6066 section 3: "Literal IPv4 and IPv6 addresses are not permitted in
-"HostName"." A name goes out as SNI; an address does not, and is still checked
-against the certificate's IP SAN.
-*/
-
 @(private = "file")
 Hello_Capture :: struct {
 	listener: net.TCP_Socket,
@@ -1747,6 +1741,9 @@ hello_for :: proc(t: ^testing.T, hostname: string) -> (hello: []u8, ok: bool) {
 	capture := new(Hello_Capture, context.temp_allocator)
 	capture.listener = listener
 	worker := thread.create_and_start_with_poly_data(capture, capture_hello)
+	if !testing.expect(t, worker != nil, "no thread to capture the ClientHello") {
+		return nil, false
+	}
 	sock, derr := net.dial_tcp_from_endpoint(bound)
 	if !testing.expectf(t, derr == nil, "cannot dial: %v", derr) {
 		thread.join(worker)
@@ -1769,6 +1766,11 @@ hello_for :: proc(t: ^testing.T, hostname: string) -> (hello: []u8, ok: bool) {
 	return capture.hello[:capture.n], true
 }
 
+/*
+RFC 6066 section 3: "Literal IPv4 and IPv6 addresses are not permitted in
+"HostName"." A name goes out as SNI; an address does not, and is still checked
+against the certificate's IP SAN.
+*/
 @(test)
 test_an_address_is_sent_no_sni :: proc(t: ^testing.T) {
 	posix.sigignore(.SIGPIPE)

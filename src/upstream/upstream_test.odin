@@ -15,6 +15,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:loop"
 import "elodin:netx"
+import "elodin:testkit"
 import "elodin:tlsx"
 
 /*
@@ -35,27 +36,32 @@ Mock :: struct {
 }
 
 /*
-Answer every query by echoing it back with the QR bit set.
-
-That is all `response_matches` asks for — the ID, the QR bit and a question that
-matches — and it keeps the responder free of an encoder of its own.
+`m` started on loopback and a race group's settings over two members both
+pointing at it, with an A query for `example.com.` under `id`. On false nothing
+is left to stop.
 */
 @(private = "file")
-mock_loop :: proc(m: ^Mock) {
-	buf: [512]u8
-	for !sync.atomic_load(&m.stop) {
-		n, client, err := net.recv_udp(m.socket, buf[:])
-		if err != nil {
-			// The receive timeout firing is how this loop notices `stop`.
-			continue
-		}
-		if n < dns.HEADER_SIZE {
-			continue
-		}
-		buf[2] |= 0x80
-		sync.atomic_add(&m.asked, 1)
-		_, _ = net.send_udp(m.socket, buf[:n], client)
+race_setup :: proc(t: ^testing.T, m: ^Echo_Mock, responder: ^^thread.Thread, id: u16) -> (cfg: config.Upstream_Config, wire: []u8, ok: bool) {
+	bound: net.Endpoint
+	bound, responder^ = serve_udp_mock(t, m, echo_mock_loop) or_return
+	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
+	servers[0] = {name = "a", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	servers[1] = {name = "b", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg = config.Upstream_Config{strategy = .Race, timeout = 2 * time.Second, attempts = 1, servers = servers}
+	query := dns.Message{id = id, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}
+	enc_err: dns.Encode_Error
+	wire, _, enc_err = dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err) {
+		stop_udp_mock(m, responder^)
+		return {}, nil, false
 	}
+	return cfg, wire, true
+}
+
+// Whether every race leg has let go of `g`.
+@(private = "file")
+legs_done :: proc(g: ^Group) -> bool {
+	return !busy(g)
 }
 
 // The arena behind `context.temp_allocator`, or nil if this thread was given
@@ -80,30 +86,13 @@ no budget every member is.
 */
 @(test)
 test_a_race_starts_only_the_legs_its_budget_has_room_for :: proc(t: ^testing.T) {
-	m := Mock{}
-	bound, responder, ok := serve_udp_mock(t, &m, mock_loop)
+	m := Echo_Mock{}
+	responder: ^thread.Thread
+	cfg, wire, ok := race_setup(t, &m, &responder, 0x2B2B)
 	if !ok {
 		return
 	}
 	defer stop_udp_mock(&m, responder)
-
-	cfg := config.Upstream_Config {
-		strategy = .Race,
-		timeout  = 2 * time.Second,
-		attempts = 1,
-		servers  = []config.Upstream_Spec {
-			{name = "a", kind = .UDP, address = "127.0.0.1", port = bound.port},
-			{name = "b", kind = .UDP, address = "127.0.0.1", port = bound.port},
-		},
-	}
-	query := dns.Message {
-		id       = 0x2B2B,
-		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
-	}
-	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
-	if !testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err) {
-		return
-	}
 
 	Case :: struct {
 		name:   string,
@@ -122,21 +111,18 @@ test_a_race_starts_only_the_legs_its_budget_has_room_for :: proc(t: ^testing.T) 
 		if !testing.expectf(t, gerr == .None, "%s: cannot build the group: %v", c.name, gerr) {
 			return
 		}
-		before := sync.atomic_load(&m.asked)
+		before := sync.atomic_load(&m.hits)
 		_, _, err := resolve_race(g, wire, 2 * time.Second, context.temp_allocator)
 		testing.expectf(t, err == .None, "%s: the race was not answered: %v", c.name, err)
 		// Every leg has let go of the group once it is not busy, and a leg that
 		// has let go has had its answer.
-		for deadline := time.tick_now(); busy(g) && time.tick_since(deadline) < 5 * time.Second; {
-			time.sleep(time.Millisecond)
-		}
-		testing.expectf(t, !busy(g), "%s: a leg never finished", c.name)
+		testing.expectf(t, wait_until(g, legs_done, 5 * time.Second), "%s: a leg never finished", c.name)
 		testing.expectf(
 			t,
-			sync.atomic_load(&m.asked) - before == c.asked,
+			sync.atomic_load(&m.hits) - before == c.asked,
 			"%s: %d members asked, want %d",
 			c.name,
-			sync.atomic_load(&m.asked) - before,
+			sync.atomic_load(&m.hits) - before,
 			c.asked,
 		)
 		if c.budget != nil {
@@ -155,30 +141,13 @@ would take it and the client would be sent nothing.
 */
 @(test)
 test_a_race_answer_that_cannot_be_copied_is_not_an_empty_answer :: proc(t: ^testing.T) {
-	m := Mock{}
-	bound, responder, ok := serve_udp_mock(t, &m, mock_loop)
+	m := Echo_Mock{}
+	responder: ^thread.Thread
+	cfg, wire, ok := race_setup(t, &m, &responder, 0x2C2C)
 	if !ok {
 		return
 	}
 	defer stop_udp_mock(&m, responder)
-
-	cfg := config.Upstream_Config {
-		strategy = .Race,
-		timeout  = 2 * time.Second,
-		attempts = 1,
-		servers  = []config.Upstream_Spec {
-			{name = "a", kind = .UDP, address = "127.0.0.1", port = bound.port},
-			{name = "b", kind = .UDP, address = "127.0.0.1", port = bound.port},
-		},
-	}
-	query := dns.Message {
-		id       = 0x2C2C,
-		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
-	}
-	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
-	if !testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err) {
-		return
-	}
 	g, gerr := make_group(cfg)
 	if !testing.expectf(t, gerr == .None, "cannot build the group: %v", gerr) {
 		return
@@ -186,10 +155,7 @@ test_a_race_answer_that_cannot_be_copied_is_not_an_empty_answer :: proc(t: ^test
 	resp, _, err := resolve_race(g, wire, 2 * time.Second, mem.nil_allocator())
 	testing.expect_value(t, err, Error.Out_Of_Memory)
 	testing.expect_value(t, len(resp), 0)
-	for deadline := time.tick_now(); busy(g) && time.tick_since(deadline) < 5 * time.Second; {
-		time.sleep(time.Millisecond)
-	}
-	if !testing.expect(t, !busy(g), "a leg never finished") {
+	if !testing.expect(t, wait_until(g, legs_done, 5 * time.Second), "a leg never finished") {
 		// Destroyed under a leg still holding it would be a use after free.
 		free_all(context.temp_allocator)
 		return
@@ -215,8 +181,8 @@ test_race_worker_releases_its_scratch :: proc(t: ^testing.T) {
 		return
 	}
 
-	m := Mock{}
-	u, responder, ok := start_udp_mock(t, &m, mock_loop)
+	m := Echo_Mock{}
+	u, responder, ok := start_udp_mock(t, &m, echo_mock_loop)
 	if !ok {
 		return
 	}
@@ -354,6 +320,29 @@ drain_request :: proc(client: net.TCP_Socket) {
 			return
 		}
 	}
+}
+
+/*
+`reply` read through `exchange_against` under a tracking allocator of its own,
+the exchange expected to succeed. The body is freed before this returns, so only
+what was read off the head is the caller's to look at.
+*/
+@(private)
+response_head :: proc(t: ^testing.T, reply: string) -> (resp: Http_Response, ok: bool) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	err: Error
+	resp, err, ok = exchange_against(t, reply, &track)
+	if !ok {
+		return
+	}
+	ok = testing.expectf(t, err == .None, "%q: %v", reply, err)
+	if len(resp.body) > 0 {
+		delete(resp.body, mem.tracking_allocator(&track))
+		resp.body = nil
+	}
+	return
 }
 
 /*
@@ -1586,32 +1575,9 @@ transport with no such limit, the same way the TC bit is handled.
 
 @(private = "file")
 Overrun_Mock :: struct {
-	udp:      net.UDP_Socket,
-	listener: net.TCP_Socket,
-	size:     int,
-	stop:     bool,
-}
-
-@(private = "file")
-overrun_udp_loop :: proc(m: ^Overrun_Mock) {
-	buf: [4096]u8
-	out := make([]u8, m.size)
-	defer delete(out)
-	for !sync.atomic_load(&m.stop) {
-		n, client, err := net.recv_udp(m.udp, buf[:])
-		if err != nil {
-			continue
-		}
-		if n < dns.HEADER_SIZE || n > m.size {
-			continue
-		}
-		copy(out, buf[:n])
-		for i in n ..< m.size {
-			out[i] = 0xAA
-		}
-		out[2] |= 0x80
-		_, _ = net.send_udp(m.udp, out, client)
-	}
+	// The UDP side, padding every answer as `big_reply_loop` does.
+	using big: Big_Mock,
+	listener:  net.TCP_Socket,
 }
 
 // Serves one framed answer and returns; one retry is all this needs.
@@ -1677,12 +1643,25 @@ test_udp_answer_over_the_advertised_size_falls_back_to_tcp :: proc(t: ^testing.T
 	set_socket_timeouts(udp, 50 * time.Millisecond)
 
 	m := Overrun_Mock {
-		udp      = udp,
+		big = {socket = udp, size = REPLY},
 		listener = listener,
-		size     = REPLY,
 	}
-	udp_thread := thread.create_and_start_with_poly_data(&m, overrun_udp_loop)
+	udp_thread := thread.create_and_start_with_poly_data(&m.big, big_reply_loop)
 	tcp_thread := thread.create_and_start_with_poly_data(&m, overrun_tcp_once)
+	if !testing.expect(t, udp_thread != nil && tcp_thread != nil, "cannot start the mocks") {
+		sync.atomic_store(&m.stop, true)
+		if udp_thread != nil {
+			thread.join(udp_thread)
+			thread.destroy(udp_thread)
+		}
+		if tcp_thread != nil {
+			thread.join(tcp_thread)
+			thread.destroy(tcp_thread)
+		}
+		net.close(udp)
+		net.close(listener)
+		return
+	}
 	defer {
 		sync.atomic_store(&m.stop, true)
 		thread.join(udp_thread)
@@ -1749,7 +1728,7 @@ Package-private rather than file-private: `padding_test.odin` stands up a DoT
 mock of its own and there is one key generation to share between them.
 */
 @(private)
-DOT_CERT_DIR :: "/tmp/elodin-upstream-test"
+DOT_CERT_DIR_PREFIX :: "/tmp/elodin-upstream-test-"
 
 @(private)
 dot_cert_once: sync.Once
@@ -1760,9 +1739,9 @@ dot_key_path: string
 @(private)
 dot_cert_ok: bool
 
-// Generated into the system temp directory and left there, so only the first
-// run of the suite pays for key generation. `certs/` is used when a developer
-// already has one; CI never does.
+// Generated into a `testkit.private_dir` of this run's own, so no run reads a
+// pair another is writing; the sweep takes the pairs of runs that have ended.
+// `certs/` is used when a developer already has one; CI never does.
 @(private)
 generate_dot_certs :: proc() {
 	if os.exists("certs/cert.pem") && os.exists("certs/key.pem") {
@@ -1770,17 +1749,13 @@ generate_dot_certs :: proc() {
 		return
 	}
 
-	dot_cert_path = DOT_CERT_DIR + "/cert.pem"
-	dot_key_path = DOT_CERT_DIR + "/key.pem"
-	if os.exists(dot_cert_path) && os.exists(dot_key_path) {
-		dot_cert_ok = true
+	testkit.sweep_private_dirs(DOT_CERT_DIR_PREFIX)
+	dir, made := testkit.private_dir(DOT_CERT_DIR_PREFIX)
+	if !made {
 		return
 	}
-	if !os.exists(DOT_CERT_DIR) {
-		if err := os.make_directory(DOT_CERT_DIR); err != nil {
-			return
-		}
-	}
+	dot_cert_path = fmt.aprintf("%s/cert.pem", dir, allocator = runtime.heap_allocator())
+	dot_key_path = fmt.aprintf("%s/key.pem", dir, allocator = runtime.heap_allocator())
 
 	process, perr := os.process_start(
 		os.Process_Desc {
@@ -1839,6 +1814,7 @@ dot_fixture :: proc(
 	t: ^testing.T,
 	client := false,
 	alpn: []string = nil,
+	server_alpn: []string = nil,
 ) -> (
 	f: Dot_Fixture,
 	ok: bool,
@@ -1857,7 +1833,7 @@ dot_fixture :: proc(
 		net.close(listener)
 		return
 	}
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path, server_alpn)
 	if !testing.expectf(t, serr == .None, "server_context: %v", serr) {
 		net.close(listener)
 		return
@@ -1872,6 +1848,61 @@ dot_fixture :: proc(
 		f.cctx = cctx
 	}
 	return f, true
+}
+
+/*
+A TLS peer on `listener` for `conns` connections in turn, at most
+`len(alpn)`: each accepted under `ctx`, the protocol its handshake chose kept
+(on the heap; `tls_peer_free` frees it), then read until the client closes it.
+`ended` is how each read ended: `.Closed` for a close_notify, an error for a
+bare EOF or a connection that never came.
+*/
+@(private)
+Tls_Peer :: struct {
+	listener: net.TCP_Socket,
+	ctx:      ^tlsx.Context,
+	conns:    int,
+	alpn:     [2]string,
+	ended:    [2]tlsx.Error,
+}
+
+@(private)
+tls_peer_run :: proc(p: ^Tls_Peer) {
+	for &e in p.ended {
+		e = .IO_Error
+	}
+	for i in 0 ..< min(p.conns, len(p.alpn)) {
+		socket, _, aerr := net.accept_tcp(p.listener)
+		if aerr != nil {
+			return
+		}
+		if net.set_option(socket, .Receive_Timeout, 3 * time.Second) != nil {
+			net.close(socket)
+			return
+		}
+		conn, terr := tlsx.server_accept(p.ctx, socket)
+		if terr != .None {
+			net.close(socket)
+			return
+		}
+		// The test's thread frees it, which may track a heap of its own.
+		p.alpn[i] = strings.clone(tlsx.alpn_protocol(conn), runtime.heap_allocator())
+		buf: [1024]u8
+		for {
+			if _, err := tlsx.read(conn, buf[:]); err != .None {
+				p.ended[i] = err
+				break
+			}
+		}
+		tlsx.close(conn)
+	}
+}
+
+@(private)
+tls_peer_free :: proc(p: ^Tls_Peer) {
+	for a in p.alpn {
+		delete(a, runtime.heap_allocator())
+	}
 }
 
 @(private)
@@ -2325,39 +2356,12 @@ Two responders, in configured order: the first answers SERVFAIL to everything,
 the second answers NOERROR. `resolve` is expected to take the first at its word;
 `resolve_answerable` is expected to go on and find the second.
 */
-@(private = "file")
-Rcode_Mock :: struct {
-	socket: net.UDP_Socket,
-	rcode:  u8,
-	stop:   bool,
-	hits:   int,
-}
-
-@(private = "file")
-rcode_mock_loop :: proc(m: ^Rcode_Mock) {
-	buf: [512]u8
-	for !sync.atomic_load(&m.stop) {
-		n, client, err := net.recv_udp(m.socket, buf[:])
-		if err != nil {
-			// The receive timeout firing is how this loop notices `stop`.
-			continue
-		}
-		if n < dns.HEADER_SIZE {
-			continue
-		}
-		sync.atomic_add(&m.hits, 1)
-		buf[2] |= 0x80
-		buf[3] = (buf[3] & 0xf0) | m.rcode
-		_, _ = net.send_udp(m.socket, buf[:n], client)
-	}
-}
-
 // Binds a responder that answers every query with `rcode`, and hands back the
 // upstream pointing at it.
 @(private = "file")
 start_rcode_mock :: proc(
 	t: ^testing.T,
-	m: ^Rcode_Mock,
+	m: ^Echo_Mock,
 	name: string,
 	rcode: dns.Rcode,
 ) -> (
@@ -2366,13 +2370,13 @@ start_rcode_mock :: proc(
 	ok: bool,
 ) {
 	m.rcode = u8(rcode) & 0xf
-	return start_udp_mock(t, m, rcode_mock_loop, name)
+	return start_udp_mock(t, m, echo_mock_loop, name)
 }
 
 @(test)
 test_a_chain_lookup_is_asked_elsewhere_when_one_upstream_declines :: proc(t: ^testing.T) {
-	refuser := Rcode_Mock{}
-	answerer := Rcode_Mock{}
+	refuser := Echo_Mock{}
+	answerer := Echo_Mock{}
 
 	bad, bad_thread, bad_ok := start_rcode_mock(t, &refuser, "refuser", .Serv_Fail)
 	if !bad_ok {
@@ -2440,8 +2444,8 @@ being what `record_failure` needs and none of them what this case is about.
 */
 @(test)
 test_the_sweep_leaves_a_parked_upstream_alone :: proc(t: ^testing.T) {
-	refuser := Rcode_Mock{}
-	answerer := Rcode_Mock{}
+	refuser := Echo_Mock{}
+	answerer := Echo_Mock{}
 
 	bad, bad_thread, bad_ok := start_rcode_mock(t, &refuser, "refuser", .Serv_Fail)
 	if !bad_ok {
@@ -2488,8 +2492,8 @@ test_the_sweep_leaves_a_parked_upstream_alone :: proc(t: ^testing.T) {
 // rather than the caller getting a transport error it would report differently.
 @(test)
 test_a_chain_lookup_keeps_the_reply_when_no_upstream_can_answer :: proc(t: ^testing.T) {
-	first := Rcode_Mock{}
-	second := Rcode_Mock{}
+	first := Echo_Mock{}
+	second := Echo_Mock{}
 
 	a, a_thread, a_ok := start_rcode_mock(t, &first, "first", .Serv_Fail)
 	if !a_ok {
