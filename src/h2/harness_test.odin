@@ -448,11 +448,11 @@ destroying_handler :: proc(conn: ^Conn, req: ^Request) {
 ignore_request :: proc(conn: ^Conn, req: ^Request) {
 }
 
-// x-t: 1, a literal with incremental indexing: it becomes dynamic index 62, so
-// a decoder that skipped it falls out of step with the peer's encoder.
 // RST_STREAM's payload for CANCEL.
 @(private)
 RST_CANCEL :: [4]u8{0, 0, 0, u8(Error_Code.Cancel)}
 
+// x-t: 1, a literal with incremental indexing: it becomes dynamic index 62, so
+// a decoder that skipped it falls out of step with the peer's encoder.
 @(private)
 TRAILER :: [?]u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}

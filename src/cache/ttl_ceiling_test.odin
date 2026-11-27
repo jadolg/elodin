@@ -87,6 +87,8 @@ test_min_ttl_raises_a_zero_ttl :: proc(t: ^testing.T) {
 // With no cache, the ceiling is the RFC 8767 section 4 cap.
 @(test)
 test_no_cache_caps_at_the_rfc_8767_figure :: proc(t: ^testing.T) {
+	// The figure itself, seven days: what the RFC sets, pinned here.
+	testing.expect_value(t, dns.TTL_CAP, u32(7 * 24 * 60 * 60))
 	testing.expect_value(t, ttl_ceiling(nil), dns.TTL_CAP)
 }
 

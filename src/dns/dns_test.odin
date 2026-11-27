@@ -844,9 +844,8 @@ test_name_length_counts_the_root_octet :: proc(t: ^testing.T) {
 	testing.expect_value(t, terr, Decode_Error.Name_Too_Long)
 
 	// The encoder is the other side of that same line, so pin it too: the
-	// presentation form
-	// of those same five labels has to come back Name_Too_Long rather than a
-	// 256th octet.
+	// presentation form of those same five labels has to come back
+	// Name_Too_Long rather than a 256th octet.
 	presentation := make([dynamic]u8, 0, 256, context.temp_allocator)
 	for _ in 0 ..< 5 {
 		for _ in 0 ..< 50 {

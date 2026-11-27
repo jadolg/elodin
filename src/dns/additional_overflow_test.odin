@@ -662,9 +662,6 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 		return a_answer("mail.example.com.", 300, last)
 	}
 	other := a_answer("other.example.com.", 300, 9)
-	// An RRSIG at the TXT records' owner covering `covered`: the type covered
-	// is its RDATA's first two bytes, and the rest is padding to a size that
-	// fits where a long TXT record was taken back from.
 	// One TXT RRset: a short record, one past the room, and a short one again,
 	// which would fit where the long one was taken back to.
 	txt := proc(text: string) -> Record {
@@ -793,8 +790,7 @@ test_past_the_rrsets_it_tracks_the_rest_of_the_section_goes :: proc(t: ^testing.
 Past `DROPPED_RRSETS` the rest of the additional section is left out, but glue
 a referral cannot be read without still truncates (RFC 9471 section 3.3): a
 referral whose in-domain glue sits behind `DROPPED_RRSETS` + 1 RRsets too big to
-fit goes out
-with TC set, not as a delegation the client cannot follow.
+fit goes out with TC set, not as a delegation the client cannot follow.
 */
 @(test)
 test_glue_past_the_tracked_rrsets_still_truncates :: proc(t: ^testing.T) {

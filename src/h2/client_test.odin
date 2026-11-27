@@ -383,6 +383,10 @@ test_client_response_past_max_body_is_too_large :: proc(t: ^testing.T) {
 			started = start_peer(t, &p)
 		}
 		if started {
+			// The peak from here on: the peer's thread and listener are tracked
+			// too, and are no part of what the response grows.
+			base := held.current_memory_allocated
+			held.peak_memory_allocated = base
 			request := []u8{1, 2}
 			resp, err := client_request(
 				p.c,
@@ -395,7 +399,7 @@ test_client_response_past_max_body_is_too_large :: proc(t: ^testing.T) {
 				testing.expect_value(t, len(resp.body), MAX_BODY)
 				// The stream's body grows by doubling but never past the bound,
 				// where `append` alone takes it to 116 KiB.
-				testing.expectf(t, held.peak_memory_allocated < MAX_BODY + 8192, "the client peaked at %d bytes", held.peak_memory_allocated)
+				testing.expectf(t, held.peak_memory_allocated - base < MAX_BODY + 8192, "the client peaked at %d bytes past its setup", held.peak_memory_allocated - base)
 			} else {
 				testing.expectf(t, err == .Too_Large, "a %d-byte response came back as %v", MAX_BODY + 1, err)
 				// With its status, so the caller can tell an oversized answer from

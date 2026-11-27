@@ -73,6 +73,8 @@ test_a_flood_fills_every_shard_within_the_limits :: proc(t: ^testing.T) {
 	for &s in c.shards {
 		testing.expect_value(t, len(s.entries), s.max_entries)
 	}
+	// And the shards together hold the operator's limit, not more.
+	testing.expect_value(t, len_entries(c), MAX)
 	testing.expect_value(t, stats(c).inserts, u64(3 * MAX))
 	testing.expect_value(t, stats(c).evictions, u64(3 * MAX - len_entries(c)))
 }

@@ -520,9 +520,9 @@ records is a large RRset; together they come to 404 KB of names against
 `NAME_BUDGET`, so the test is a real hold on the figure rather than a shape that
 could never reach it.
 
-The boundary is a good way further out: a pointer-owned record costs 16 wire bytes for about
-101 of name here, and it takes around 160 characters of name before a
-full-length reply of them is refused.
+The boundary is a good way further out: a pointer-owned record costs 16 wire
+bytes for about 101 of name here, and it takes around 160 characters of name
+before a full-length reply of them is refused.
 */
 @(test)
 test_long_name_pointed_at_by_a_whole_rrset_still_decodes :: proc(t: ^testing.T) {

@@ -57,7 +57,7 @@ superseded_junk :: proc(wire: []u8) -> []u8 {
 @(private = "file")
 superseded_lapsed_rrsig :: proc() -> dns.Record {
 	expiration := u32(time.time_to_unix(time.now())) - 3600 // lint:allow wall-clock: an RRSIG's expiration is an instant on it
-	return dns.Record{name = STALE_NAME, type = .RRSIG, class = .IN, ttl = 300, data = rrsig_over(.A, expiration = expiration, original_ttl = 300)}
+	return dns.Record{name = STALE_NAME, type = .RRSIG, class = .IN, ttl = 300, data = rrsig_over(.A, expiration = expiration, original_ttl = 300, signer = ".", labels = 2)}
 }
 
 @(private = "file")
