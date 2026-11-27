@@ -8,20 +8,6 @@ import "elodin:dns"
 import "elodin:testkit"
 
 /*
-A fresh hashing allowance, held to `max_iterations` per record.
-
-Every call below gets its own, the way every client question does. The proofs
-take one rather than a bare ceiling so that no path can hash without being
-charged for it - see `MAX_NSEC3_ROUNDS_PER_QUERY`.
-*/
-@(private = "file")
-budget_at :: proc(max_iterations: int) -> ^Nsec3_Budget {
-	b := new(Nsec3_Budget, context.temp_allocator)
-	b.max_iterations = max_iterations
-	return b
-}
-
-/*
 What a DS denial is allowed to say about the name below it.
 
 The walk down to a zone's keys asks for a DS at every label, and a denial that
@@ -90,7 +76,8 @@ test_a_denial_of_a_name_that_is_not_there_ends_the_walk :: proc(t: ^testing.T) {
 	// walk must stop on the second rather than ask about the label below it.
 	zone := nsec3_zone({{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}}, {"a.example.", {.A, .RRSIG}}})
 	testing.expect(t, len(zone) == 2, "the chain should build")
-	nsec3_step, _ := denial_step(nil, zone, "nx.example.", "example.", budget_at(150))
+	nsec3_step, nsec3_step_cut := denial_step(nil, zone, "nx.example.", "example.", budget_at(150))
+	testing.expect(t, !nsec3_step_cut, "the step was cut short, so its verdict says nothing of the denial")
 	testing.expect_value(t, nsec3_step, Step.Absent)
 
 	// And NSEC, where the same span answers for every name inside it, so the
@@ -100,7 +87,8 @@ test_a_denial_of_a_name_that_is_not_there_ends_the_walk :: proc(t: ^testing.T) {
 		nsec_rr("a.example.", "z.example.", {.A, .RRSIG, .NSEC}),
 		nsec_rr("z.example.", "example.", {.A, .RRSIG, .NSEC}),
 	}
-	nsec_step, _ := denial_step(nsecs, nil, "nx.example.", "example.", budget_at(150))
+	nsec_step, nsec_step_cut := denial_step(nsecs, nil, "nx.example.", "example.", budget_at(150))
+	testing.expect(t, !nsec_step_cut, "the step was cut short, so its verdict says nothing of the denial")
 	testing.expect_value(t, nsec_step, Step.Absent)
 	free_all(context.temp_allocator)
 }
@@ -117,7 +105,8 @@ test_a_denial_at_an_empty_non_terminal_keeps_the_walk_going :: proc(t: ^testing.
 		},
 	)
 	testing.expect(t, len(zone) == 3, "the chain should build")
-	nsec3_step, _ := denial_step(nil, zone, "ent.example.", "example.", budget_at(150))
+	nsec3_step, nsec3_step_cut := denial_step(nil, zone, "ent.example.", "example.", budget_at(150))
+	testing.expect(t, !nsec3_step_cut, "the step was cut short, so its verdict says nothing of the denial")
 	testing.expect_value(t, nsec3_step, Step.No_Cut)
 
 	/*
@@ -132,7 +121,8 @@ test_a_denial_at_an_empty_non_terminal_keeps_the_walk_going :: proc(t: ^testing.
 		nsec_rr("example.", "a.ent.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
 		nsec_rr("a.ent.example.", "example.", {.A, .RRSIG, .NSEC}),
 	}
-	nsec_step, _ := denial_step(nsecs, nil, "ent.example.", "example.", budget_at(150))
+	nsec_step, nsec_step_cut := denial_step(nsecs, nil, "ent.example.", "example.", budget_at(150))
+	testing.expect(t, !nsec_step_cut, "the step was cut short, so its verdict says nothing of the denial")
 	testing.expect_value(t, nsec_step, Step.No_Cut)
 	free_all(context.temp_allocator)
 }
@@ -142,14 +132,16 @@ test_a_denial_at_an_unsigned_delegation_still_ends_the_chain :: proc(t: ^testing
 	// Neither of the two readings above: the name is there, it is delegated,
 	// and it carries no DS, which is where the chain of trust stops.
 	zone := nsec3_zone({{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}}, {"sub.example.", {.NS}}})
-	nsec3_step, _ := denial_step(nil, zone, "sub.example.", "example.", budget_at(150))
+	nsec3_step, nsec3_step_cut := denial_step(nil, zone, "sub.example.", "example.", budget_at(150))
+	testing.expect(t, !nsec3_step_cut, "the step was cut short, so its verdict says nothing of the denial")
 	testing.expect_value(t, nsec3_step, Step.Insecure)
 
 	nsecs := []Nsec_Rr {
 		nsec_rr("example.", "sub.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
 		nsec_rr("sub.example.", "example.", {.NS, .NSEC}),
 	}
-	nsec_step, _ := denial_step(nsecs, nil, "sub.example.", "example.", budget_at(150))
+	nsec_step, nsec_step_cut := denial_step(nsecs, nil, "sub.example.", "example.", budget_at(150))
+	testing.expect(t, !nsec_step_cut, "the step was cut short, so its verdict says nothing of the denial")
 	testing.expect_value(t, nsec_step, Step.Insecure)
 	free_all(context.temp_allocator)
 }
@@ -159,7 +151,8 @@ test_a_denial_that_settles_nothing_is_refused :: proc(t: ^testing.T) {
 	// Records from some other part of the zone say nothing about this name, and
 	// "says nothing" must not be read as either answer.
 	nsecs := []Nsec_Rr{nsec_rr("a.example.", "b.example.", {.A, .RRSIG, .NSEC})}
-	out_of_zone, _ := denial_step(nsecs, nil, "q.other.", "other.", budget_at(150))
+	out_of_zone, out_of_zone_cut := denial_step(nsecs, nil, "q.other.", "other.", budget_at(150))
+	testing.expect(t, !out_of_zone_cut, "the step was cut short, so its verdict says nothing of the denial")
 	testing.expect_value(t, out_of_zone, Step.Bogus)
 	free_all(context.temp_allocator)
 }
@@ -186,7 +179,8 @@ test_a_step_whose_hashing_ran_out_is_not_read_as_an_absent_name :: proc(t: ^test
 	measured := Nsec3_Budget {
 		max_iterations = 150,
 	}
-	probe, _ := denial_step(nil, zone, "ent.example.", "example.", &measured)
+	probe, probe_cut := denial_step(nil, zone, "ent.example.", "example.", &measured)
+	testing.expect(t, !probe_cut, "the step was cut short, so its verdict says nothing of the denial")
 	testing.expect_value(t, probe, Step.No_Cut)
 	testing.expect(t, measured.rounds > 0, "a step that hashes nothing cannot be starved")
 
@@ -473,7 +467,7 @@ test_a_refused_record_does_not_downgrade_a_readable_denial :: proc(t: ^testing.T
 	budget := Nsec3_Budget {
 		max_iterations = 100,
 	}
-	step, _ := denial_step(nil, both[:], "sub.example.", "example.", &budget)
+	step, _ := denial_step(nil, both[:], "sub.example.", "example.", &budget) // lint:allow the refused record sets the flag; the verdict is what this pins
 	testing.expect_value(t, step, Step.Bogus)
 	free_all(context.temp_allocator)
 }

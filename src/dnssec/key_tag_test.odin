@@ -1,5 +1,6 @@
 package dnssec
 
+import "core:strings"
 import "core:testing"
 import "elodin:dns"
 
@@ -42,7 +43,7 @@ test_a_key_tag_query_name_that_does_not_fit_is_refused :: proc(t: ^testing.T) {
 	// Three labels of 63 octets and one of 55 are 249 octets on the wire, a
 	// zone DNS can name; `_ta-0001` puts 9 more in front, 258.
 	label := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	long := concat(label, ".", label, ".", label, ".", label[:55], ".")
+	long := strings.concatenate({label, ".", label, ".", label, ".", label[:55], "."}, context.temp_allocator)
 	wire: [256]u8
 	_, zone_err := dns.encode_name(long, wire[:])
 	testing.expectf(t, zone_err == .None, "the premise: the zone is a name DNS can carry (%v)", zone_err)
@@ -52,20 +53,6 @@ test_a_key_tag_query_name_that_does_not_fit_is_refused :: proc(t: ^testing.T) {
 	_, none := key_tag_query_name(".", nil, context.temp_allocator)
 	testing.expect(t, !none, "a Key Tag query name was built with no tags")
 	free_all(context.temp_allocator)
-}
-
-@(private = "file")
-concat :: proc(parts: ..string) -> string {
-	n := 0
-	for p in parts {
-		n += len(p)
-	}
-	out := make([]u8, n, context.temp_allocator)
-	at := 0
-	for p in parts {
-		at += copy(out[at:], p)
-	}
-	return string(out)
 }
 
 // The tags signalled for a zone are its anchors', sorted, each once; none for

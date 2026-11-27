@@ -4,6 +4,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:testkit"
 
 // The captured chain, with lookup number `fail_at` unanswered: an upstream that
 // lost one reply.
@@ -31,7 +32,7 @@ the walk lost in turn.
 */
 @(test)
 test_a_lost_chain_reply_is_not_a_forgery :: proc(t: ^testing.T) {
-	wire := unhex(fixture("example_a").wire, context.allocator)
+	wire := testkit.unhex(fixture("example_a").wire, context.allocator)
 	defer delete(wire)
 	lost := 0
 	for n := 1; ; n += 1 {

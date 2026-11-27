@@ -95,10 +95,7 @@ ED25519_KEY_TAG :: 14506
 // `ED25519_KEY_RDATA` as a key set of one. A key that does not decode or parse
 // is a broken test, so it panics.
 ed25519_key :: proc() -> []Dnskey {
-	rdata, ok := decode_hex(ED25519_KEY_RDATA, context.temp_allocator)
-	if !ok {
-		panic("the test key is not hex")
-	}
+	rdata := testkit.unhex(ED25519_KEY_RDATA)
 	key, err := parse_dnskey(rdata)
 	if err != .None {
 		panic("the test key does not parse")
@@ -209,16 +206,6 @@ SPENT :: dns.REQUEST_DECODE_BUDGET + 1
 // literal, so the tests name it once here.
 NO_DENIAL :: "no denial of existence"
 
-// Test hex decoded. Text that is not hex is a broken test, not an input to judge,
-// so it panics rather than hand back a nil every caller would have to check.
-unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
-	out, ok := decode_hex(text, allocator)
-	if !ok {
-		panic("test hex does not decode")
-	}
-	return out
-}
-
 // The fixture under `key` in `table`, the captured set when that is nil. A key
 // the table lacks is a broken test.
 fixture :: proc(key: string, table: []Fixture = nil) -> Fixture {
@@ -233,7 +220,7 @@ fixture :: proc(key: string, table: []Fixture = nil) -> Fixture {
 // The reply under `key` in `fixtures`, decoded. A missing key or a wire that is
 // not hex is a broken test, not a verdict, so it panics.
 scenario_fixture :: proc(fixtures: []Fixture, key: string) -> []u8 {
-	return unhex(fixture(key, fixtures).wire)
+	return testkit.unhex(fixture(key, fixtures).wire)
 }
 
 // The reply `fixtures` holds for a lookup, the way an upstream would answer it.
@@ -242,7 +229,7 @@ scenario_fixture :: proc(fixtures: []Fixture, key: string) -> []u8 {
 fixture_answer :: proc(fixtures: []Fixture, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
 	for f in fixtures {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return unhex(f.wire, allocator), true
+			return testkit.unhex(f.wire, allocator), true
 		}
 	}
 	return nil, false
@@ -278,6 +265,14 @@ fixture_anchors :: proc(texts: ..string) -> []Trust_Anchor {
 // A validator answered from `fixtures` and anchored at `anchors`.
 scenario_validator :: proc(fixtures: ^[]Fixture, anchors: ..string) -> ^Validator {
 	return make_validator(scenario_query, fixtures, Options{anchors = fixture_anchors(..anchors)})
+}
+
+// `wire`, the reply to `qname`'s `qtype`, validated at `now` by a fresh validator
+// answered from `fixtures` and anchored at `anchors`, gone again by the return.
+scenario_validate :: proc(fixtures: ^[]Fixture, qname: string, qtype: dns.Type, wire: []u8, anchors: ..string, now := i64(FIXTURE_TIME)) -> Result {
+	v := scenario_validator(fixtures, ..anchors)
+	defer destroy_validator(v)
+	return validate(v, qname, qtype, wire, time.unix(now, 0))
 }
 
 /*
@@ -715,4 +710,17 @@ FIXTURES := []Fixture{
 			"171620e373094c70436db9532abb52afab92f98211f17eb31add58c1a831e66897849d2d11094700002904d000008000" +
 			"0000",
 	},
+}
+
+/*
+A fresh hashing allowance, held to `max_iterations` per record.
+
+Every call gets its own, the way every client question does. The proofs
+take one rather than a bare ceiling so that no path can hash without being
+charged for it - see `MAX_NSEC3_ROUNDS_PER_QUERY`.
+*/
+budget_at :: proc(max_iterations: int) -> ^Nsec3_Budget {
+	b := new(Nsec3_Budget, context.temp_allocator)
+	b.max_iterations = max_iterations
+	return b
 }

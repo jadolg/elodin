@@ -271,10 +271,7 @@ test_a_ds_for_an_unknown_algorithm_does_not_break_a_rollover :: proc(t: ^testing
 	unusable because part of it is unusable would take every zone adding an
 	algorithm off the air for the length of its rollover.
 	*/
-	v := scenario_validator(&DG_FIXTURES, DG_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "www.dgtest.", .A, scenario_fixture(DG_FIXTURES, "dg_answer"), fixture_now())
+	result := scenario_validate(&DG_FIXTURES, "www.dgtest.", .A, scenario_fixture(DG_FIXTURES, "dg_answer"), DG_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -295,10 +292,7 @@ test_a_ds_set_of_only_unknown_algorithms_is_insecure_not_bogus :: proc(t: ^testi
 	not heard of - the failure mode that keeps validators from ever adopting a
 	new algorithm.
 	*/
-	v := scenario_validator(&UA_FIXTURES, UA_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "www.uatest.", .A, scenario_fixture(UA_FIXTURES, "ua_answer"), fixture_now())
+	result := scenario_validate(&UA_FIXTURES, "www.uatest.", .A, scenario_fixture(UA_FIXTURES, "ua_answer"), UA_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Insecure,
@@ -318,10 +312,7 @@ test_a_ds_set_of_only_unknown_digests_is_insecure_not_bogus :: proc(t: ^testing.
 	algorithm would have this delegation look followable right up to the point
 	the digest fails to match, which is bogus rather than insecure.
 	*/
-	v := scenario_validator(&UD_FIXTURES, UD_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "www.udtest.", .A, scenario_fixture(UD_FIXTURES, "ud_answer"), fixture_now())
+	result := scenario_validate(&UD_FIXTURES, "www.udtest.", .A, scenario_fixture(UD_FIXTURES, "ud_answer"), UD_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Insecure,
@@ -346,10 +337,7 @@ test_a_revoked_apex_key_cannot_carry_the_chain :: proc(t: ^testing.T) {
 	rather than an unsigned one: the parent says there is a chain here, and there
 	is not.
 	*/
-	v := scenario_validator(&RV_FIXTURES, RV_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "www.rvtest.", .A, scenario_fixture(RV_FIXTURES, "rv_answer"), fixture_now())
+	result := scenario_validate(&RV_FIXTURES, "www.rvtest.", .A, scenario_fixture(RV_FIXTURES, "rv_answer"), RV_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Bogus,
@@ -392,10 +380,7 @@ test_an_unfollowable_ds_beside_an_unknown_one_is_bogus :: proc(t: ^testing.T) {
 	Without this scenario the two checks cover for each other: break either one
 	and the other still produces the same verdict, and nothing fails.
 	*/
-	v := scenario_validator(&UF_FIXTURES, UF_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "www.uftest.", .A, scenario_fixture(UF_FIXTURES, "uf_answer"), fixture_now())
+	result := scenario_validate(&UF_FIXTURES, "www.uftest.", .A, scenario_fixture(UF_FIXTURES, "uf_answer"), UF_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Bogus,

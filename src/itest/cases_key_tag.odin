@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:slice"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 RFC 8145 section 4.2.2: a client's own `edns-key-tag` option on its DNSKEY
@@ -83,7 +84,7 @@ run_client_key_tag_validating_case :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("key-tag-validating", upstream_port)
 	for f in ANCHORED_REVERSE_FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	}
 	if !mock_start_or_skip(r, mock, "key-tag-validating") {
 		return

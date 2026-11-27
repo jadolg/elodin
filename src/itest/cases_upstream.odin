@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 Upstream coverage: the transports elodin speaks as a client, the three
@@ -308,7 +309,7 @@ run_upstream_transport_cases :: proc(r: ^Runner) {
 	{
 		upstream_port := next_port(r)
 		mock := mock_make("tcp-upstream", upstream_port)
-		mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
+		mock_reply(mock, fix.qname, fix.qtype, testkit.unhex(fix.response, context.allocator))
 		if mock_start_or_skip(r, mock, "upstream: tcp") {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
@@ -344,7 +345,7 @@ run_upstream_transport_cases :: proc(r: ^Runner) {
 	{
 		upstream_port := next_port(r)
 		mock := mock_make("dot-upstream", upstream_port)
-		mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
+		mock_reply(mock, fix.qname, fix.qtype, testkit.unhex(fix.response, context.allocator))
 		if mock_start_or_skip(r, mock, "upstream: dot", r.cert_file, r.key_file) {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
@@ -384,7 +385,7 @@ run_upstream_transport_cases :: proc(r: ^Runner) {
 	// --- truncated UDP answer retried over TCP ---
 	{
 		upstream_port := next_port(r)
-		full := from_hex(fixture("txt").response, context.allocator)
+		full := testkit.unhex(fixture("txt").response, context.allocator)
 		mock := mock_make("truncating", upstream_port)
 		mock_truncate_udp(mock, "google.com.", u16(dns.Type.TXT), full)
 		if mock_start_or_skip(r, mock, "upstream: udp to tcp retry") {
@@ -544,7 +545,7 @@ run_stale_connection_cases :: proc(r: ^Runner) {
 
 		upstream_port := next_port(r)
 		mock := mock_make("stale", upstream_port)
-		mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
+		mock_reply(mock, fix.qname, fix.qtype, testkit.unhex(fix.response, context.allocator))
 		// Drop connections after a beat of idleness.
 		mock_close_idle_after(mock, 250 * time.Millisecond)
 

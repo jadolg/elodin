@@ -1,6 +1,7 @@
 package itest
 
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 Issue #186: a CNAME chain that ends in a denial is validated at the target's
@@ -288,7 +289,7 @@ with_unsigned_answer :: proc(wire: []u8) -> ([]u8, bool) {
 run_dnssec_cname_denial_cases :: proc(r: ^Runner) {
 	mock := mock_make("dnssec-cname-denial", next_port(r))
 	for f in CD_FIXTURES {
-		wire := from_hex(f.response, context.allocator)
+		wire := testkit.unhex(f.response, context.allocator)
 		if f.key == "cd_no_proof" {
 			padded, padded_ok := with_unsigned_answer(wire)
 			if !padded_ok {

@@ -7,6 +7,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:server"
+import "elodin:testkit"
 import "elodin:upstream"
 
 /*
@@ -94,7 +95,7 @@ run_cookie_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("cookie", upstream_port)
 	f := fixture("a")
-	mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	if !mock_start_or_skip(r, mock, "cookies") {
 		return
 	}
@@ -343,7 +344,7 @@ start_cookie_pair :: proc(
 	upstream_port := next_port(r)
 	mock = mock_make(name, upstream_port)
 	mock.cookies = mode
-	mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	if !mock_start_or_skip(r, mock, group) {
 		return nil, {}, 0, false
 	}

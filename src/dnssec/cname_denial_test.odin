@@ -4,6 +4,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 A CNAME chain that ends in a denial at another zone (issue #186).
@@ -414,16 +415,16 @@ cd_validate :: proc(key: string, unreachable: ^string = nil, edit: proc(msg: ^dn
 	v := make_validator(cd_query, unreachable, Options{anchors = fixture_anchors(CD_ANCHOR)})
 	defer destroy_validator(v)
 	f := fixture(key, CD_FIXTURES)
-	reply := unhex(f.wire)
+	reply := testkit.unhex(f.wire)
 	if edit != nil {
 		msg, derr := dns.decode_message(reply, context.temp_allocator)
 		if derr != .None {
-			return {status = .Indeterminate, reason = "the fixture did not decode"}
+			panic("the fixture does not decode")
 		}
 		edit(&msg)
 		encoded, _, eerr := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
 		if eerr != .None {
-			return {status = .Indeterminate, reason = "the edited fixture did not encode"}
+			panic("the edited fixture does not encode")
 		}
 		reply = encoded
 	}

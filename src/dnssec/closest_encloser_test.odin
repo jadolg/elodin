@@ -152,10 +152,7 @@ test_ce_zone_chain_is_sound :: proc(t: ^testing.T) {
 test_wildcard_answer_from_the_applicable_wildcard_validates :: proc(t: ^testing.T) {
 	// `*.y.cetest.` is the wildcard that applies to `x.y.cetest.`, and its next
 	// closer name is `x.y.cetest.` itself, which the authority section covers.
-	v := scenario_validator(&CE_FIXTURES, CE_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "x.y.cetest.", .A, scenario_fixture(CE_FIXTURES, "ce_inner_wildcard"), fixture_now())
+	result := scenario_validate(&CE_FIXTURES, "x.y.cetest.", .A, scenario_fixture(CE_FIXTURES, "ce_inner_wildcard"), CE_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -177,10 +174,7 @@ test_wildcard_answer_from_a_shallower_wildcard_is_bogus :: proc(t: ^testing.T) {
 	which is exactly the cover an honest answer for a name under `y.cetest.`
 	comes with.
 	*/
-	v := scenario_validator(&CE_FIXTURES, CE_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "x.y.cetest.", .A, scenario_fixture(CE_FIXTURES, "ce_outer_wildcard"), fixture_now())
+	result := scenario_validate(&CE_FIXTURES, "x.y.cetest.", .A, scenario_fixture(CE_FIXTURES, "ce_outer_wildcard"), CE_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Bogus,

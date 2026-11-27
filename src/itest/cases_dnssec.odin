@@ -6,6 +6,7 @@ import "core:strings"
 import "core:time"
 import "elodin:dns"
 import "elodin:server"
+import "elodin:testkit"
 
 /*
 DNSSEC validation, end to end.
@@ -58,7 +59,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	mock := mock_make("dnssec", upstream_port)
 	mock_synth_all(mock, {203, 0, 113, 55})
 	for f in ANCHORED_REVERSE_FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	}
 	if !mock_start_or_skip(r, mock, "dnssec") {
 		return
@@ -333,7 +334,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		cut_port := next_port(r)
 		cut_mock := mock_make("dnssec-cname-cut", cut_port)
 		for f in CNAME_CUT_FIXTURES {
-			mock_reply(cut_mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+			mock_reply(cut_mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 		}
 		for qname in ([]string{"seed.alias.cntest.", "x.bare.cntest.", "x.wild.cntest.", "x.stray.cntest."}) {
 			mock_synth(cut_mock, qname, u16(dns.Type.A), {192, 0, 2, 1})
@@ -490,7 +491,7 @@ run_key_tag_off_case :: proc(r: ^Runner) {
 	mock := mock_make("dnssec-quiet", upstream_port)
 	mock_synth_all(mock, {203, 0, 113, 56})
 	for f in ANCHORED_REVERSE_FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	}
 	if !mock_start_or_skip(r, mock, "dnssec-quiet") {
 		return
@@ -534,7 +535,7 @@ run_key_tag_anchored_case :: proc(r: ^Runner) {
 	mock := mock_make("dnssec-anchored", upstream_port)
 	mock_synth_all(mock, {203, 0, 113, 58})
 	for f in ANCHORED_REVERSE_FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	}
 	if !mock_start_or_skip(r, mock, "dnssec-anchored") {
 		return

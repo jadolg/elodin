@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:strings"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 Per-domain upstreams (`upstream.zones`), end to end.
@@ -264,7 +265,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	internal := mock_make("internal", internal_port)
 	mock_synth_all(internal, INTERNAL)
 	for f in ANCHORED_CORP_FIXTURES {
-		mock_reply(internal, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		mock_reply(internal, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	}
 	if !mock_start_or_skip(r, internal, "upstream.zones") {
 		return

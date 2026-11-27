@@ -2,13 +2,14 @@ package itest
 
 import "elodin:dns"
 import "elodin:server"
+import "elodin:testkit"
 
 // A mock named `name` on a port of its own, answering each of `fixtures` with
 // its captured response.
 signed_mock :: proc(r: ^Runner, name: string, fixtures: []Fixture) -> ^Mock {
 	mock := mock_make(name, next_port(r))
 	for f in fixtures {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		mock_reply(mock, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	}
 	return mock
 }

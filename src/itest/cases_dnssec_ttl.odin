@@ -2,6 +2,7 @@ package itest
 
 import "core:strings"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 Issue #337: a validated answer goes out with no more TTL than its signature
@@ -194,7 +195,7 @@ raised_answer :: proc(wire: []u8) -> (out: []u8, original: u32, ok: bool) {
 ttl_mock :: proc(r: ^Runner) -> (mock: ^Mock, reference: []u8, original: u32, ok: bool) {
 	mock = mock_make("dnssec-ttl", next_port(r))
 	for f in TTL_FIXTURES {
-		wire := from_hex(f.response, context.allocator)
+		wire := testkit.unhex(f.response, context.allocator)
 		if f.key == "dr_sub_answer" {
 			wire, original = raised_answer(wire) or_return
 			reference = wire

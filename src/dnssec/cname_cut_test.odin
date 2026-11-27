@@ -173,10 +173,7 @@ test_a_cname_the_parent_signed_is_no_cut :: proc(t: ^testing.T) {
 test_an_unsigned_delegation_under_a_cname_owner_is_insecure :: proc(t: ^testing.T) {
 	// `seed.bitcoin.sipa.be.` in the issue: the walk has to pass the CNAME owner
 	// to reach the delegation below it, which has no DS.
-	v := scenario_validator(&CN_FIXTURES, CN_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "seed.alias.cntest.", .A, scenario_fixture(CN_FIXTURES, "cn_seed_answer"), fixture_now())
+	result := scenario_validate(&CN_FIXTURES, "seed.alias.cntest.", .A, scenario_fixture(CN_FIXTURES, "cn_seed_answer"), CN_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Insecure,
@@ -215,7 +212,8 @@ test_a_cname_step_out_of_verifications_is_undecided :: proc(t: ^testing.T) {
 
 	now := fixture_now()
 	budget := query_budget(v)
-	status, keys, _ := zone_trust(v, &budget, "cntest.", now, context.temp_allocator)
+	status, keys, established := zone_trust(v, &budget, "cntest.", now, context.temp_allocator)
+	testing.expect_value(t, established, "cntest.")
 	testing.expect_value(t, status, Status.Secure)
 
 	budget.verifications = MAX_VERIFICATIONS_PER_QUERY
@@ -237,7 +235,8 @@ test_a_lapsed_cname_at_a_ds_question_names_its_window :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, keys, _ := zone_trust(v, &budget, "cntest.", fixture_now(), context.temp_allocator)
+	status, keys, established := zone_trust(v, &budget, "cntest.", fixture_now(), context.temp_allocator)
+	testing.expect_value(t, established, "cntest.")
 	testing.expect_value(t, status, Status.Secure)
 
 	// A month and a day early: the CNAME's inception is thirty days before

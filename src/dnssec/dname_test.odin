@@ -114,10 +114,7 @@ test_dname_redirection_validates :: proc(t: ^testing.T) {
 	inside a signed zone with no signature of its own - and takes the whole
 	response down with it. Every name behind a DNAME then fails to resolve.
 	*/
-	v := scenario_validator(&DNAME_FIXTURES, DNAME_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "a.dnametest.", .A, scenario_fixture(DNAME_FIXTURES, "dname_answer"), fixture_now())
+	result := scenario_validate(&DNAME_FIXTURES, "a.dnametest.", .A, scenario_fixture(DNAME_FIXTURES, "dname_answer"), DNAME_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -338,8 +335,14 @@ test_a_synthesized_cname_keeps_its_ttl :: proc(t: ^testing.T) {
 	result := validate(v, "a.dnametest.", .A, wire, fixture_now())
 	testing.expect_value(t, result.status, Status.Secure)
 	out, ok := strip_unauthenticated(wire, result)
-	testing.expect(t, ok, "the prune failed")
-	served, _ := dns.decode_message(out, context.temp_allocator)
+	if !testing.expect(t, ok, "the prune failed") {
+		return
+	}
+	// Undecoded, the answer would read as holding no CNAME at all.
+	served, serr := dns.decode_message(out, context.temp_allocator)
+	if !testing.expect_value(t, serr, dns.Decode_Error.None) {
+		return
+	}
 	cnames := 0
 	for rec in served.answer {
 		if rec.type == .CNAME {
@@ -412,10 +415,7 @@ DNAME_ROOT_FIXTURES := []Fixture{
 
 @(test)
 test_dname_to_the_root_validates :: proc(t: ^testing.T) {
-	v := scenario_validator(&DNAME_ROOT_FIXTURES, DNAME_ROOT_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "a.drtest.", .A, scenario_fixture(DNAME_ROOT_FIXTURES, "dr_answer"), fixture_now())
+	result := scenario_validate(&DNAME_ROOT_FIXTURES, "a.drtest.", .A, scenario_fixture(DNAME_ROOT_FIXTURES, "dr_answer"), DNAME_ROOT_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -428,10 +428,7 @@ test_dname_to_the_root_validates :: proc(t: ^testing.T) {
 
 @(test)
 test_dname_to_the_root_refuses_a_cname_it_did_not_produce :: proc(t: ^testing.T) {
-	v := scenario_validator(&DNAME_ROOT_FIXTURES, DNAME_ROOT_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "a.drtest.", .A, scenario_fixture(DNAME_ROOT_FIXTURES, "dr_answer_mismatched"), fixture_now())
+	result := scenario_validate(&DNAME_ROOT_FIXTURES, "a.drtest.", .A, scenario_fixture(DNAME_ROOT_FIXTURES, "dr_answer_mismatched"), DNAME_ROOT_ANCHOR)
 	testing.expectf(
 		t,
 		result.status != .Secure,

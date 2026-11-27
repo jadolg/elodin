@@ -175,7 +175,7 @@ kt_walk :: proc(pads: []Padding, spent: ^int = nil) -> (Status, Budget) {
 	defer destroy_validator(v)
 	budget := query_budget(v)
 	budget.spent = spent
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", fixture_now(), context.temp_allocator)
+	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", fixture_now(), context.temp_allocator) // lint:allow only the status is under test
 	return status, budget
 }
 
@@ -312,7 +312,7 @@ test_a_padded_root_dnskey_set_is_bounded :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, _ := zone_keys(v, &budget, ".", fixture_now(), context.temp_allocator)
+	status, _ := zone_keys(v, &budget, ".", fixture_now(), context.temp_allocator) // lint:allow only the status is under test
 	testing.expectf(
 		t,
 		status == .Indeterminate,
@@ -487,7 +487,7 @@ test_an_exhausted_key_check_is_not_a_downgrade :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	_, status, _, _ := fetch_keys(
+	_, status, _, _ := fetch_keys( // lint:allow only the status is under test
 		v,
 		&budget,
 		"cloudflare.com.",
@@ -516,7 +516,7 @@ test_an_exhausted_key_check_is_not_a_downgrade :: proc(t: ^testing.T) {
 kt_walk_arena :: proc(pads: []Padding) -> (int, Status) {
 	free_all(context.temp_allocator)
 	before := arena_used()
-	status, _ := kt_walk(pads)
+	status, _ := kt_walk(pads) // lint:allow only the status is under test
 	return arena_used() - before, status
 }
 
@@ -591,8 +591,15 @@ test_the_ds_render_is_charged_to_the_request :: proc(t: ^testing.T) {
 	}
 	read_spent :: proc(pads: []Padding) -> (spent: int) {
 		pads := pads
-		wire, _ := kt_query(&pads, "cloudflare.com.", .DS, context.temp_allocator, nil)
-		dns.decode_message(wire, context.temp_allocator, &spent)
+		wire, built := kt_query(&pads, "cloudflare.com.", .DS, context.temp_allocator, nil)
+		if !built {
+			panic("the DS reply was not built")
+		}
+		// What decoding it charges is the measurement; one that fails charges
+		// for a reading that never finished.
+		if _, derr := dns.decode_message(wire, context.temp_allocator, &spent); derr != .None {
+			panic("the DS reply does not decode")
+		}
 		return
 	}
 	padded := []Padding{{name = "cloudflare.com.", type = .DS, records = 255}}

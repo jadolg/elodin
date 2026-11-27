@@ -81,7 +81,9 @@ test_served_ttl_is_clamped_to_the_signature :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	original := max(u32)
 	for sig in sigs_covering(msg.answer, "www.example.com.", .A, .IN, context.temp_allocator) {
 		original = min(original, sig.original_ttl)
@@ -91,7 +93,9 @@ test_served_ttl_is_clamped_to_the_signature :: proc(t: ^testing.T) {
 		rec.ttl = 604800
 	}
 	raised, _, rerr := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, rerr, dns.Encode_Error.None)
+	if !testing.expect_value(t, rerr, dns.Encode_Error.None) {
+		return
+	}
 
 	// Once with a signature that has hours left, where the Original TTL binds,
 	// and once a hundred seconds before it lapses, where the expiration does.
@@ -105,9 +109,13 @@ test_served_ttl_is_clamped_to_the_signature :: proc(t: ^testing.T) {
 		result := validate(v, "www.example.com.", .A, raised, time.unix(i64(c.at), 0))
 		testing.expectf(t, result.status == .Secure, "at %d the raised answer is %v (%s)", c.at, result.status, result.reason)
 		out, ok := strip_unauthenticated(raised, result)
-		testing.expect(t, ok, "the prune failed")
+		if !testing.expect(t, ok, "the prune failed") {
+			return
+		}
 		served, sderr := dns.decode_message(out, context.temp_allocator)
-		testing.expect_value(t, sderr, dns.Decode_Error.None)
+		if !testing.expect_value(t, sderr, dns.Decode_Error.None) {
+			return
+		}
 		testing.expect(t, len(served.answer) >= 2, "the answer lost its records")
 		for rec in served.answer {
 			testing.expectf(t, rec.ttl <= c.ceiling, "at %d %v went out with TTL %d over a ceiling of %d", c.at, rec.type, rec.ttl, c.ceiling)
@@ -122,18 +130,26 @@ test_served_ttl_under_the_ceiling_is_kept :: proc(t: ^testing.T) {
 	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	for &rec in msg.answer {
 		rec.ttl = 7
 	}
 	wire, _, eerr := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, eerr, dns.Encode_Error.None)
+	if !testing.expect_value(t, eerr, dns.Encode_Error.None) {
+		return
+	}
 	result := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expect_value(t, result.status, Status.Secure)
 	out, ok := strip_unauthenticated(wire, result)
-	testing.expect(t, ok, "the prune failed")
+	if !testing.expect(t, ok, "the prune failed") {
+		return
+	}
 	served, sderr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, sderr, dns.Decode_Error.None)
+	if !testing.expect_value(t, sderr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(t, len(served.answer) >= 2, "the answer lost its records")
 	for rec in served.answer {
 		testing.expect_value(t, rec.ttl, u32(7))
@@ -219,18 +235,26 @@ test_served_ttl_takes_the_least_received :: proc(t: ^testing.T) {
 	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	for &rec in msg.answer {
 		rec.ttl = 100 if rec.type == .RRSIG else 250
 	}
 	wire, _, eerr := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, eerr, dns.Encode_Error.None)
+	if !testing.expect_value(t, eerr, dns.Encode_Error.None) {
+		return
+	}
 	result := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expect_value(t, result.status, Status.Secure)
 	out, ok := strip_unauthenticated(wire, result)
-	testing.expect(t, ok, "the prune failed")
+	if !testing.expect(t, ok, "the prune failed") {
+		return
+	}
 	served, sderr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, sderr, dns.Decode_Error.None)
+	if !testing.expect_value(t, sderr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(t, len(served.answer) >= 2, "the answer lost its records")
 	for rec in served.answer {
 		testing.expectf(t, rec.ttl == 100, "%v went out with TTL %d, the RRSIG arrived with 100", rec.type, rec.ttl)

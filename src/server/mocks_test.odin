@@ -1,6 +1,5 @@
 package server
 
-import "core:encoding/hex"
 import "core:mem"
 import "core:net"
 import "core:strings"
@@ -1333,17 +1332,6 @@ RFC9018_CLIENT_COOKIE :: "2464c4abcf10c957"
 
 @(private)
 RFC9018_CLIENT :: "198.51.100.100:9999"
-
-// The bytes `text` spells in hex. A literal that does not decode is a broken
-// fixture, so it panics rather than hand back a short or empty key.
-@(private)
-unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
-	out, ok := hex.decode(transmute([]u8)text, allocator)
-	if !ok {
-		panic("a test's hex literal does not decode")
-	}
-	return out
-}
 
 // An eight-byte client cookie no server has answered yet, so its verdict is
 // `Unproven` and a server cookie is minted for it.

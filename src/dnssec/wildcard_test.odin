@@ -137,10 +137,7 @@ test_wildcard_answer_with_apex_closest_encloser_validates :: proc(t: ^testing.T)
 	(confirmed against Quad9's live answer for big.oisd.nl, which sets the AD
 	bit on exactly this shape).
 	*/
-	v := scenario_validator(&WILDCARD_FIXTURES, WILDCARD_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "sub.wildcardtest.", .A, scenario_fixture(WILDCARD_FIXTURES, "wc_wildcard_answer"), fixture_now())
+	result := scenario_validate(&WILDCARD_FIXTURES, "sub.wildcardtest.", .A, scenario_fixture(WILDCARD_FIXTURES, "wc_wildcard_answer"), WILDCARD_ANCHOR)
 	testing.expectf(
 		t,
 		result.status == .Secure,

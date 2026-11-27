@@ -7,6 +7,7 @@ import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:testkit"
 import "elodin:tlsx"
 
 /*
@@ -51,7 +52,7 @@ run_h2_cases :: proc(r: ^Runner) {
 	fix := fixture("a")
 	upstream_port := next_port(r)
 	mock := mock_make("h2", upstream_port)
-	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
+	mock_reply(mock, fix.qname, fix.qtype, testkit.unhex(fix.response, context.allocator))
 	mock_synth_all(mock, {203, 0, 113, 5})
 	// Answered late enough that the client's GOAWAY behind it is read first.
 	mock_delay(mock, GOAWAY_QNAME, u16(dns.Type.A), GOAWAY_DELAY, nil)

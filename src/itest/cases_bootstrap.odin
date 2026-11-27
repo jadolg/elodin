@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:time"
 import "elodin:dns"
+import "elodin:testkit"
 import "elodin:upstream"
 
 /*
@@ -26,7 +27,7 @@ run_bootstrap_cases :: proc(r: ^Runner) {
 	up_port := next_port(r)
 	up := mock_make("named-upstream", up_port)
 	defer mock_stop(up)
-	mock_reply(up, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	mock_reply(up, f.qname, f.qtype, testkit.unhex(f.response, context.allocator))
 	if !mock_start_or_skip(r, up, GROUP) {
 		return
 	}

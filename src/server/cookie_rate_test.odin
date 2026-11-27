@@ -4,6 +4,7 @@ import "core:net"
 import "core:strings"
 import "core:testing"
 import "elodin:config"
+import "elodin:testkit"
 
 /*
 A datagram that proves its source with a server cookie is charged to a pool of
@@ -35,7 +36,7 @@ cookie_query :: proc(cookie: []u8) -> []u8 {
 @(private = "file")
 issued_to :: proc(k: ^Cookie_Keeper, client: net.Endpoint) -> [COOKIE_REPLY_LEN]u8 {
 	req: Cookie_Request
-	copy(req.client[:], unhex(RFC9018_CLIENT_COOKIE))
+	copy(req.client[:], testkit.unhex(RFC9018_CLIENT_COOKIE))
 	ok: bool
 	req.ip_len, ok = cookie_client_ip(net.endpoint_to_string(client, context.temp_allocator), req.ip[:])
 	if !ok {

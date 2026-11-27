@@ -80,10 +80,7 @@ BA_FIXTURES := []Fixture{
 test_the_public_chain_alone_reads_the_zone_as_insecure :: proc(t: ^testing.T) {
 	// The premise: with the root as the only anchor, the root's NSEC proves
 	// no DS for `corp.`, so the answer is Insecure - not Bogus, not broken.
-	v := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR)
-	defer destroy_validator(v)
-
-	result := validate(v, "www.corp.", .A, scenario_fixture(BA_FIXTURES, "ba_answer"), fixture_now())
+	result := scenario_validate(&BA_FIXTURES, "www.corp.", .A, scenario_fixture(BA_FIXTURES, "ba_answer"), BA_ROOT_ANCHOR)
 	testing.expectf(t, result.status == .Insecure, "root anchor only: want Insecure, got %v (%q)", result.status, result.reason)
 	free_all(context.temp_allocator)
 }
@@ -124,10 +121,7 @@ test_a_wrong_anchor_below_the_root_is_bogus_not_insecure :: proc(t: ^testing.T) 
 	// publish is a broken chain, and the root's proof that `corp.` has no DS
 	// does not get to turn that into an unsigned zone (RFC 6840 Appendix C.1).
 	wrong := "corp. IN DS 59822 15 2 0000000000000000000000000000000000000000000000000000000000000000"
-	v := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR, wrong)
-	defer destroy_validator(v)
-
-	result := validate(v, "www.corp.", .A, scenario_fixture(BA_FIXTURES, "ba_answer"), fixture_now())
+	result := scenario_validate(&BA_FIXTURES, "www.corp.", .A, scenario_fixture(BA_FIXTURES, "ba_answer"), BA_ROOT_ANCHOR, wrong)
 	testing.expectf(t, result.status == .Bogus, "a corp. anchor naming the wrong key: want Bogus, got %v (%q)", result.status, result.reason)
 	// And the operator is told it was their anchor, not some parent's DS.
 	testing.expectf(

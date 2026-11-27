@@ -6,6 +6,7 @@ import "core:slice"
 import "core:strings"
 import "elodin:dns"
 import "elodin:server"
+import "elodin:testkit"
 import "elodin:tlsx"
 
 /*
@@ -53,7 +54,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 
 	mock := mock_make("primary", upstream_port)
-	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
+	mock_reply(mock, fix.qname, fix.qtype, testkit.unhex(fix.response, context.allocator))
 	mock_reply(mock, "cname-nosoa.example.com.", u16(dns.Type.A), bare_cname_reply("cname-nosoa.example.com."))
 	if !mock_start_or_skip(r, mock, "transports") {
 		return

@@ -3,6 +3,7 @@ package server
 import "core:testing"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 A request in an EDNS version this server does not implement is refused with
@@ -138,7 +139,7 @@ test_badvers_still_carries_a_cookie_back :: proc(t: ^testing.T) {
 
 	out, outcome, ok := handle_query(
 		&s,
-		version_query(1, cookie = unhex(RFC9018_CLIENT_COOKIE)),
+		version_query(1, cookie = testkit.unhex(RFC9018_CLIENT_COOKIE)),
 		.UDP,
 		RFC9018_CLIENT,
 		context.temp_allocator,

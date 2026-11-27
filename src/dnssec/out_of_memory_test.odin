@@ -65,7 +65,7 @@ have been cached.
 test_a_validation_that_runs_dry_is_undecided :: proc(t: ^testing.T) {
 	for c in OOM_CASES {
 		// On the heap: each round frees the temp arena it would otherwise sit in.
-		wire := unhex(fixture(c.key).wire, context.allocator)
+		wire := testkit.unhex(fixture(c.key).wire, context.allocator)
 		defer delete(wire)
 		refused := 0
 		for run in ([]int{1, 2, 3}) do for n := 1; ; n += 1 {
@@ -164,7 +164,7 @@ test_a_prune_that_runs_dry_is_not_a_prune :: proc(t: ^testing.T) {
 				return
 			}
 		} else {
-			wire = unhex(fixture(c.key).wire, context.allocator)
+			wire = testkit.unhex(fixture(c.key).wire, context.allocator)
 		}
 		defer delete(wire)
 		result := validate(v, c.qname, c.qtype, wire, fixture_now())
@@ -317,7 +317,7 @@ test_a_question_that_ran_dry_settles_nothing :: proc(t: ^testing.T) {
 		non_cut_remember(v, &budget, "www.example.com.", MIN_ZONE_TTL, now)
 		_, _, memo := cache_get(v, "example.com.", now, context.temp_allocator)
 		testing.expectf(t, !memo, "ran dry %v: the zone settled is still a memoised no cut", dry)
-		_, zone_found, _ := cache_get(v, "example.com.", now, context.temp_allocator)
+		_, zone_found, _ := cache_get(v, "example.com.", now, context.temp_allocator) // lint:allow only whether the entry is held is under test
 		_, _, name_found := cache_get(v, "www.example.com.", now, context.temp_allocator)
 		testing.expectf(t, zone_found == !dry, "ran dry %v: the zone cached %v", dry, zone_found)
 		testing.expectf(t, name_found == !dry, "ran dry %v: the name remembered %v", dry, name_found)
@@ -407,7 +407,7 @@ test_a_lookup_that_runs_dry_on_a_loop_is_this_servers :: proc(t: ^testing.T) {
 	_, spawned := loop.spawn(l, proc(data: rawptr) {
 		s := (^Loop_Sweep)(data)
 		defer sync.sema_post(&s.done)
-		wire := unhex(fixture("example_a").wire, context.allocator)
+		wire := testkit.unhex(fixture("example_a").wire, context.allocator)
 		defer delete(wire)
 		scratch := context.temp_allocator
 		for n := 1; ; n += 1 {
@@ -453,7 +453,7 @@ test_a_zone_that_cannot_be_named_evicts_nothing :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 	now := loop.moment_now()
 	cache_put(v, nil, "kept.example.", .Insecure, nil, MAX_ZONE_TTL, now)
-	_, kept, _ := cache_get(v, "kept.example.", now, context.temp_allocator)
+	_, kept, _ := cache_get(v, "kept.example.", now, context.temp_allocator) // lint:allow only whether the entry is held is under test
 	if !testing.expect(t, kept, "the first zone was not cached") {
 		return
 	}
@@ -464,13 +464,13 @@ test_a_zone_that_cannot_be_named_evicts_nothing :: proc(t: ^testing.T) {
 		v.allocator = mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 		cache_put(v, nil, "new.example.", .Insecure, nil, MAX_ZONE_TTL, now)
 		v.allocator = heap
-		_, stored, _ := cache_get(v, "new.example.", now, context.temp_allocator)
+		_, stored, _ := cache_get(v, "new.example.", now, context.temp_allocator) // lint:allow only whether the entry is held is under test
 		if f.seen < n {
 			testing.expect(t, stored, "the new zone was not cached with nothing refused")
 			break
 		}
 		refused += 1
-		_, still, _ := cache_get(v, "kept.example.", now, context.temp_allocator)
+		_, still, _ := cache_get(v, "kept.example.", now, context.temp_allocator) // lint:allow only whether the entry is held is under test
 		testing.expectf(t, still && !stored, "allocation %d refused: kept %v, new %v", n, still, stored)
 	}
 	testing.expect(t, refused > 0, "the cache took no copy to refuse")

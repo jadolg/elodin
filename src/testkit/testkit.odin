@@ -6,6 +6,7 @@ cannot import it and keep their own copies.
 */
 package testkit
 
+import "core:encoding/hex"
 import "core:mem"
 import "core:net"
 import "core:sys/linux"
@@ -146,4 +147,14 @@ stall_listener :: proc(wait: time.Duration, backlog := 4) -> (listener: net.TCP_
 		return
 	}
 	return listener, bound, true
+}
+
+// The bytes `text` spells in hex. A literal that does not decode is a broken
+// fixture, so it panics rather than hand back nothing for a case to run on.
+unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
+	out, ok := hex.decode(transmute([]u8)text, allocator)
+	if !ok {
+		panic("a test's hex literal does not decode")
+	}
+	return out
 }

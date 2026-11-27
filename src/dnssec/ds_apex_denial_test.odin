@@ -31,6 +31,9 @@ because the bit map is read by a separate routine for each.
 @(private = "file")
 DA_ANCHOR :: ". IN DS 31088 15 2 2E211FFDD1AB5449FB868E6EDB29B34F33FC298FB3D007E6CEB82DD714124C2F"
 
+// The genuine DS and DNSKEY fixtures are listed before the denials, so the
+// chain walk, which takes the first match, finds the delegation rather than
+// the reply under test.
 @(private = "file")
 DA_FIXTURES := []Fixture{
 	{
@@ -192,12 +195,8 @@ DA_FIXTURES := []Fixture{
 	},
 }
 
-// The genuine DS and DNSKEY fixtures are listed before the denials, so the
-// chain walk, which takes the first match, finds the delegation rather than
-// the reply under test.
-
 /*
-The reason every refusal below has to carry, `NO_DENIAL`.
+The reason every refusal in this file has to carry, `NO_DENIAL`.
 
 `Bogus` on its own is a weak thing to assert here, because a fixture chain that
 has quietly come apart produces it too - a lookup that matches the wrong record
@@ -213,11 +212,12 @@ any bit map is read. The bit map guard is what stands behind that, and it is
 `nsec_unit_test` and `nsec3_unit_test` that hold it to account, by calling the
 two routines directly.
 */
+
+// The reply under `key` to a DS question for `qname`, validated against the
+// DA zone's anchor.
 @(private = "file")
 da_validate :: proc(key, qname: string) -> Result {
-	v := scenario_validator(&DA_FIXTURES, DA_ANCHOR)
-	defer destroy_validator(v)
-	return validate(v, qname, .DS, scenario_fixture(DA_FIXTURES, key), fixture_now())
+	return scenario_validate(&DA_FIXTURES, qname, .DS, scenario_fixture(DA_FIXTURES, key), DA_ANCHOR)
 }
 
 @(test)
@@ -443,7 +443,10 @@ test_check_signature_holds_its_type_rules_itself :: proc(t: ^testing.T) {
 	a_sigs := sigs_covering(covers_msg.answer, "dstest.", .A, .IN, context.temp_allocator)
 	keys := make([dynamic]Dnskey, 0, 1, context.temp_allocator)
 	for rec in records_of(keys_msg.answer, "dstest.", .DNSKEY, .IN, context.temp_allocator) {
-		rdata, _ := raw_rdata(rec)
+		rdata, is_raw := raw_rdata(rec)
+		if !testing.expect(t, is_raw, "a DNSKEY arrived decoded, not as raw RDATA") {
+			continue
+		}
 		key, perr := parse_dnskey(rdata)
 		if perr == .None {
 			append(&keys, key)

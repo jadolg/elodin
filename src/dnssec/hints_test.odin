@@ -345,15 +345,23 @@ sh_prune :: proc(
 	return result, msg, true
 }
 
+// Copies `sh_pad_hint` makes: enough to spend `MAX_VERIFICATIONS_PER_QUERY`
+// outright if each one were tried.
+@(private = "file")
+PAD_SIGNATURES :: MAX_VERIFICATIONS_PER_QUERY
+
 /*
-`sh_srv_same_zone` with sixty-four copies of the signature over its A hint,
-each with `damage` done to it, in front of everything in the additional section.
+`sh_srv_same_zone` with `PAD_SIGNATURES` copies of the signature over its A
+hint, each with `damage` done to it, in front of everything in the additional
+section.
 */
 @(private = "file")
 sh_pad_hint :: proc(t: ^testing.T, damage: bit_set[Rrsig_Damage]) -> []u8 {
 	msg, derr := dns.decode_message(scenario_fixture(SH_FIXTURES, "sh_srv_same_zone"), context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
-	padded := make([dynamic]dns.Record, 0, len(msg.additional) + 64, context.temp_allocator)
+	if derr != .None {
+		panic("the hint fixture does not decode")
+	}
+	padded := make([dynamic]dns.Record, 0, len(msg.additional) + PAD_SIGNATURES, context.temp_allocator)
 	for rec in msg.additional {
 		rdata, is_raw := raw_rdata(rec)
 		if rec.type != .RRSIG || !is_raw {
@@ -363,16 +371,20 @@ sh_pad_hint :: proc(t: ^testing.T, damage: bit_set[Rrsig_Damage]) -> []u8 {
 		if err != .None || sig.type_covered != .A {
 			continue
 		}
-		for _ in 0 ..< 64 {
+		for _ in 0 ..< PAD_SIGNATURES {
 			append(&padded, rrsig_mutant(rec, damage))
 		}
 	}
-	testing.expect(t, len(padded) == 64, "the fixture should carry one signature over the A hint")
+	if len(padded) != PAD_SIGNATURES {
+		panic("the hint fixture carries no one signature over the A hint")
+	}
 	append(&padded, ..msg.additional)
 	msg.additional = padded[:]
 
 	wire, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
+	if enc != .None {
+		panic("the padded hint does not encode")
+	}
 	return wire
 }
 
@@ -628,7 +640,9 @@ test_a_wildcard_hint_is_dropped :: proc(t: ^testing.T) {
 
 	wire := scenario_fixture(SH_FIXTURES, "sh_wildcard_hint")
 	msg, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 
 	budget := query_budget(v)
 	unix := u32(FIXTURE_TIME)
@@ -851,7 +865,7 @@ test_a_padded_hint_keeps_a_bounded_number_of_signatures :: proc(t: ^testing.T) {
 
 	The key tag is flipped rather than the signature bytes, and that is what
 	isolates the cap from the budget. A copy that keeps the real tag has to be
-	verified before it can be refused, and sixty-four of those spend
+	verified before it can be refused, and `PAD_SIGNATURES` of those spend
 	`MAX_VERIFICATIONS_PER_QUERY` outright - the hint is then dropped for want of
 	allowance, which is safe and is the next test, but it says nothing about
 	whether the cap here works. A flipped tag names a key the zone never
@@ -872,7 +886,8 @@ test_a_padded_hint_keeps_a_bounded_number_of_signatures :: proc(t: ^testing.T) {
 	testing.expectf(
 		t,
 		kept <= MAX_SIGNATURES_PER_RRSET + 1,
-		"64 forged signatures over one hint left %d of them in the answer",
+		"%d forged signatures over one hint left %d of them in the answer",
+		PAD_SIGNATURES,
 		kept,
 	)
 	free_all(context.temp_allocator)

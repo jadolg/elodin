@@ -80,7 +80,7 @@ test_signature_attempts_render_the_rrset_once :: proc(t: ^testing.T) {
 		section := ss_section(signatures)
 		budget: Budget
 		before := arena_used()
-		_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator)
+		_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator) // lint:allow ok and exhausted are what this pins
 		used[i] = arena_used() - before
 		// The premise: every forgery reached a verification.
 		testing.expect(t, !ok && !exhausted)
@@ -111,7 +111,7 @@ test_signing_input_is_charged_to_the_request :: proc(t: ^testing.T) {
 	budget := Budget {
 		spent = &spent,
 	}
-	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator)
+	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator) // lint:allow ok and exhausted are what this pins
 	testing.expect(t, !ok)
 	testing.expect(t, exhausted, "a render past the request's budget was paid for")
 	testing.expect_value(t, budget.verifications, 1)
@@ -126,7 +126,7 @@ test_signing_input_is_charged_to_the_request :: proc(t: ^testing.T) {
 		budget = Budget {
 			spent = &spent,
 		}
-		_, _, _, ok, exhausted, _ = verified_rrset(&budget, section[:230 + signatures], SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator)
+		_, _, _, ok, exhausted, _ = verified_rrset(&budget, section[:230 + signatures], SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator) // lint:allow ok and exhausted are what this pins
 		testing.expect(t, !ok && !exhausted)
 		testing.expect_value(t, budget.verifications, signatures)
 		testing.expect_value(t, exhausted_reason(&budget), VERIFICATIONS_SPENT)
@@ -180,8 +180,12 @@ test_a_reused_scratch_builds_what_a_fresh_render_builds :: proc(t: ^testing.T) {
 		original_ttl = 300,
 		signer       = "example.com.",
 	}
-	fresh, _ := signing_input(sig, SS_OWNER, .IN, other, context.temp_allocator)
-	reused, _ := signing_input(sig, SS_OWNER, .IN, other, context.temp_allocator, &scratch)
+	fresh, fresh_ok := signing_input(sig, SS_OWNER, .IN, other, context.temp_allocator)
+	reused, reused_ok := signing_input(sig, SS_OWNER, .IN, other, context.temp_allocator, &scratch)
+	// Two refusals would compare equal too: both have to have rendered something.
+	if !testing.expect(t, fresh_ok && reused_ok && len(fresh) > 0, "the signing input was not rendered") {
+		return
+	}
 	testing.expect(t, string(fresh) == string(reused))
 	free_all(context.temp_allocator)
 }
@@ -268,7 +272,7 @@ ss_answer :: proc(signatures: int, spent: ^int) -> (used: int, status: Status, r
 	budget := query_budget(v)
 	budget.spent = spent
 	before := arena_used()
-	status, _, reason, _, _, _ = validate_rrset(v, &budget, SS_OWNER, .TXT, .IN, records, sigs, FIXTURE_TIME, now, context.temp_allocator)
+	status, _, reason, _, _, _ = validate_rrset(v, &budget, SS_OWNER, .TXT, .IN, records, sigs, FIXTURE_TIME, now, context.temp_allocator) // lint:allow the status and its reason are what this pins
 	return arena_used() - before, status, reason, budget.verifications
 }
 
@@ -291,7 +295,7 @@ test_answer_signatures_do_not_rerender_the_set :: proc(t: ^testing.T) {
 	// And charged: a request without room for the render is told so, as our
 	// own allowance and not as a forgery.
 	spent := dns.REQUEST_DECODE_BUDGET - 1024
-	_, refused, reason, _ := ss_answer(MAX_VERIFICATIONS_PER_QUERY, &spent)
+	_, refused, reason, _ := ss_answer(MAX_VERIFICATIONS_PER_QUERY, &spent) // lint:allow the refusal and its reason are what this pins
 	testing.expect_value(t, refused, Status.Indeterminate)
 	testing.expect_value(t, reason, READING_OVER_BUDGET)
 	free_all(context.temp_allocator)
@@ -354,7 +358,7 @@ test_the_reason_is_what_stopped_the_loop :: proc(t: ^testing.T) {
 		spent         = &spent,
 		verifications = MAX_VERIFICATIONS_PER_QUERY,
 	}
-	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator)
+	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator) // lint:allow ok and exhausted are what this pins
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), VERIFICATIONS_SPENT)
 
@@ -364,11 +368,11 @@ test_the_reason_is_what_stopped_the_loop :: proc(t: ^testing.T) {
 	budget = Budget {
 		spent = &spent,
 	}
-	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator)
+	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator) // lint:allow ok and exhausted are what this pins
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), READING_OVER_BUDGET)
 	budget.verifications = MAX_VERIFICATIONS_PER_QUERY
-	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator)
+	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator) // lint:allow ok and exhausted are what this pins
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), VERIFICATIONS_SPENT)
 	free_all(context.temp_allocator)

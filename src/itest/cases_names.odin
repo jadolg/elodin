@@ -6,6 +6,7 @@ import "core:path/filepath"
 import "core:strings"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 A DoH upstream and a list that the file names only by a url with a key in the
@@ -16,7 +17,7 @@ warn-level failure line under the name.
 */
 run_name_cases :: proc(r: ^Runner) {
 	fix := fixture("a")
-	payload := from_hex(fix.response, context.allocator)
+	payload := testkit.unhex(fix.response, context.allocator)
 	defer delete(payload)
 
 	http_port := next_port(r)

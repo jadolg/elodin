@@ -3,6 +3,7 @@ package dnssec
 import "core:crypto/ed25519"
 import "core:testing"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 `check_signature` on its own, at the point where nothing else is guarding it.
@@ -73,7 +74,7 @@ CS_EXPIRATION :: 2101024800
 
 @(private = "file")
 cs_sig :: proc(hex_signature: string) -> Rrsig {
-	signature, _ := decode_hex(hex_signature, context.temp_allocator)
+	signature := testkit.unhex(hex_signature)
 	return Rrsig {
 		type_covered = .A,
 		algorithm = ALG_ED25519,
@@ -204,7 +205,8 @@ test_check_signature_refuses_a_signer_outside_the_owners_zone :: proc(t: ^testin
 		moved := cs_sig(CS_PLAIN_SIG)
 		moved.signer = signer
 		sig, keys := cs_resign(t, moved, "www.example.com.")
-		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
+		result, result_encloser := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
+		testing.expectf(t, result_encloser == "", "no wildcard was expanded, yet the encloser %q was claimed", result_encloser)
 		testing.expectf(t, result == .Bad, "%q must not be able to sign www.example.com., got %v", signer, result)
 	}
 
@@ -213,7 +215,8 @@ test_check_signature_refuses_a_signer_outside_the_owners_zone :: proc(t: ^testin
 	moved := cs_sig(CS_PLAIN_SIG)
 	moved.signer = "com."
 	sig, keys := cs_resign(t, moved, "www.example.com.")
-	in_bailiwick, _ := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
+	in_bailiwick, in_bailiwick_encloser := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
+	testing.expectf(t, in_bailiwick_encloser == "", "no wildcard was expanded, yet the encloser %q was claimed", in_bailiwick_encloser)
 	testing.expect_value(t, in_bailiwick, Verify_Result.Ok)
 	free_all(context.temp_allocator)
 }
@@ -232,7 +235,8 @@ test_check_signature_refuses_a_labels_field_the_owner_contradicts :: proc(t: ^te
 		moved := cs_sig(CS_PLAIN_SIG)
 		moved.labels = labels
 		sig, keys := cs_resign(t, moved, "www.example.com.")
-		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
+		result, result_encloser := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
+		testing.expectf(t, result_encloser == "", "no wildcard was expanded, yet the encloser %q was claimed", result_encloser)
 		testing.expectf(t, result == .Bad, "a labels field of %d over a three-label name must be refused", labels)
 	}
 
@@ -241,7 +245,8 @@ test_check_signature_refuses_a_labels_field_the_owner_contradicts :: proc(t: ^te
 	moved := cs_sig(CS_PLAIN_SIG)
 	moved.labels = 1
 	sig, keys := cs_resign(t, moved, "*.com.")
-	result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
+	result, result_encloser := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
+	testing.expectf(t, result_encloser == "", "no wildcard was expanded, yet the encloser %q was claimed", result_encloser)
 	testing.expect_value(t, result, Verify_Result.Bad)
 	free_all(context.temp_allocator)
 }
@@ -329,7 +334,8 @@ test_check_signature_refuses_a_consistent_out_of_bailiwick_signature :: proc(t: 
 	*/
 	sig := cs_sig(CS_OUT_OF_BAILIWICK_SIG)
 	sig.signer = "example.org."
-	result, _ := check_signature(sig, "www.example.com.", .IN, cs_records(), ed25519_key(), FIXTURE_TIME, context.temp_allocator)
+	result, result_encloser := check_signature(sig, "www.example.com.", .IN, cs_records(), ed25519_key(), FIXTURE_TIME, context.temp_allocator)
+	testing.expectf(t, result_encloser == "", "no wildcard was expanded, yet the encloser %q was claimed", result_encloser)
 	testing.expect_value(t, result, Verify_Result.Bad)
 	free_all(context.temp_allocator)
 }

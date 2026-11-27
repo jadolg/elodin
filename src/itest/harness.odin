@@ -1,6 +1,5 @@
 package itest
 
-import "core:encoding/hex"
 import "core:fmt"
 import "core:net"
 import "core:os"
@@ -1320,14 +1319,6 @@ parse_header :: proc(r: ^Runner, wire: []u8) -> (h: Header) {
 	h.nscount = int(u16(wire[8]) << 8 | u16(wire[9]))
 	h.arcount = int(u16(wire[10]) << 8 | u16(wire[11]))
 	return h
-}
-
-from_hex :: proc(s: string, allocator := context.temp_allocator) -> []u8 {
-	out, ok := hex.decode(transmute([]u8)s, allocator)
-	if !ok {
-		return nil
-	}
-	return out
 }
 
 fixture :: proc(key: string) -> Fixture {
