@@ -503,8 +503,8 @@ test_an_anchor_over_the_reverse_zone_stops_the_synthesis :: proc(t: ^testing.T) 
 	anchors := make([]string, 1, context.temp_allocator)
 	anchors[0] = "168.192.in-addr.arpa."
 
-	_, anchored, refused := ask_rules(rules, "50.1.168.192.in-addr.arpa.", .PTR, anchor_zones = anchors)
-	testing.expect(t, refused, "the anchored zone went unanswered")
+	_, anchored, anchored_ok := ask_rules(rules, "50.1.168.192.in-addr.arpa.", .PTR, anchor_zones = anchors)
+	testing.expect(t, anchored_ok, "the anchored zone went unanswered")
 	testing.expect_value(t, anchored, Outcome.Refused)
 
 	resp, elsewhere, ok := ask_rules(rules, "5.0.0.10.in-addr.arpa.", .PTR, anchor_zones = anchors)

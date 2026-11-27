@@ -488,7 +488,7 @@ test_the_home_arpa_apex_ds_is_still_forwarded :: proc(t: ^testing.T) {
 
 		opt: Maybe(dns.Record)
 		if do_bit {
-			opt = dns.make_opt(1232, true)
+			opt = dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, true)
 		}
 		_, outcome, answered := exchange_with(&s, x, serve_canned, test_query("home.arpa.", .DS, opt = opt))
 		testing.expect(t, answered, "the DS query for home.arpa. went unanswered")

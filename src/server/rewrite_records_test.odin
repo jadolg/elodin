@@ -190,8 +190,8 @@ test_a_record_only_rule_leaves_other_types_alone :: proc(t: ^testing.T) {
 		ptr     = true,
 	}
 
-	_, forwarded, refused := ask_rules(rules, "example.com.", .A)
-	testing.expect(t, refused, "the A query went unanswered")
+	_, forwarded, a_answered := ask_rules(rules, "example.com.", .A)
+	testing.expect(t, a_answered, "the A query went unanswered")
 	testing.expect_value(t, forwarded, Outcome.Refused)
 
 	// The types it does hold are still answered here.
@@ -355,8 +355,8 @@ test_the_walk_will_not_reach_an_alias_past_records :: proc(t: ^testing.T) {
 
 	// Nothing here can answer it: the MX rule has no A and the alias may not
 	// apply, so the name goes on down the pipeline.
-	_, outcome, refused := ask_rules(rules, "mail.lan.", .A)
-	testing.expect(t, refused, "the A query went unanswered")
+	_, outcome, answered := ask_rules(rules, "mail.lan.", .A)
+	testing.expect(t, answered, "the A query went unanswered")
 	testing.expect_value(t, outcome, Outcome.Refused)
 
 	// The MX is still answered, and the alias still answers every other name

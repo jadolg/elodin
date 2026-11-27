@@ -778,7 +778,7 @@ cname_record :: proc(name, target: string, ttl: u32 = 60) -> dns.Record {
 
 // An OPT record carrying one option.
 @(private)
-opt_with :: proc(code: dns.EDNS_Option_Code, data: []u8, udp_size: u16 = 1232, do_bit := false, version: u8 = 0) -> dns.Record {
+opt_with :: proc(code: dns.EDNS_Option_Code, data: []u8, udp_size: u16 = config.DEFAULT_MAX_UDP_RESPONSE, do_bit := false, version: u8 = 0) -> dns.Record {
 	options := make([]dns.EDNS_Option, 1, context.temp_allocator)
 	options[0] = dns.EDNS_Option{code = u16(code), data = data}
 	return opt_record(udp_size, version, do_bit, options)
@@ -788,7 +788,7 @@ opt_with :: proc(code: dns.EDNS_Option_Code, data: []u8, udp_size: u16 = 1232, d
 // The version is the TTL's second byte (RFC 6891 section 6.1.3); the extended
 // rcode above it stays zero.
 @(private)
-opt_record :: proc(udp_size: u16 = 1232, version: u8 = 0, do_bit := false, options: []dns.EDNS_Option = nil) -> dns.Record {
+opt_record :: proc(udp_size: u16 = config.DEFAULT_MAX_UDP_RESPONSE, version: u8 = 0, do_bit := false, options: []dns.EDNS_Option = nil) -> dns.Record {
 	opt := dns.make_opt(udp_size, do_bit)
 	opt.ttl |= u32(version) << 16
 	opt.data = dns.Rdata_OPT{options = options}

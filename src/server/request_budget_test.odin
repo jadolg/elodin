@@ -28,6 +28,9 @@ here is that the request's own procedures charge the one counter.
 // `fit_response`, and `dnssec.MAX_LOOKUPS_PER_QUERY` chain lookups.
 @(private = "file")
 READINGS :: 2 + 1 + dnssec.MAX_LOOKUPS_PER_QUERY
+// `decode_answer`'s pairs, then `fit_response` once: the loop below spends an odd
+// count.
+#assert(READINGS % 2 == 1)
 
 /*
 A reply that spends a whole reading's budget out of a few kilobytes of wire.
@@ -100,7 +103,7 @@ request_ceiling :: proc(msg_len: int) -> int {
 Every reading a request makes charges the one counter the request owns.
 
 The readings here are the request's real ones - `decode_answer`'s pair, then
-`fit_response` - run until the issue's thirty-five are spent. Without the shared
+`fit_response` - run until `READINGS` are spent. Without the shared
 counter this is 23 MB of arena for a reply of five kilobytes.
 */
 @(test)

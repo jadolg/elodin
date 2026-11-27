@@ -755,7 +755,7 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	*/
 	stale_fixture_join(&f)
 
-	testing.expect_value(t, mock_heard(f.socket), 1)
+	testing.expect_value(t, mock_heard(f.socket, STALE_NAME), 1)
 	free_all(context.temp_allocator)
 }
 
@@ -944,7 +944,7 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	// Nothing was ever submitted, so this stops an idle loop; the count behind
 	// it is the one attempt this thread made for itself.
 	stale_fixture_join(&f)
-	testing.expect_value(t, mock_heard(f.socket), 1)
+	testing.expect_value(t, mock_heard(f.socket, STALE_NAME), 1)
 	free_all(context.temp_allocator)
 }
 
