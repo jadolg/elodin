@@ -49,10 +49,7 @@ tcp_closed_without_answer :: proc(tcp_port: int) -> (connected: bool, answered: 
 	defer net.close(socket)
 
 	query := build_query("acl.example.", u16(dns.Type.A), id = 0x51, allocator = context.temp_allocator)
-	framed := make([]u8, 2 + len(query), context.temp_allocator)
-	framed[0] = u8(len(query) >> 8)
-	framed[1] = u8(len(query))
-	copy(framed[2:], query)
+	framed := frame_all({query})
 	// A closed connection may take the write rather than the read, so a failure
 	// here is still the server having refused us.
 	if _, werr := net.send_tcp(socket, framed); werr != nil {

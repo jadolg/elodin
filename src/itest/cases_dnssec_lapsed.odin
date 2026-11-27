@@ -1,6 +1,7 @@
 package itest
 
 import "elodin:dns"
+import "elodin:server"
 
 /*
 Issue #360: a signature outside its validity window reaches the client as RFC
@@ -282,21 +283,12 @@ LP_FIXTURES := []Fixture{
 }
 
 run_dnssec_lapsed_cases :: proc(r: ^Runner) {
-	mock := mock_make("dnssec-lapsed", next_port(r))
-	for f in LP_FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
-	}
-	if !mock_start_or_skip(r, mock, "dnssec: a lapsed signature is named by its window") {
-		return
-	}
-	defer mock_stop(mock)
-
-	udp_port := next_port(r)
-	config := dnssec_config(udp_port, mock.port, []string{LP_ANCHOR}, log = "{ level: info }", cache = "{ enabled: true }")
-	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	mock := signed_mock(r, "dnssec-lapsed", LP_FIXTURES)
+	srv, udp_port, ok := start_signed_pair(r, mock, LP_ANCHOR, "dnssec: a lapsed signature is named by its window", cache = true)
 	if !ok {
 		return
 	}
+	defer mock_stop(mock)
 	defer stop_server(&srv)
 
 	EXPIRED :: "signature expired at 2026-07-03T10:00:00Z"
@@ -310,16 +302,16 @@ run_dnssec_lapsed_cases :: proc(r: ^Runner) {
 		// Asked before, so it has to come from the remembered verdict.
 		cached: bool,
 	} {
-		{"dnssec: a DS signed by its parent past its expiration is code 7", "www.dsx.", .Serv_Fail, 7, EXPIRED, false},
-		{"dnssec: a DNSKEY set signed before its inception is code 8", "www.dkx.", .Serv_Fail, 8, NOT_YET, false},
-		{"dnssec: an answer signed past its expiration is code 7", "late.lt.", .Serv_Fail, 7, EXPIRED, false},
-		{"dnssec: an answer signed before its inception is code 8", "early.lt.", .Serv_Fail, 8, NOT_YET, false},
-		{"dnssec: the cached refusal of that answer is code 8 too", "early.lt.", .Serv_Fail, 8, NOT_YET, true},
-		{"dnssec: an unsigned delegation whose DS denial is not yet valid is code 8", "www.unsigned.lt.", .Serv_Fail, 8, NOT_YET, false},
-		{"dnssec: an NXDOMAIN whose cover is not yet valid is code 8", "nope.lt.", .Serv_Fail, 8, NOT_YET, false},
-		{"dnssec: a wildcard answer whose cover expired is code 7", "x.wl.", .Serv_Fail, 7, EXPIRED, false},
+		{"dnssec: a DS signed by its parent past its expiration is code 7", "www.dsx.", .Serv_Fail, server.EDE_SIGNATURE_EXPIRED, EXPIRED, false},
+		{"dnssec: a DNSKEY set signed before its inception is code 8", "www.dkx.", .Serv_Fail, server.EDE_SIGNATURE_NOT_YET_VALID, NOT_YET, false},
+		{"dnssec: an answer signed past its expiration is code 7", "late.lt.", .Serv_Fail, server.EDE_SIGNATURE_EXPIRED, EXPIRED, false},
+		{"dnssec: an answer signed before its inception is code 8", "early.lt.", .Serv_Fail, server.EDE_SIGNATURE_NOT_YET_VALID, NOT_YET, false},
+		{"dnssec: the cached refusal of that answer is code 8 too", "early.lt.", .Serv_Fail, server.EDE_SIGNATURE_NOT_YET_VALID, NOT_YET, true},
+		{"dnssec: an unsigned delegation whose DS denial is not yet valid is code 8", "www.unsigned.lt.", .Serv_Fail, server.EDE_SIGNATURE_NOT_YET_VALID, NOT_YET, false},
+		{"dnssec: an NXDOMAIN whose cover is not yet valid is code 8", "nope.lt.", .Serv_Fail, server.EDE_SIGNATURE_NOT_YET_VALID, NOT_YET, false},
+		{"dnssec: a wildcard answer whose cover expired is code 7", "x.wl.", .Serv_Fail, server.EDE_SIGNATURE_EXPIRED, EXPIRED, false},
 		{"dnssec: an expired signature beside a current one still validates", "both.lt.", .No_Error, -1, "", false},
-		{"dnssec: a current signature that fails beside an expired one is code 6", "mixed.lt.", .Serv_Fail, 6, "no valid signature", false},
+		{"dnssec: a current signature that fails beside an expired one is code 6", "mixed.lt.", .Serv_Fail, server.EDE_DNSSEC_BOGUS, "no valid signature", false},
 	}
 	for c in cases {
 		start_case(r, c.name)

@@ -203,13 +203,20 @@ conn_read_full :: proc(c: ^Test_Conn, buf: []u8) -> bool {
 	return true
 }
 
+// `queries`, each behind its two-byte length prefix (RFC 1035 section 4.2.2), in
+// one buffer for one write, in the temp arena.
+frame_all :: proc(queries: [][]u8) -> []u8 {
+	out := make([dynamic]u8, 0, 64 * len(queries), context.temp_allocator)
+	for q in queries {
+		append(&out, u8(len(q) >> 8), u8(len(q)))
+		append(&out, ..q)
+	}
+	return out[:]
+}
+
 @(private)
 stream_query :: proc(c: ^Test_Conn, query: []u8, allocator: mem.Allocator) -> Query_Result {
-	framed := make([]u8, 2 + len(query), context.temp_allocator)
-	framed[0] = u8(len(query) >> 8)
-	framed[1] = u8(len(query))
-	copy(framed[2:], query)
-	if !conn_write(c, framed) {
+	if !conn_write(c, frame_all({query})) {
 		return {}
 	}
 	return stream_read_answer(c, allocator)

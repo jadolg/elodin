@@ -1,6 +1,7 @@
 package itest
 
 import "elodin:dns"
+import "elodin:server"
 
 /*
 DNS rebinding protection, end to end.
@@ -117,7 +118,7 @@ run_rebind_refusal_cases :: proc(r: ^Runner) {
 						check_eq_int(r, h.ancount, 0, "answer count")
 						check(r, h.nscount >= 1, "no SOA in the authority section")
 						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
-						check_eq_int(r, extended_error(r, res.wire), 15, "extended error info-code")
+						check_eq_int(r, extended_error(r, res.wire), server.EDE_BLOCKED, "extended error info-code")
 					}
 					check(r, log_contains(&srv, "outcome=blocked detail=rebind"), "the query log did not record the refusal")
 					check(r, log_contains(&srv, "rebinding attack"), "no warning was logged for the first refusal")

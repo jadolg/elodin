@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:net"
 import "core:os"
+import "core:strings"
 import "core:time"
 import "elodin:tlsx"
 
@@ -17,21 +18,15 @@ than reading the log would.
 */
 
 @(private = "file")
-config_for_reload :: proc(udp_port, dot_port, doh_port: int, cert_file, key_file: string) -> string {
+config_for_reload :: proc(r: ^Runner, udp_port, dot_port, doh_port: int, cert_file, key_file: string) -> string {
 	return base_config(
 		udp_port,
 		`["127.0.0.1:1"]`,
 		log = "{ level: debug }",
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
-		listeners_extra = fmt.tprintf(
-			`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}`,
-			dot_port,
-			cert_file,
-			key_file,
-			doh_port,
-			cert_file,
-			key_file,
+		listeners_extra = strings.concatenate(
+			[]string{dot_listener(r, dot_port, cert = cert_file, key = key_file), "\n", doh_listener(r, doh_port, cert = cert_file, key = key_file)},
+			context.temp_allocator,
 		),
 	)
 }
@@ -64,7 +59,7 @@ run_reload_cases :: proc(r: ^Runner) {
 	srv, ok := start_server(
 		r,
 		Server_Options {
-			config = config_for_reload(udp_port, dot_port, doh_port, active_cert, active_key),
+			config = config_for_reload(r, udp_port, dot_port, doh_port, active_cert, active_key),
 			udp_port = udp_port,
 			dot_port = dot_port,
 			// Named because the profile cases below dial it: the listeners bind

@@ -1,11 +1,11 @@
 package itest
 
 import "core:fmt"
-import "core:strconv"
 import "core:strings"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:netx"
 
 /*
 The Prometheus endpoint, against the running binary.
@@ -207,9 +207,6 @@ Wait for the endpoint rather than for the resolver.
 `start_server` establishes readiness by asking a DNS question, and the metrics
 listener binds after the ones that answer those - so a scrape sent the moment
 the probe succeeds can arrive before there is anything to accept it.
-
-Shared with `cases_special_use.odin`, which scrapes the endpoint for a counter of
-its own; the waiting is the same and the reason for it is the same.
 */
 wait_http :: proc(port: int, path: string) -> bool {
 	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
@@ -237,8 +234,8 @@ metrics_page :: proc(metrics_port: int) -> string {
 	return string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
 }
 
-// -1 when the sample is not there, which no counter on the page can be. Shared
-// with `cases_special_use.odin` for the same reason `wait_http` is.
+// The sample `name` on `page`, or -1 when it is not there or not a plain count,
+// which no counter on the page can be.
 metric_value :: proc(page: string, name: string) -> int {
 	prefix := fmt.tprintf("\n%s ", name)
 	at := strings.index(page, prefix)
@@ -250,5 +247,6 @@ metric_value :: proc(page: string, name: string) -> int {
 	if line_end < 0 {
 		return -1
 	}
-	return strconv.parse_int(rest[:line_end]) or_else -1
+	value, ok := netx.parse_decimal(rest[:line_end], u64(max(int)))
+	return int(value) if ok else -1
 }

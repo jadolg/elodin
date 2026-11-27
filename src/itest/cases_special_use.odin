@@ -457,16 +457,9 @@ run_special_use_counter_cases :: proc(r: ^Runner) {
 		forwarded := query_udp(udp_port, build_query("printer.local.", u16(dns.Type.A)))
 		check(r, forwarded.ok, "no response for the forwarded name")
 
-		if check(r, wait_http(metrics_port, "/metrics"), "the metrics endpoint never answered") {
-			res := http_request(metrics_port, "GET", "/metrics", context.temp_allocator)
-			if check(r, res.status == 200, "a scrape returned %d", res.status) {
-				check(
-					r,
-					metric_value(string(res.body), "elodin_special_use_total") == 3,
-					"elodin_special_use_total is %v, want 3",
-					metric_value(string(res.body), "elodin_special_use_total"),
-				)
-			}
+		page := metrics_page(metrics_port)
+		if check(r, page != "", "the metrics endpoint never answered") {
+			check_eq_int(r, metric_value(page, "elodin_special_use_total"), 3, "elodin_special_use_total")
 		}
 	}
 	end_case(r)

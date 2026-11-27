@@ -1,11 +1,11 @@
 package itest
 
 import "core:fmt"
-import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
+import "elodin:server"
 
 /*
 DNSSEC validation, end to end.
@@ -49,7 +49,8 @@ dnssec_config :: proc(
 	)
 }
 
-// The root's DS, the anchor a validating server holds when none is configured.
+// The 2017 root KSK's DS, one of the two built-in anchors a validating server
+// holds when none is configured.
 ROOT_DS :: ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
 
 run_dnssec_cases :: proc(r: ^Runner) {
@@ -185,7 +186,8 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// DO to get the signatures, CD so the upstream's own opinion of them
 		// does not decide the matter for us.
 		mock_reset_counts(mock)
-		_ = query_udp(udp_port, build_query("signatures.test.", u16(dns.Type.A)))
+		asked := query_udp(udp_port, build_query("signatures.test.", u16(dns.Type.A)))
+		check(r, asked.ok, "the query asking for signatures went unanswered")
 
 		// The client's question by its type: the chain walk's own lookups and the
 		// Key Tag query it sends on a fiber of its own can land after it.
@@ -284,7 +286,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 				ede:      int,
 			}{
 				{ANCHORED_REVERSE_ANCHOR, .No_Error, true, -1},
-				{"168.192.in-addr.arpa. IN DS 18109 15 2 0000000000000000000000000000000000000000000000000000000000000000", .Serv_Fail, false, 6},
+				{"168.192.in-addr.arpa. IN DS 18109 15 2 0000000000000000000000000000000000000000000000000000000000000000", .Serv_Fail, false, server.EDE_DNSSEC_BOGUS},
 			}) {
 			anchored_port := next_port(r)
 			config := dnssec_config(
@@ -350,9 +352,9 @@ run_dnssec_cases :: proc(r: ^Runner) {
 						ede:   int,
 					}{
 						{"seed.alias.cntest.", .No_Error, -1},
-						{"x.bare.cntest.", .Serv_Fail, 6},
-						{"x.wild.cntest.", .Serv_Fail, 6},
-						{"x.stray.cntest.", .Serv_Fail, 6},
+						{"x.bare.cntest.", .Serv_Fail, server.EDE_DNSSEC_BOGUS},
+						{"x.wild.cntest.", .Serv_Fail, server.EDE_DNSSEC_BOGUS},
+						{"x.stray.cntest.", .Serv_Fail, server.EDE_DNSSEC_BOGUS},
 					}) {
 					res := query_udp(cut_udp, build_query(c.name, u16(dns.Type.A), edns_size = 1232, dnssec_ok = true))
 					if check(r, res.ok, "no response for %s", c.name) {
@@ -435,14 +437,28 @@ run_dnssec_cases :: proc(r: ^Runner) {
 // RFC 8145 section 4: the last DNSKEY lookup carried `tags` as its edns-key-tag.
 @(private = "file")
 check_key_tag_option :: proc(r: ^Runner, mock: ^Mock, tags: []u8) {
-	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
-	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
-		m, derr := dns.decode_message(dnskey, context.temp_allocator)
-		if check(r, derr == .None, "the DNSKEY lookup does not decode: %v", derr) {
-			data, found := dns.find_edns_option(m, .Key_Tag)
-			check(r, found && slice.equal(data, tags), "the DNSKEY lookup's edns-key-tag is %x (found %v), want %x", data, found, tags)
-		}
+	if data, found, ok := dnskey_key_tag(r, mock); ok {
+		check(r, found && slice.equal(data, tags), "the DNSKEY lookup's edns-key-tag is %x (found %v), want %x", data, found, tags)
 	}
+}
+
+/*
+The edns-key-tag option of the last DNSKEY lookup `mock` saw, and whether it
+carried one. `ok` is false, with the case failed, when no DNSKEY lookup arrived
+or it does not decode.
+*/
+@(private = "file")
+dnskey_key_tag :: proc(r: ^Runner, mock: ^Mock) -> (data: []u8, found: bool, ok: bool) {
+	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
+	if !check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
+		return nil, false, false
+	}
+	m, derr := dns.decode_message(dnskey, context.temp_allocator)
+	if !check(r, derr == .None, "the DNSKEY lookup does not decode: %v", derr) {
+		return nil, false, false
+	}
+	data, found = dns.find_edns_option(m, .Key_Tag)
+	return data, found, true
 }
 
 /*
@@ -497,13 +513,8 @@ run_key_tag_off_case :: proc(r: ^Runner) {
 		return
 	}
 	check(r, parse_header(r, res.wire).ad, "the premise: the anchored name validated, so its keys were cached")
-	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
-	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
-		m, derr := dns.decode_message(dnskey, context.temp_allocator)
-		if check(r, derr == .None, "the DNSKEY lookup does not decode: %v", derr) {
-			_, found := dns.find_edns_option(m, .Key_Tag)
-			check(r, !found, "the DNSKEY lookup carries edns-key-tag with signalling off")
-		}
+	if _, found, read := dnskey_key_tag(r, mock); read {
+		check(r, !found, "the DNSKEY lookup carries edns-key-tag with signalling off")
 	}
 	// With the switch on, the Key Tag query arrives within milliseconds of the
 	// answer; a second is far past that.
@@ -575,13 +586,8 @@ run_key_tag_failed_lookup_case :: proc(r: ^Runner) {
 	defer stop_server(&srv)
 	_, _, answered := ask(r, udp_port, "failing.test.", u16(dns.Type.A))
 	check(r, answered, "no answer")
-	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
-	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
-		m, derr := dns.decode_message(dnskey, context.temp_allocator)
-		if check(r, derr == .None, "the DNSKEY lookup does not decode: %v", derr) {
-			_, found := dns.find_edns_option(m, .Key_Tag)
-			check(r, found, "the premise: the failed DNSKEY lookup carried the anchors' key tags")
-		}
+	if _, found, read := dnskey_key_tag(r, mock); read {
+		check(r, found, "the premise: the failed DNSKEY lookup carried the anchors' key tags")
 	}
 	check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query followed a failed DNSKEY lookup")
 }
@@ -639,12 +645,7 @@ dnssec:
 		srv, started := start_server_raw(r, config, port)
 		if check(r, started, "cannot start the binary") {
 			defer stop_server(&srv)
-			state, werr := os.process_wait(srv.process, 10 * time.Second)
-			if check(r, werr == nil && state.exited, "the server started on an anchor it cannot follow") {
-				srv.running = false
-				check(r, state.exit_code != 0, "the refusal exited 0")
-				check(r, log_contains(&srv, "no trust anchor for corp. names an algorithm"), "the refusal does not name the zone:\n%s", read_log(&srv))
-			}
+			expect_refused_start(r, &srv, "no trust anchor for corp. names an algorithm")
 		}
 	}
 	end_case(r)

@@ -23,8 +23,8 @@ client pipelining down one connection reaches it as fast as the socket allows.
 The last case is the line between the two: a prefix's datagrams and its connections
 are charged to separate budgets, so a spoofed flood cannot close the connections of
 the clients who live at the address it is naming. See the note at the top of
-`src/server/ratelimit.odin`, which is where that decision is argued and where the
-one-shared-budget version it replaced is written down.
+`src/server/ratelimit.odin`, which is where that decision is argued, against a
+single budget shared by both.
 */
 
 run_rate_limit_cases :: proc(r: ^Runner) {
@@ -114,8 +114,8 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 		)
 		if ok {
 			defer stop_server(&srv)
-			// As many responses as the flood case sends queries: before the
-			// fix, those past the budget drew slips.
+			// As many responses as the flood case sends queries: none is
+			// answered, so none past the budget draws a slip either.
 			response := slice.clone(query, context.temp_allocator)
 			response[2] |= 0x80
 			bounced := udp_flood(udp_port, response, QUERIES)
@@ -374,8 +374,8 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			by_size := udp_flood(sized_port, big_query, QUERIES)
 
 			// Counted: every answer is one token whatever it weighs, so the
-			// prefix keeps receiving `responses_per_second` of them. This is the
-			// shipped behaviour and the shape of the finding.
+			// prefix keeps receiving `responses_per_second` of them, however
+			// large: the bytes a counted budget lets through grow with the answer.
 			counted_port := next_port(r)
 			counted, cok := start_server(
 				r,
@@ -390,7 +390,9 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			)
 			if cok {
 				defer stop_server(&counted)
-				_ = udp_flood(counted_port, big_query, QUERIES)
+				// Drained until its answers are in, as the sized burst is: one
+				// token each, so the burst is `BURST` answers.
+				_ = udp_flood(counted_port, big_query, QUERIES, drain = 10 * time.Second, want = BURST) // lint:allow the burst only spends the budget; the flood after it is measured
 				by_count := udp_flood(counted_port, big_query, QUERIES)
 				check(
 					r,
@@ -490,7 +492,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			// The figures are in the needle: a case looking for the setting's
 			// name alone would pass on the error the loader writes for a figure
 			// out of bounds, which is a different thing being reported.
-			reported := "is 2048 bytes, above the 1232 server.max_udp_response allows"
+			reported := fmt.tprintf("is 2048 bytes, above the %d server.max_udp_response allows", config.DEFAULT_MAX_UDP_RESPONSE)
 			check(
 				r,
 				log_contains(&inert, reported),
@@ -650,7 +652,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 
 			// A short drain, so the query below arrives while a shared budget would
 			// still have been empty.
-			res := udp_flood(udp_port, query, QUERIES, 250 * time.Millisecond)
+			res := udp_flood(udp_port, query, QUERIES, drain = 250 * time.Millisecond)
 			full := res.answered - res.truncated
 			check(
 				r,
@@ -867,6 +869,9 @@ query_tcp_once_bound :: proc(tcp_port: int, query: []u8, timeout: time.Duration)
 			if time.tick_diff(time.tick_now(), deadline) <= 0 {
 				return {}
 			}
+			// Not at once: a refused dial comes back in microseconds, and an
+			// unpaused retry spins a core until the deadline.
+			time.sleep(PROBE_RETRY_PAUSE) // lint:allow a pause between dials, bounded by the deadline above
 			continue
 		}
 		defer net.close(conn.socket)

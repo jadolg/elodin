@@ -35,12 +35,7 @@ run_identity_cases :: proc(r: ^Runner) {
 			udp_port,
 			upstream_at(next_port(r)),
 			log = "{ level: info, queries: true }",
-			listeners_extra = fmt.tprintf(
-				`  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}`,
-				doh_port,
-				r.cert_file,
-				r.key_file,
-			),
+			listeners_extra = doh_listener(r, doh_port),
 			extra = extra,
 		)
 		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, doh_port = doh_port})

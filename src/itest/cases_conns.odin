@@ -80,7 +80,7 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 	/*
 	With no share configured, one client is served every connection it opens.
 
-	This is the shape of the finding rather than a feature: four connections held
+	Not a feature but the exposure the share exists for: four connections held
 	open at once from one source, four of the server's slots occupied by it, and
 	nothing that would have stopped it taking the other two as well.
 
@@ -103,14 +103,14 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 		)
 		if ok {
 			defer stop_server(&srv)
-			refused_before := conn_refused_count(metrics_port)
+			refused_before := conn_counters(metrics_port).refused
 			check(r, refused_before >= 0, "the metrics endpoint published no elodin_connections_refused_total")
 			answered, opened := tcp_hold_and_query(tcp_port, query, CONNS)
 			check_eq_int(r, opened, CONNS, "connections the client could open")
 			check_eq_int(r, answered, CONNS, "answers on connections held at once with no share configured")
 			check_eq_int(
 				r,
-				conn_refused_count(metrics_port) - refused_before,
+				conn_counters(metrics_port).refused - refused_before,
 				0,
 				"connections refused with no share configured",
 			)
@@ -142,7 +142,7 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 		)
 		if ok {
 			defer stop_server(&srv)
-			refused_before := conn_refused_count(metrics_port)
+			refused_before := conn_counters(metrics_port).refused
 			check(r, refused_before >= 0, "the metrics endpoint published no elodin_connections_refused_total")
 			answered, opened := tcp_hold_and_query(tcp_port, query, CONNS)
 			check_eq_int(r, opened, CONNS, "connections the client could open")
@@ -163,7 +163,7 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 			// reason, would leave this short.
 			check_eq_int(
 				r,
-				conn_refused_count(metrics_port) - refused_before,
+				conn_counters(metrics_port).refused - refused_before,
 				CONNS - answered,
 				"connections refused past the share",
 			)
@@ -230,11 +230,4 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 	end_case(r)
 }
 
-// The refusals the server has counted so far, or -1 when the endpoint does not
-// publish the series. Not clamped to 0: the no-share row asserts a difference of
-// 0, which a missing series read as 0 would satisfy for the wrong reason.
-@(private = "file")
-conn_refused_count :: proc(metrics_port: int) -> int {
-	return metric_value(metrics_page(metrics_port), "elodin_connections_refused_total")
-}
 

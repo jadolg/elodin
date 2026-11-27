@@ -168,8 +168,10 @@ run_config_reload_cases :: proc(r: ^Runner) {
 
 	start_case(r, "config reload: a listener change is named and the listener keeps its port")
 	{
-		moved, _ := strings.replace_all(config_reload_text(udp_port, b_port, REWRITE), fmt.tprintf("port: %d }", udp_port), fmt.tprintf("port: %d }", udp_port + 1000), context.temp_allocator)
-		if check(r, reload_to(r, &srv, moved, "listeners.udp changed, which takes a restart"), "the restart-only key was not named") {
+		text := config_reload_text(udp_port, b_port, REWRITE)
+		needle := fmt.tprintf("port: %d }", udp_port)
+		moved, _ := strings.replace_all(text, needle, fmt.tprintf("port: %d }", udp_port + 1000), context.temp_allocator) // lint:allow the flag is allocation, not a match
+		if check(r, strings.contains(text, needle), "the configuration has no %q to move", needle) && check(r, reload_to(r, &srv, moved, "listeners.udp changed, which takes a restart"), "the restart-only key was not named") {
 			check(r, query_udp(udp_port, build_query("rw.reload.test.", u16(dns.Type.A))).ok, "the listener stopped answering on its port")
 		}
 	}
@@ -236,10 +238,11 @@ run_config_reload_cases :: proc(r: ^Runner) {
 			shorter := config_reload_text(udp_port, a_port, "  client_timeout: 1s\n")
 			if check(r, reload_to(r, &srv, shorter, "msg=reloaded"), "the reload was never logged") {
 				check(r, stream_query(&conn, build_query("rw.reload.test.", u16(dns.Type.A)), context.temp_allocator).ok, "no answer after the reload")
-				_ = net.set_option(conn.socket, .Receive_Timeout, 5 * time.Second)
-				buf: [1]u8
-				n, rerr := net.recv_tcp(conn.socket, buf[:])
-				check(r, n == 0 && rerr == nil, "the idle connection was not closed on the new client_timeout (read %d, %v)", n, rerr)
+				if check(r, net.set_option(conn.socket, .Receive_Timeout, 5 * time.Second) == nil, "cannot bound the read") {
+					buf: [1]u8
+					n, rerr := net.recv_tcp(conn.socket, buf[:])
+					check(r, n == 0 && rerr == nil, "the idle connection was not closed on the new client_timeout (read %d, %v)", n, rerr)
+				}
 			}
 		}
 	}
@@ -277,15 +280,7 @@ run_log_reopen_case :: proc(r: ^Runner, upstream_port: int) {
 	{
 		rotated := strings.concatenate({log_file, ".1"}, context.temp_allocator)
 		if check(r, os.rename(log_file, rotated) == nil, "cannot rotate the log") && check(r, signal_reload(&srv), "could not deliver SIGHUP") {
-			deadline := time.tick_add(time.tick_now(), 5 * time.Second)
-			reopened := false
-			for !reopened && time.tick_diff(time.tick_now(), deadline) > 0 {
-				data, err := os.read_entire_file(log_file, context.temp_allocator)
-				reopened = err == nil && strings.contains(string(data), "SIGHUP received")
-				if !reopened {
-					time.sleep(20 * time.Millisecond)
-				}
-			}
+			reopened := wait_file_count(log_file, "SIGHUP received", 1, 5 * time.Second)
 			check(r, reopened, "nothing was written to the log file's name after the rotation")
 			if reopened {
 				check_log_mode(r, log_file)

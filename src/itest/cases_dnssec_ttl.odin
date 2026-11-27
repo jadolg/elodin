@@ -212,34 +212,29 @@ run_dnssec_ttl_cases :: proc(r: ^Runner) {
 		mock_stop(mock)
 		return
 	}
-	if !mock_start_or_skip(r, mock, "dnssec: served ttl") {
-		return
-	}
-	defer mock_stop(mock)
-
-	udp_port := next_port(r)
-	config := dnssec_config(udp_port, mock.port, []string{TTL_ANCHOR}, log = "{ level: info }", cache = "{ enabled: true }")
-	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	srv, udp_port, ok := start_signed_pair(r, mock, TTL_ANCHOR, "dnssec: served ttl", cache = true)
 	if !ok {
 		return
 	}
+	defer mock_stop(mock)
 	defer stop_server(&srv)
 
 	cases := []struct {
 		name:      string,
 		dnssec_ok: bool,
 		records:   int,
+		// Asked before, so it has to be the cache's copy.
+		cached:    bool,
 	} {
-		{"dnssec: a raised ttl is served no higher than the signature's original ttl", true, 2},
-		{"dnssec: the cached copy of that answer keeps the ceiling", true, 2},
-		{"dnssec: and so does the copy stripped for a client without DO", false, 1},
+		{name = "dnssec: a raised ttl is served no higher than the signature's original ttl", dnssec_ok = true, records = 2},
+		{name = "dnssec: the cached copy of that answer keeps the ceiling", dnssec_ok = true, records = 2, cached = true},
+		{name = "dnssec: and so does the copy stripped for a client without DO", dnssec_ok = false, records = 1},
 	}
-	for c, i in cases {
+	for c in cases {
 		start_case(r, c.name)
 		asked := mock_total(mock)
 		res := query_udp(udp_port, build_query(TTL_QNAME, u16(dns.Type.A), edns_size = 1232, dnssec_ok = c.dnssec_ok))
-		// The second case is the same question again, so it has to be the cache's copy.
-		if i == 1 {
+		if c.cached {
 			check(r, mock_total(mock) == asked, "the repeated question went upstream rather than to the cache")
 		}
 		if check(r, res.ok, "no response") {
@@ -279,7 +274,7 @@ parity_signed_ttl_case :: proc(r: ^Runner, udp_port: int, reference: []u8, origi
 		transport = .UDP,
 		desc      = TTL_QNAME,
 	}
-	q.wire = build_query(TTL_QNAME, q.qtype, q.id, q.qclass, q.udp_size, dnssec_ok = true)
+	q.wire = build_query(TTL_QNAME, q.qtype, id = q.id, class = q.qclass, edns_size = q.udp_size, dnssec_ok = true)
 	if m := pw_parse(q.wire, context.temp_allocator); m.ok && len(m.question) == 1 {
 		q.name = m.question[0].name
 	}

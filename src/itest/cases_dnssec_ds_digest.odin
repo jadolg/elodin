@@ -2,16 +2,15 @@ package itest
 
 import "core:fmt"
 import "elodin:dns"
-import "elodin:server"
 
 /*
 Issue #686: RFC 4509 section 3 has a validator ignore a SHA-1 DS when the DS
 set holds a SHA-256 one. Served by the binary over UDP, each zone's DS set holds
 a SHA-1 DS that matches its key, and beside it a SHA-256 DS that matches too
 (`ddboth.`), or a SHA-256 or SHA-384 DS that matches nothing (`ddwrong.`,
-`ddwrong384.`). The first validates; the other two are bogus, since the key
-only the SHA-1 digest names may not stand in for the one the stronger digest
-names.
+`ddwrong384.`), or a SHA-256 DS one byte short (`ddshort.`). The first and the
+last validate; the other two are bogus, since the key only the SHA-1 digest
+names may not stand in for the one the stronger digest names.
 
 Generated - `testdata/gen/sign_fixtures.py`, scenario `ds_digest_preference`,
 the same bytes `src/dnssec/ds_digest_test.odin` reads.
@@ -200,25 +199,15 @@ DD_FIXTURES := []Fixture{
 }
 
 run_dnssec_ds_digest_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("dnssec-ds-digest", upstream_port)
-	for f in DD_FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
-	}
-	if !mock_start_or_skip(r, mock, "dnssec: a SHA-1 DS beside a stronger one") {
-		return
-	}
-	defer mock_stop(mock)
-
-	udp_port := next_port(r)
-	config := dnssec_config(udp_port, upstream_port, []string{DD_ANCHOR}, log = "{ level: info }")
-	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	mock := signed_mock(r, "dnssec-ds-digest", DD_FIXTURES)
+	srv, udp_port, ok := start_signed_pair(r, mock, DD_ANCHOR, "dnssec: a SHA-1 DS beside a stronger one")
 	if !ok {
 		return
 	}
+	defer mock_stop(mock)
 	defer stop_server(&srv)
 
-	cases := []struct {
+	verdicts := [?]struct {
 		qname: string,
 		rcode: dns.Rcode,
 	} {
@@ -228,18 +217,17 @@ run_dnssec_ds_digest_cases :: proc(r: ^Runner) {
 		{"www.ddboth.", .No_Error},
 		{"www.ddwrong.", .Serv_Fail},
 		{"www.ddwrong384.", .Serv_Fail},
+		// A SHA-256 DS one byte short is no SHA-256 DS, so the SHA-1 one is
+		// followed.
+		{"www.ddshort.", .No_Error},
 	}
-	for c in cases {
-		start_case(r, fmt.tprintf("dnssec: %s, a SHA-1 DS beside a stronger one, is %s", c.qname, "secure" if c.rcode == .No_Error else "bogus"))
-		res := query_udp(udp_port, build_query(c.qname, u16(dns.Type.A), edns_size = 1232, dnssec_ok = true))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
-			check_eq_int(r, h.rcode, int(c.rcode), "rcode")
-			check(r, h.ad == (c.rcode == .No_Error), "AD is %v", h.ad)
-			if c.rcode == .Serv_Fail {
-				check_eq_int(r, extended_error(r, res.wire), server.EDE_DNSSEC_BOGUS, "extended DNS error")
-			}
+	cases: [len(verdicts)]Signed_Verdict
+	for v, i in verdicts {
+		cases[i] = Signed_Verdict {
+			name  = fmt.tprintf("dnssec: %s, a SHA-1 DS beside a stronger one, is %s", v.qname, "secure" if v.rcode == .No_Error else "bogus"),
+			qname = v.qname,
+			rcode = v.rcode,
 		}
-		end_case(r)
 	}
+	check_signed_verdicts(r, udp_port, cases[:])
 }

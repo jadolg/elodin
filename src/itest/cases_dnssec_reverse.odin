@@ -223,22 +223,12 @@ R6_FIXTURES := []Fixture{
 }
 
 run_dnssec_reverse_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("dnssec-reverse", upstream_port)
-	for f in R6_FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
-	}
-	if !mock_start_or_skip(r, mock, "dnssec: ipv6 reverse") {
-		return
-	}
-	defer mock_stop(mock)
-
-	udp_port := next_port(r)
-	config := dnssec_config(udp_port, upstream_port, []string{R6_ANCHOR}, log = "{ level: info }")
-	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	mock := signed_mock(r, "dnssec-reverse", R6_FIXTURES)
+	srv, udp_port, ok := start_signed_pair(r, mock, R6_ANCHOR, "dnssec: ipv6 reverse")
 	if !ok {
 		return
 	}
+	defer mock_stop(mock)
 	defer stop_server(&srv)
 
 	start_case(r, "dnssec: a full-length ipv6 reverse name is validated, not refused")

@@ -27,16 +27,7 @@ run_tls_cipher_cases :: proc(r: ^Runner) {
 	config := base_config(
 		udp_port,
 		upstream_at(next_port(r)),
-		listeners_extra = fmt.tprintf(
-			`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}`,
-			dot_port,
-			cert,
-			key,
-			doh_port,
-			cert,
-			key,
-		),
+		listeners_extra = fmt.tprintf("%s\n%s", dot_listener(r, dot_port, cert = cert, key = key), doh_listener(r, doh_port, cert = cert, key = key)),
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, dot_port = dot_port, doh_port = doh_port})
 	if !ok {

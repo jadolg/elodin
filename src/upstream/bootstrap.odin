@@ -28,7 +28,6 @@ BOOTSTRAP_TTL :: 1 * time.Hour
 The shortest: a TTL of zero or one would send every exchange on an upstream
 named by it to the bootstrap servers first.
 */
-@(private)
 BOOTSTRAP_MIN_TTL :: 10 * time.Second
 
 @(private)

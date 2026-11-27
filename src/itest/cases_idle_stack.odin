@@ -4,11 +4,11 @@ import "base:runtime"
 import "core:fmt"
 import "core:net"
 import "core:os"
-import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
+import "elodin:netx"
 
 /*
 A held connection between queries keeps only the stack its parked frames are on
@@ -86,33 +86,19 @@ run_idle_stack_cases :: proc(r: ^Runner) {
 	tcp_port := next_port(r)
 	dot_port := next_port(r)
 	doh_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d, readers: 1 }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}
-server:
-  client_timeout: 60s
-  max_connections: %d
-  max_connections_per_prefix: %d
-  rate_limit: {{ enabled: false }}
-upstream:
-  servers: ["127.0.0.1:1"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		tcp_port,
-		dot_port,
-		r.cert_file,
-		r.key_file,
-		doh_port,
-		r.cert_file,
-		r.key_file,
-		IDLE_HELD * 2,
-		IDLE_HELD * 2,
+		upstream_at(1),
+		log = "{ level: info }",
+		timeout = "",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		listeners_extra = fmt.tprintf("%s\n%s", dot_listener(r, dot_port), doh_listener(r, doh_port)),
+		extra = fmt.tprintf(
+			"server:\n  client_timeout: 60s\n  max_connections: %d\n  max_connections_per_prefix: %d\n  rate_limit: {{ enabled: false }}",
+			IDLE_HELD * 2,
+			IDLE_HELD * 2,
+		),
+		readers = 1,
 	)
 	srv, started := start_server(
 		r,
@@ -240,6 +226,14 @@ mapping of its own.
 pages back: a glibc arena that THP backs jumps 2 MiB at once, which is the
 kernel's choice and not what a connection holds.
 */
+// A kB figure from smaps, digits only: a field that is not one is a reading
+// that cannot be trusted, not a zero.
+@(private = "file")
+kib_of :: proc(field: string) -> (kib: int, ok: bool) {
+	n := netx.parse_decimal(field, u64(max(i32))) or_return
+	return int(n), true
+}
+
 @(private = "file")
 fiber_stacks :: proc(pid: int, bound_kib: int) -> (count, over, rest_kib: int, ok: bool) {
 	// Polled until the stacks go back, and the temp allocator is reset only when
@@ -263,13 +257,13 @@ fiber_stacks :: proc(pid: int, bound_kib: int) -> (count, over, rest_kib: int, o
 			anonymous = len(fields) == 5
 			size = 0
 		case fields[0] == "Size:" && len(fields) >= 2:
-			size, _ = strconv.parse_int(fields[1])
+			size = kib_of(fields[1]) or_return
 		case fields[0] == "Rss:" && len(fields) >= 2 && anonymous && size == STACK_KIB:
-			rss, _ := strconv.parse_int(fields[1])
+			rss := kib_of(fields[1]) or_return
 			count += 1
 			over += 1 if rss > bound_kib else 0
 		case anonymous && size != STACK_KIB && len(fields) >= 2 && (fields[0] == "Rss:" || fields[0] == "AnonHugePages:"):
-			kib, _ := strconv.parse_int(fields[1])
+			kib := kib_of(fields[1]) or_return
 			rest_kib += kib if fields[0] == "Rss:" else -kib
 		}
 	}

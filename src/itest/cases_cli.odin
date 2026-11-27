@@ -6,6 +6,7 @@ import "core:path/filepath"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
+import "elodin:config"
 
 /*
 Command-line behaviour: the checks an operator relies on before a deploy.
@@ -81,7 +82,7 @@ run_cli_cases :: proc(r: ^Runner) {
 			check_eq_int(r, res.exit_code, 0, "exit code for an estimate above the ceiling")
 			check(
 				r,
-				strings.contains(res.output, "above the 1232 server.max_udp_response allows"),
+				strings.contains(res.output, fmt.tprintf("above the %d server.max_udp_response allows", config.DEFAULT_MAX_UDP_RESPONSE)),
 				"an estimate no answer can reach was not reported: %q",
 				res.output,
 			)
@@ -243,13 +244,15 @@ run_cli_cases :: proc(r: ^Runner) {
 		// Nor in a directory the account cannot write; root writes any.
 		if posix.geteuid() != 0 {
 			ro := filepath.join({r.work_dir, "read-only-dir"}, context.temp_allocator) or_else ""
-			_ = os.make_directory(ro)
-			_ = os.chmod(ro, {.Read_User, .Execute_User})
-			defer _ = os.chmod(ro, {.Read_User, .Write_User, .Execute_User})
-			in_ro := filepath.join({ro, "check.log"}, context.temp_allocator) or_else ""
-			res = check_config_text(r, "check-nolog-ro", fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", in_ro))
-			check(r, res.exit_code == 0, "--check with a log file in a read-only directory exited %d: %q", res.exit_code, res.output)
-			check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say a log file in a read-only directory cannot be created: %q", res.output)
+			// Made and read-only, or the refusal below is the missing directory's,
+			// which the case above already covers.
+			if check(r, os.make_directory(ro) == nil, "cannot make %s", ro) && check(r, os.chmod(ro, {.Read_User, .Execute_User}) == nil, "cannot make %s read-only", ro) {
+				defer _ = os.chmod(ro, {.Read_User, .Write_User, .Execute_User}) // lint:allow a directory left read-only is the work directory's to remove
+				in_ro := filepath.join({ro, "check.log"}, context.temp_allocator) or_else ""
+				res = check_config_text(r, "check-nolog-ro", fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", in_ro))
+				check(r, res.exit_code == 0, "--check with a log file in a read-only directory exited %d: %q", res.exit_code, res.output)
+				check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say a log file in a read-only directory cannot be created: %q", res.output)
+			}
 		}
 	}
 	end_case(r)

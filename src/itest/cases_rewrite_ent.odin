@@ -6,7 +6,6 @@ import "elodin:dns"
 // An upstream's NXDOMAIN for `name` A, with the zone's SOA.
 @(private = "file")
 nx_with_soa :: proc(name: string, allocator := context.allocator) -> []u8 {
-	question := [1]dns.Question{{name = name, type = .A, class = .IN}}
 	soa := [1]dns.Record {
 		{
 			name = "mock.test.",
@@ -17,18 +16,10 @@ nx_with_soa :: proc(name: string, allocator := context.allocator) -> []u8 {
 		},
 	}
 	m := dns.Message {
-		question  = question[:],
 		authority = soa[:],
 	}
-	m.flags.qr = true
-	m.flags.rd = true
-	m.flags.ra = true
 	m.flags.rcode = u8(dns.Rcode.NX_Domain)
-	wire, _, err := dns.encode_message(m, allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(name, .A, m, allocator)
 }
 
 /*
@@ -58,7 +49,8 @@ run_rewrite_ent_cases :: proc(r: ^Runner) {
 	for row, i in rows {
 		payloads[i] = nx_with_soa(row.name)
 		if payloads[i] == nil {
-			skip_case(r, GROUP, "cannot build the NXDOMAIN reply")
+			// The codec's failure or the fixture's, not a busy port: failed.
+			fail(r, "%s: cannot build the NXDOMAIN reply", GROUP)
 			mock_stop(mock)
 			return
 		}

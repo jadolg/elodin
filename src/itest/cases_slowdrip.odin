@@ -59,7 +59,7 @@ config_drip :: proc(r: ^Runner, udp_port, tcp_port, doh_port, upstream_port: int
 		log = "{ level: info }",
 		timeout = "3s",
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
-		listeners_extra = fmt.tprintf("  doh: {{ enabled: true, address: \"127.0.0.1\", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}", doh_port, r.cert_file, r.key_file),
+		listeners_extra = doh_listener(r, doh_port),
 		extra = "server:\n  client_timeout: 1s",
 	)
 }
@@ -192,7 +192,7 @@ run_upstream_drip_case :: proc(r: ^Runner) {
 		start := time.tick_now()
 		// Waits past the whole trickle, so a server held by it is seen answering
 		// late rather than not at all.
-		res := query_udp(udp_port, build_query("drip.example.", 1), timeout = 15 * time.Second)
+		res := query_udp(udp_port, build_query("drip.example.", u16(dns.Type.A)), timeout = 15 * time.Second)
 		spent := time.tick_since(start)
 		dripped := sync.atomic_load(&mock.dripped)
 		// The premise: the upstream was reached over TLS and was trickling.

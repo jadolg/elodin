@@ -58,7 +58,7 @@ run_tc_backlog_cases :: proc(r: ^Runner) {
 
 	start_case(r, name)
 	answered := paced_big_queries(udp_port)
-	check(r, answered > 0, "nothing was answered")
+	check(r, answered > 0, "nothing was answered (%d; -1 is a client socket that failed)", answered)
 	backlogged := metric_value(
 		metrics_page(metrics_port),
 		`elodin_upstream_failure_kind_total{upstream="slow",error="backlogged"}`,
@@ -69,27 +69,31 @@ run_tc_backlog_cases :: proc(r: ^Runner) {
 
 /*
 `QUERIES` truncated names, each its own, one every `PACE`, counting the answers
-as they come.
+as they come; -1 when the client socket cannot be opened, bounded or sent from.
 */
 @(private = "file")
 paced_big_queries :: proc(udp_port: int) -> (answered: int) {
 	socket, err := net.make_unbound_udp_socket(.IP4)
 	if err != nil {
-		return
+		return -1
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 5 * time.Millisecond)
+	if net.set_option(socket, .Receive_Timeout, 5 * time.Millisecond) != nil {
+		return -1
+	}
 	endpoint := net.Endpoint{address = net.IP4_Loopback, port = udp_port}
 
 	sent := 0
 	start := time.tick_now()
-	buf := make([]u8, 65535, context.temp_allocator)
+	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
 	// Every reply is in by the last query plus the timeout; the slack is the
 	// server's own.
 	for time.tick_since(start) < QUERIES * PACE + 2 * time.Second {
 		if sent < QUERIES && time.tick_since(start) >= time.Duration(sent) * PACE {
 			query := build_query(fmt.tprintf("q%d.backlog.test.", sent), u16(dns.Type.A), id = u16(sent))
-			_, _ = net.send_udp(socket, query, endpoint)
+			if _, serr := net.send_udp(socket, query, endpoint); serr != nil {
+				return -1
+			}
 			sent += 1
 		}
 		n, _, rerr := net.recv_udp(socket, buf)

@@ -16,7 +16,7 @@ Policy coverage: sink lists, block response modes, rewrites and the cache.
 write_list :: proc(r: ^Runner, name: string, contents: string) -> string {
 	// A write that did not land has failed the case already, and the server
 	// it is for then fails on the missing file.
-	path, _ := write_work_file(r, name, contents)
+	path, _ := write_work_file(r, name, contents) // lint:allow a failed write has failed the case already
 	return strings.clone(path)
 }
 
@@ -863,20 +863,25 @@ run_cache_cases :: proc(r: ^Runner) {
 		// The referral is not passed on at all (issue #410): it is no answer,
 		// and a client would read the empty NOERROR as NODATA, so with no other
 		// member to ask the query is a SERVFAIL.
-		for name, i in ([]string{"nosoa.example.com.", "referral.example.com."}) {
+		Uncached :: struct {
+			name:     string,
+			referral: bool,
+		}
+		for c, i in ([]Uncached{{name = "nosoa.example.com.", referral = false}, {name = "referral.example.com.", referral = true}}) {
 			mock_reset_counts(mock)
-			first := query_udp(udp_port, build_query(name, u16(dns.Type.A), id = u16(20 + 2 * i)))
-			if !check(r, first.ok, "no response to the first query for %s", name) {
+			first := query_udp(udp_port, build_query(c.name, u16(dns.Type.A), id = u16(20 + 2 * i)))
+			if !check(r, first.ok, "no response to the first query for %s", c.name) {
 				continue
 			}
 			h := parse_header(r, first.wire)
-			if i == 0 {
-				check(r, h.rcode == int(dns.Rcode.No_Error) && h.ancount == 0, "%s: want the empty NOERROR the mock sent", name)
+			if c.referral {
+				check(r, h.rcode == int(dns.Rcode.Serv_Fail), "%s: rcode %d, want SERVFAIL for a referral", c.name, h.rcode)
 			} else {
-				check(r, h.rcode == int(dns.Rcode.Serv_Fail), "%s: rcode %d, want SERVFAIL for a referral", name, h.rcode)
+				check(r, h.rcode == int(dns.Rcode.No_Error) && h.ancount == 0, "%s: want the empty NOERROR the mock sent", c.name)
 			}
-			_ = query_udp(udp_port, build_query(name, u16(dns.Type.A), id = u16(21 + 2 * i)))
-			check_eq_int(r, mock_total(mock), 2, fmt.tprintf("upstream queries for %s asked twice", name))
+			again := query_udp(udp_port, build_query(c.name, u16(dns.Type.A), id = u16(21 + 2 * i)))
+			check(r, again.ok, "no response to the second query for %s", c.name)
+			check_eq_int(r, mock_total(mock), 2, fmt.tprintf("upstream queries for %s asked twice", c.name))
 		}
 	}
 	end_case(r)
@@ -894,7 +899,8 @@ run_cache_cases :: proc(r: ^Runner) {
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want the NOERROR the mock sent", h.rcode)
 			check_eq_int(r, h.ancount, 1, "answer count, the bare CNAME")
 			check_eq_int(r, h.nscount, 0, "authority count")
-			_ = query_udp(udp_port, build_query(name, u16(dns.Type.A), id = 31))
+			again := query_udp(udp_port, build_query(name, u16(dns.Type.A), id = 31))
+			check(r, again.ok, "no response to the second query")
 			check_eq_int(r, mock_total(mock), 2, "upstream queries for a bare CNAME asked twice")
 		}
 	}
@@ -903,7 +909,8 @@ run_cache_cases :: proc(r: ^Runner) {
 	start_case(r, "cache: A and AAAA are separate entries")
 	{
 		mock_reset_counts(mock)
-		_ = query_udp(udp_port, build_query(fix.qname, u16(dns.Type.AAAA), id = 9))
+		aaaa := query_udp(udp_port, build_query(fix.qname, u16(dns.Type.AAAA), id = 9))
+		check(r, aaaa.ok, "no response to the AAAA query")
 		check(r, mock_total(mock) >= 1, "an AAAA query was answered from the A entry")
 	}
 	end_case(r)
@@ -1193,13 +1200,16 @@ run_cache_bytes_cases :: proc(r: ^Runner) {
 		// The most recent is still held, so the cache is working and the check
 		// below is about the bound rather than about caching being off.
 		mock_reset_counts(mock)
-		_ = query_udp(udp_port, build_query(names[NAMES - 1], u16(dns.Type.A), id = 1000, edns_size = 4096))
+		recent := query_udp(udp_port, build_query(names[NAMES - 1], u16(dns.Type.A), id = 1000, edns_size = 4096))
+		// Answered, or a server that stopped answering would pass the count.
+		check(r, recent.ok, "the most recently cached name was not answered")
 		check_eq_int(r, mock_total(mock), 0, "upstream queries for the most recently cached name")
 
 		// The oldest is not, and only the byte bound can have taken it: four
 		// hundred entries is a fraction of the hundred thousand allowed.
 		mock_reset_counts(mock)
-		_ = query_udp(udp_port, build_query(names[0], u16(dns.Type.A), id = 1001, edns_size = 4096))
+		oldest := query_udp(udp_port, build_query(names[0], u16(dns.Type.A), id = 1001, edns_size = 4096))
+		check(r, oldest.ok, "the oldest name was not answered")
 		check(
 			r,
 			mock_total(mock) >= 1,
@@ -1392,7 +1402,7 @@ run_stale_refresh_cases :: proc(r: ^Runner) {
 		// Long enough for a 1.2-second upstream to have answered and the
 		// refresh to have stored it, and well short of the four seconds the
 		// entry it stored is then good for.
-		time.sleep(2 * time.Second)
+		time.sleep(2 * time.Second) // lint:allow the store has no outside signal: the bytes and the cache's gauges are the same either side of it
 
 		third := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 13))
 		if check(r, third.ok, "no response after the refresh") {

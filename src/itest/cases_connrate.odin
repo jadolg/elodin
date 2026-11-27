@@ -19,8 +19,8 @@ share of 256 is never reached. Measured, that was 6,922 handshakes a second and
 So opening a connection is charged to the prefix's own budget, alongside the
 datagrams and the queries - see `Rate_Class` in `src/server/ratelimit.odin`. The
 two runs below are the same burst of connections from one client against a server
-with the limiter on and against one with it off, which is the shape of the finding
-and the shape of the fix.
+with the limiter off, where every one is served, and against one with it on, where
+the burst runs into the budget.
 
 `responses_per_second` is pinned low so the burst reaches the budget in the time a
 test can spend: at 4/s a prefix banks 8 connections, which 24 dials go through
@@ -78,7 +78,7 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 	/*
 	With the limiter off, one client is served every connection it opens.
 
-	The shape of the finding rather than a feature: 24 connections in as many
+	Not a feature but the exposure the limiter exists for: 24 connections in as many
 	milliseconds from one source, every one accepted and served, and no
 	counter in this server moving for any of them. `rate_limit.enabled: false` is
 	also what an operator who wants that back asks for, so the row is worth
@@ -110,9 +110,9 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 	With the limiter on, the burst runs into the prefix's budget.
 
 	The counter is what says a refusal happened rather than an answer being lost,
-	and it is the counter the finding is about: `conn_refused` read zero right
-	through a handshake flood, so a bound with nothing publishing it would leave
-	an operator inferring this from latency complaints.
+	and a bound with nothing publishing it would leave an operator inferring a
+	handshake flood from latency complaints, `conn_refused` reading zero right
+	through it.
 
 	`answered >= 1` as well, because a budget is a budget and not a wall: a
 	client is served up to it. A row where nothing at all got through would be
@@ -190,7 +190,7 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 			setting alone, because the setting alone is not this line:
 			`report_rate_limited` names it too, for a *query* the budget
 			refused. That one is debug-only and this case runs at info, so the
-			short needle would pass today - and pass for the wrong reason the
+			short needle passes here - and passes for the wrong reason the
 			moment either of those changes, which is exactly the confusion the
 			assertion above this one exists to rule out.
 			*/
@@ -243,13 +243,13 @@ reason: the limiter-off row is the only thing here that would notice
 `elodin_connections_rate_limited_total` going away, and clamped it would go on
 passing after the series was gone.
 */
-@(private = "file")
+@(private)
 Conn_Counters :: struct {
 	rate_limited: int,
 	refused:      int,
 }
 
-@(private = "file")
+@(private)
 conn_counters :: proc(metrics_port: int) -> Conn_Counters {
 	page := metrics_page(metrics_port)
 	return {

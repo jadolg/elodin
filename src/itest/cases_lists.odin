@@ -239,7 +239,7 @@ wait_parked :: proc(sock: net.TCP_Socket, timeout: time.Duration) -> bool {
 				return true
 			}
 		}
-		time.sleep(PROBE_RETRY_PAUSE)
+		time.sleep(PROBE_RETRY_PAUSE) // lint:allow a poll of a kernel queue, which raises no event
 	}
 	return false
 }
@@ -272,7 +272,7 @@ run_list_refresh_signal_cases :: proc(r: ^Runner) {
 		if listening {
 			defer net.close(silent)
 			config := config_for_refresh_signals(udp_port, upstream_port, silent_port)
-			if srv, ok := start_server_raw(r, config, udp_port, true); ok {
+			if srv, ok := start_server_raw(r, config, udp_port, allow_fetch = true); ok {
 				defer stop_server(&srv)
 				if check(r, wait_for_log(&srv, "list hosts-list: downloading", 5 * time.Second), "no download started") &&
 				   check(r, wait_parked(silent, 5 * time.Second), "the download never reached the silent host") {
@@ -422,7 +422,7 @@ run_list_bad_download_cases :: proc(r: ^Runner) {
 		if i > 0 {
 			// Aged past the refresh window, so this start downloads again: the
 			// window is read off the cached copy's mtime.
-			aged := time.time_add(time.now(), -time.Hour)
+			aged := time.time_add(time.now(), -time.Hour) // lint:allow wall-clock: an mtime is an instant on it
 			if err := os.change_times(cached, aged, aged); !check(r, err == nil, "cannot age the cached copy: %v", err) {
 				end_case(r)
 				continue
