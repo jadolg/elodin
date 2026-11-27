@@ -592,6 +592,15 @@ expect_copies_capped :: proc(t: ^testing.T, copy_of: proc(rec: dns.Record) -> dn
 	}
 	sigs := holds_signature_over(pruned.answer, "www.example.com.", .A)
 	testing.expectf(t, sigs <= MAX_SIGNATURES_PER_RRSET + 1, "%d signatures survived: %s", sigs, why)
+	// Every RRSIG left, parseable or not, at any owner: a copy the count above
+	// cannot read is still one the client is handed.
+	left := 0
+	for rec in pruned.answer {
+		if rec.type == .RRSIG {
+			left += 1
+		}
+	}
+	testing.expectf(t, left <= MAX_SIGNATURES_PER_RRSET + 1, "%d RRSIGs left in the answer: %s", left, why)
 	// And the one that matters is still there.
 	after := validate(v, "www.example.com.", .A, out, fixture_now())
 	testing.expectf(t, after.status == .Secure, "the pruned answer no longer validates (%v)", after.status)
@@ -739,6 +748,7 @@ test_chain_walk_reads_only_the_chain :: proc(t: ^testing.T) {
 			testing.expectf(t, end == c.end, "%s: ended at %q, want %q", c.what, end, c.end)
 		}
 	}
+	free_all(context.temp_allocator)
 }
 
 // A record at `name` of `type` for `chain_walk` to read; a CNAME points at `target`.

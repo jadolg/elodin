@@ -111,7 +111,7 @@ test_a_frame_with_no_room_is_not_built :: proc(t: ^testing.T) {
 	}
 	for c in fixed {
 		want := testkit.unhex(c.want)
-		testing.expectf(t, want != nil && string(c.frame) == string(want), "%s built as %x", c.name, c.frame)
+		testing.expectf(t, string(c.frame) == string(want), "%s built as %x", c.name, c.frame)
 	}
 
 	for end_stream in ([]bool{true, false}) {
@@ -237,9 +237,6 @@ test_a_header_list_with_no_room_is_not_decoded :: proc(t: ^testing.T) {
 	}
 	for hex in ([]string{REQUEST_BLOCK, "828684418cf1e3c2e5f23a6ba0ab90f4ff"}) {
 		block := testkit.unhex(hex)
-		if !testing.expectf(t, block != nil, "cannot read %s", hex) {
-			return
-		}
 		refusals := 0
 		for run in RUNS {
 			for at in 1 ..= MAX_SWEEP {

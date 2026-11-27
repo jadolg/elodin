@@ -497,7 +497,7 @@ test_validates_nodata :: proc(t: ^testing.T) {
 // The captured root NXDOMAIN with `sig` planted in it: at the front of the
 // authority section, or as the whole answer with the proof taken out.
 @(private = "file")
-plant_in_nxdomain :: proc(t: ^testing.T, sig: dns.Record, as_answer: bool) -> []u8 {
+plant_in_nxdomain :: proc(sig: dns.Record, as_answer: bool) -> []u8 {
 	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "nxdomain_root"), context.temp_allocator)
 	if derr != .None {
 		panic("the NXDOMAIN fixture does not decode")
@@ -535,7 +535,7 @@ test_injected_signer_cannot_downgrade_a_denial :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	// reddit.com is unsigned in the captured set.
-	tampered := plant_in_nxdomain(t, junk_rrsig("zzzz-does-not-exist-xq7.", "reddit.com.", .NSEC, 1), as_answer = false)
+	tampered := plant_in_nxdomain(junk_rrsig("zzzz-does-not-exist-xq7.", "reddit.com.", .NSEC, 1), as_answer = false)
 
 	result := validate(v, "zzzz-does-not-exist-xq7.", .A, tampered, fixture_now())
 	testing.expect_value(t, result.status, Status.Secure)
@@ -561,7 +561,7 @@ test_injected_answer_record_cannot_skip_a_denial :: proc(t: ^testing.T) {
 	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	tampered := plant_in_nxdomain(t, junk_rrsig("zzzz-does-not-exist-xq7.", "reddit.com.", .NSEC, 1), as_answer = true)
+	tampered := plant_in_nxdomain(junk_rrsig("zzzz-does-not-exist-xq7.", "reddit.com.", .NSEC, 1), as_answer = true)
 
 	result := validate(v, "zzzz-does-not-exist-xq7.", .A, tampered, fixture_now())
 	testing.expect(
@@ -583,7 +583,7 @@ test_rrsig_question_has_nothing_to_authenticate :: proc(t: ^testing.T) {
 	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	tampered := plant_in_nxdomain(t, junk_rrsig("example.com.", "example.com.", .A, 2), as_answer = true)
+	tampered := plant_in_nxdomain(junk_rrsig("example.com.", "example.com.", .A, 2), as_answer = true)
 
 	result := validate(v, "example.com.", .RRSIG, tampered, fixture_now())
 	testing.expect_value(t, result.status, Status.Insecure)

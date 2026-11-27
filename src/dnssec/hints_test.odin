@@ -356,7 +356,7 @@ hint, each with `damage` done to it, in front of everything in the additional
 section.
 */
 @(private = "file")
-sh_pad_hint :: proc(t: ^testing.T, damage: bit_set[Rrsig_Damage]) -> []u8 {
+sh_pad_hint :: proc(damage: bit_set[Rrsig_Damage]) -> []u8 {
 	msg, derr := dns.decode_message(scenario_fixture(SH_FIXTURES, "sh_srv_same_zone"), context.temp_allocator)
 	if derr != .None {
 		panic("the hint fixture does not decode")
@@ -376,7 +376,7 @@ sh_pad_hint :: proc(t: ^testing.T, damage: bit_set[Rrsig_Damage]) -> []u8 {
 		}
 	}
 	if len(padded) != PAD_SIGNATURES {
-		panic("the hint fixture carries no one signature over the A hint")
+		panic("the hint fixture should carry exactly one signature over the A hint")
 	}
 	append(&padded, ..msg.additional)
 	msg.additional = padded[:]
@@ -873,7 +873,7 @@ test_a_padded_hint_keeps_a_bounded_number_of_signatures :: proc(t: ^testing.T) {
 	genuine signature is reached, and what is left to decide is how many of the
 	forgeries travel with it.
 	*/
-	result, pruned, ok := sh_prune(t, v, sh_pad_hint(t, {.Key_Tag}), "_svc._tcp.hinttest.", .SRV)
+	result, pruned, ok := sh_prune(t, v, sh_pad_hint({.Key_Tag}), "_svc._tcp.hinttest.", .SRV)
 	if !ok {
 		return
 	}
@@ -915,7 +915,7 @@ test_padding_a_hint_cannot_take_the_answer_with_it :: proc(t: ^testing.T) {
 	v := scenario_validator(&SH_FIXTURES, SH_ANCHOR)
 	defer destroy_validator(v)
 
-	result, pruned, ok := sh_prune(t, v, sh_pad_hint(t, {.Signature}), "_svc._tcp.hinttest.", .SRV)
+	result, pruned, ok := sh_prune(t, v, sh_pad_hint({.Signature}), "_svc._tcp.hinttest.", .SRV)
 	if !ok {
 		return
 	}
