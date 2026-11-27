@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import "core:unicode"
@@ -26,7 +27,11 @@ Loader :: struct {
 	errors:    [dynamic]string,
 	allocator: mem.Allocator,
 	// See `load_file`'s `tls_files`.
-	tls_files: bool,
+	tls_files:       bool,
+	// `upstream.servers` named servers, and every one was refused and reported.
+	servers_refused: bool,
+	// The same, for these indexes into `upstream.zones`.
+	routes_refused:  [dynamic]int,
 }
 
 @(private)
@@ -67,10 +72,11 @@ load_string :: proc(src: string, allocator := context.allocator, tls_files := tr
 	}
 
 	l := Loader {
-		root      = root,
-		errors    = make([dynamic]string, 0, 4, allocator),
-		allocator = allocator,
-		tls_files = tls_files,
+		root           = root,
+		errors         = make([dynamic]string, 0, 4, allocator),
+		allocator      = allocator,
+		tls_files      = tls_files,
+		routes_refused = make([dynamic]int, allocator),
 	}
 	cfg = default_config()
 
@@ -202,26 +208,28 @@ opt_bool :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^bool, path: strin
 		// Named, and with why where it is a form that read as a boolean to
 		// YAML 1.1 and to earlier versions of this reader.
 		_, bool_text := yaml.core_bool(text)
-		errorf(l, "%s.%s: expected true or false, not %q%s", path, key, text, yaml_1_1_hint(child.quoted && bool_text, !child.quoted && yaml.yaml_1_1_bool(text), !child.quoted && earlier_form(text)))
+		errorf(l, "%s.%s: expected true or false, not %q%s", path, key, text, yaml_1_1_hint(child, text, bool_text, yaml.yaml_1_1_bool(text)))
 	} else {
 		errorf(l, "%s.%s: expected true or false", path, key)
 	}
 }
 
 /*
-Why a refused scalar is refused, where the reason is that YAML 1.2 types it as
-a string: `quoted` is a quoted or block scalar that would read as the type
-plain, `form` a YAML 1.1 boolean or integer, and `earlier` a spelling earlier
+Why the scalar `child`, written `text`, is refused, where the reason is that
+YAML 1.2 types it as a string: `core_form` is whether it would read as the type
+plain, so quoting or a block scalar is why; `yaml_1_1_form` whether it is a
+YAML 1.1 boolean or integer; failing both, whether it is a spelling earlier
 versions of this reader took (`0X35`, `tRUE`).
 */
 @(private)
-yaml_1_1_hint :: proc(quoted, form: bool, earlier := false) -> string {
+yaml_1_1_hint :: proc(child: ^yaml.Node, text: string, core_form, yaml_1_1_form: bool) -> string {
+	if child.quoted {
+		return " (quoted or a block scalar, so a string in YAML 1.2)" if core_form else ""
+	}
 	switch {
-	case quoted:
-		return " (quoted or a block scalar, so a string in YAML 1.2)"
-	case form:
+	case yaml_1_1_form:
 		return " (a YAML 1.1 form, a string in YAML 1.2)"
-	case earlier:
+	case earlier_form(text):
 		return " (read by earlier versions of elodin, a string in YAML 1.2)"
 	}
 	return ""
@@ -255,7 +263,7 @@ opt_int :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string)
 	} else if text, scalar := yaml.as_string(child); scalar {
 		// Named for the same reason as `opt_bool`.
 		_, int_text := yaml.core_int(text)
-		errorf(l, "%s.%s: expected an integer, not %q%s", path, key, text, yaml_1_1_hint(child.quoted && int_text, !child.quoted && yaml.yaml_1_1_int(text), !child.quoted && earlier_form(text)))
+		errorf(l, "%s.%s: expected an integer, not %q%s", path, key, text, yaml_1_1_hint(child, text, int_text, yaml.yaml_1_1_int(text)))
 	} else {
 		errorf(l, "%s.%s: expected an integer", path, key)
 	}
@@ -292,7 +300,7 @@ opt_ttl :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^u32, path: string)
 	if !ok || secs < 0 || secs > MAX_TTL {
 		// A TTL may be a duration, quoted or not, so quoting is never why.
 		if text, scalar := yaml.as_string(child); scalar {
-			errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8), not %q%s", path, key, MAX_TTL, text, yaml_1_1_hint(false, !child.quoted && yaml.yaml_1_1_int(text), !child.quoted && earlier_form(text)))
+			errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8), not %q%s", path, key, MAX_TTL, text, yaml_1_1_hint(child, text, false, yaml.yaml_1_1_int(text)))
 		} else {
 			errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8)", path, key, MAX_TTL)
 		}
@@ -459,7 +467,8 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 			}
 		}
 		if !known {
-			errorf(l, "server.sandbox: unknown mode %q (want off, basic or strict)", s)
+			names := sandbox.MODE_NAMES
+			errorf(l, "server.sandbox: unknown mode %q (want %s, %s or %s)", s, names[.Off], names[.Basic], names[.Strict])
 		}
 	}
 	load_allow_from(l, n, cfg)
@@ -621,140 +630,168 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 
 	for e, i in entries {
 		path := fmt.tprintf("server.rate_limit.overrides[%d]", i)
-		/*
-		An entry that is not a mapping is said to be that, rather than reported
-		as a missing key.
-
-		`- 198.51.100.0/24` - the network on its own, which is what
-		`allow_from`'s entries look like and so the shorthand somebody reaches
-		for here - is a scalar, and `yaml.get` answers nil for every key of a
-		scalar. Read through the "missing prefix" branch below it becomes "this
-		entry does not name a network", said to an operator looking straight at
-		the network they wrote. What is actually missing is the figures, and the
-		shape that carries them.
-		*/
-		if e == nil || e.kind != .Mapping {
-			errorf(
-				l,
-				"%s: expected a network and the figures it gets, such as %s; a network on its own does not say what it is being given",
-				path,
-				OVERRIDE_EXAMPLE,
-			)
-			continue
+		if o, ok := load_rate_limit_override(l, e, path, out[:]); ok {
+			append(&out, o)
 		}
-		check_keys(l, e, path, "prefix", "responses_per_second", "slip")
-		text := ""
-		/*
-		`opt_string` has already said its piece when the key is there and is
-		not a string, so "missing" is not also said: an operator told a line is
-		absent goes looking for one that is in the file, which is the mistake
-		the `responses_per_second` check below goes out of its way to avoid.
-		Counted rather than asked of the node, because `prefix: ""` is a key
-		that parsed and named nothing, and that one does need saying.
-		*/
-		said := len(l.errors)
-		opt_string(l, e, "prefix", &text, path)
-		if len(l.errors) > said {
-			continue
-		}
-		if text == "" {
-			errorf(l, "%s: missing prefix, which is the network this entry is about", path)
-			continue
-		}
-		p, pok := parse_prefix(text)
-		if !pok {
-			errorf(l, "%s: %q is not a network in CIDR form such as 198.51.100.0/24 or 2001:db8::/32", path, text)
-			continue
-		}
-		/*
-		Finer than the accounting is refused rather than quietly widened.
-
-		Every address in a /24 shares one bucket, so a /28 entry could only be
-		applied to the /24 around it - sixteen times the network the operator
-		named. The error says what to write instead, because the fix is
-		mechanical and the mistake is an easy one to make: somebody thinking
-		about one client reaches for /32.
-		*/
-		limit := u8(OVERRIDE_MAX_BITS_V6) if p.v6 else u8(OVERRIDE_MAX_BITS_V4)
-		if p.bits > limit {
-			errorf(
-				l,
-				"%s: %q is finer than the /%d these budgets are accounted per, so it could only ever be applied to the whole /%d around it; name that network instead",
-				path,
-				text,
-				limit,
-				limit,
-			)
-			continue
-		}
-		/*
-		The same network twice is refused. `prefix_match` takes the most specific
-		entry, so two of equal length would leave the figure decided by the order
-		they happen to be written in - which is the one thing that procedure's
-		contract promises does not decide anything.
-		*/
-		duplicate := false
-		for existing in out {
-			if existing.prefix == p {
-				errorf(l, "%s: %q already has figures of its own from an earlier entry", path, text)
-				duplicate = true
-				break
-			}
-		}
-		if duplicate {
-			continue
-		}
-
-		/*
-		`slip` of -1 is "the entry did not say", which `derive_sizes` fills in; 0 is a
-		value `slip` can be given on purpose, so it cannot stand for absence.
-
-		`responses_per_second` starts at 1 rather than 0 so that a figure
-		`opt_int` could not read leaves a value `validate` has nothing to say
-		about. Left at 0 it would draw a second error - "must be at least 1" -
-		beside the "expected an integer" the operator actually needs, telling
-		them their figure was too small when what they wrote was not a number.
-		Every path that reaches `append` below has either read a figure or
-		reported why it could not.
-		*/
-		o := Rate_Limit_Override {
-			prefix               = p,
-			responses_per_second = 1,
-			slip                 = -1,
-		}
-		/*
-		Absent is asked of the node rather than read off the parsed figure: an
-		entry that wrote `responses_per_second: 0` said something, and telling
-		it the key is missing would send an operator looking for a line that is
-		already there. A figure that was written is left for `validate`, which
-		holds it to the same "at least 1" the default is held to.
-		*/
-		if yaml.is_null(yaml.get(e, "responses_per_second")) {
-			errorf(
-				l,
-				"%s: missing responses_per_second; an entry with no figure of its own is the default, which is what leaving the network out already means",
-				path,
-			)
-			continue
-		}
-		opt_int(l, e, "responses_per_second", &o.responses_per_second, path)
-		/*
-		Same question for `slip`, and for a sharper reason: -1 is this loader's
-		marker for silence, so an operator who writes `slip: -1` would otherwise
-		be handed the inherited figure without a word - while `slip: -1` at the
-		top level is refused. Asking the node keeps the two answers the same.
-		*/
-		if !yaml.is_null(yaml.get(e, "slip")) {
-			o.slip = 0
-			opt_int(l, e, "slip", &o.slip, path)
-			if o.slip < 0 {
-				errorf(l, "%s: slip must not be negative", path)
-				continue
-			}
-		}
-		append(&out, o)
 	}
 	cfg.server.rate_limit.overrides = out[:]
+}
+
+/*
+One entry of `server.rate_limit.overrides`, held to the `earlier` ones; false
+where it is refused, which is said.
+*/
+@(private)
+load_rate_limit_override :: proc(
+	l: ^Loader,
+	e: ^yaml.Node,
+	path: string,
+	earlier: []Rate_Limit_Override,
+) -> (
+	Rate_Limit_Override,
+	bool,
+) {
+	/*
+	An entry that is not a mapping is said to be that, rather than reported
+	as a missing key.
+
+	`- 198.51.100.0/24` - the network on its own, which is what
+	`allow_from`'s entries look like and so the shorthand somebody reaches
+	for here - is a scalar, and `yaml.get` answers nil for every key of a
+	scalar. Read through the "missing prefix" branch below it becomes "this
+	entry does not name a network", said to an operator looking straight at
+	the network they wrote. What is actually missing is the figures, and the
+	shape that carries them.
+	*/
+	if e == nil || e.kind != .Mapping {
+		errorf(
+			l,
+			"%s: expected a network and the figures it gets, such as %s; a network on its own does not say what it is being given",
+			path,
+			OVERRIDE_EXAMPLE,
+		)
+		return {}, false
+	}
+	check_keys(l, e, path, "prefix", "responses_per_second", "slip")
+	p, pok := override_prefix(l, e, path, earlier)
+	if !pok {
+		return {}, false
+	}
+	/*
+	`slip` of -1 is "the entry did not say", which `derive_sizes` fills in; 0 is a
+	value `slip` can be given on purpose, so it cannot stand for absence.
+
+	`responses_per_second` starts at 1 rather than 0 so that a figure
+	`opt_int` could not read leaves a value `validate` has nothing to say
+	about. Left at 0 it would draw a second error - "must be at least 1" -
+	beside the "expected an integer" the operator actually needs, telling
+	them their figure was too small when what they wrote was not a number.
+	Every path that reaches `append` below has either read a figure or
+	reported why it could not.
+	*/
+	o := Rate_Limit_Override {
+		prefix               = p,
+		responses_per_second = 1,
+		slip                 = -1,
+	}
+	/*
+	Absent is asked of the node rather than read off the parsed figure: an
+	entry that wrote `responses_per_second: 0` said something, and telling
+	it the key is missing would send an operator looking for a line that is
+	already there. A figure that was written is left for `validate`, which
+	holds it to the same "at least 1" the default is held to.
+	*/
+	if yaml.is_null(yaml.get(e, "responses_per_second")) {
+		errorf(
+			l,
+			"%s: missing responses_per_second; an entry with no figure of its own is the default, which is what leaving the network out already means",
+			path,
+		)
+		return {}, false
+	}
+	opt_int(l, e, "responses_per_second", &o.responses_per_second, path)
+	/*
+	Same question for `slip`, and for a sharper reason: -1 is this loader's
+	marker for silence, so an operator who writes `slip: -1` would otherwise
+	be handed the inherited figure without a word - while `slip: -1` at the
+	top level is refused. Asking the node keeps the two answers the same.
+	*/
+	if !yaml.is_null(yaml.get(e, "slip")) {
+		o.slip = 0
+		opt_int(l, e, "slip", &o.slip, path)
+		if o.slip < 0 {
+			errorf(l, "%s: slip must not be negative", path)
+			return {}, false
+		}
+	}
+	return o, true
+}
+
+// The network an override entry names, held to the accounting and to the `earlier` entries.
+@(private)
+override_prefix :: proc(l: ^Loader, e: ^yaml.Node, path: string, earlier: []Rate_Limit_Override) -> (Prefix, bool) {
+	text := ""
+	/*
+	`opt_string` has already said its piece when the key is there and is
+	not a string, so "missing" is not also said: an operator told a line is
+	absent goes looking for one that is in the file, which is the mistake
+	the `responses_per_second` check below goes out of its way to avoid.
+	Counted rather than asked of the node, because `prefix: ""` is a key
+	that parsed and named nothing, and that one does need saying.
+	*/
+	said := len(l.errors)
+	opt_string(l, e, "prefix", &text, path)
+	if len(l.errors) > said {
+		return {}, false
+	}
+	if text == "" {
+		errorf(l, "%s: missing prefix, which is the network this entry is about", path)
+		return {}, false
+	}
+	p, pok := parse_prefix(text)
+	if !pok {
+		errorf(l, "%s: %q is not a network in CIDR form such as 198.51.100.0/24 or 2001:db8::/32", path, text)
+		return {}, false
+	}
+	/*
+	Finer than the accounting is refused rather than quietly widened.
+
+	Every address in a /24 shares one bucket, so a /28 entry could only be
+	applied to the /24 around it - sixteen times the network the operator
+	named. The error says what to write instead, because the correction is
+	mechanical and the mistake is an easy one to make: somebody thinking
+	about one client reaches for /32.
+	*/
+	limit := u8(OVERRIDE_MAX_BITS_V6) if p.v6 else u8(OVERRIDE_MAX_BITS_V4)
+	if p.bits > limit {
+		errorf(
+			l,
+			"%s: %q is finer than the /%d these budgets are accounted per, so it could only ever be applied to the whole /%d around it; name that network instead",
+			path,
+			text,
+			limit,
+			limit,
+		)
+		return {}, false
+	}
+	/*
+	The same network twice is refused. `prefix_match` takes the most specific
+	entry, so two of equal length would leave the figure decided by the order
+	they happen to be written in - which is the one thing that procedure's
+	contract promises does not decide anything.
+	*/
+	duplicate := false
+	for existing in earlier {
+		if existing.prefix == p {
+			errorf(l, "%s: %q already has figures of its own from an earlier entry", path, text)
+			duplicate = true
+			break
+		}
+	}
+	if duplicate {
+		return {}, false
+	}
+	return p, true
 }
 
 /*
@@ -776,7 +813,7 @@ load_identity :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {
 		return
 	}
 	if child.kind != .Scalar {
-		errorf(l, "server.identity: expected version, off, or a quoted text")
+		errorf(l, "server.identity: expected %s, %s, or a quoted text", IDENTITY_VERSION, IDENTITY_OFF)
 		return
 	}
 	if !child.quoted {
@@ -788,12 +825,18 @@ load_identity :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {
 			cfg.server.identity = .Off
 			return
 		}
-		errorf(l, "server.identity: %q is neither version nor off; quote it to answer with it as text", child.scalar)
+		errorf(
+			l,
+			"server.identity: %q is neither %s nor %s; quote it to answer with it as text",
+			child.scalar,
+			IDENTITY_VERSION,
+			IDENTITY_OFF,
+		)
 		return
 	}
 	text := child.scalar
 	if len(text) == 0 || len(text) > dns.MAX_CHARACTER_STRING {
-		errorf(l, "server.identity: a text is 1 to %d bytes; write off to answer with nothing", dns.MAX_CHARACTER_STRING)
+		errorf(l, "server.identity: a text is 1 to %d bytes; write %s to answer with nothing", dns.MAX_CHARACTER_STRING, IDENTITY_OFF)
 		return
 	}
 	for c in transmute([]u8)text {
@@ -995,7 +1038,8 @@ load_upstream :: proc(l: ^Loader, cfg: ^Config) {
 		"zones",
 	)
 	load_group_fields(l, n, &cfg.upstream, "upstream")
-	load_servers(l, n, &cfg.upstream, "upstream")
+	_, kept := load_servers(l, n, &cfg.upstream, "upstream")
+	l.servers_refused = !kept
 	load_upstream_zones(l, cfg, n)
 }
 
@@ -1018,15 +1062,17 @@ load_group_fields :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path
 
 /*
 A group's `servers`, each with the group's bootstrap as its default. Left out or
-empty, `dst.servers` keeps what it held. False when the key holds something
-other than a list: as in `load_block_lists`, `items` answers nil for one server
-written without its "-", which would be reported as no server at all.
+empty, `dst.servers` keeps what it held. `listed` is false when the key holds
+something other than a list: as in `load_block_lists`, `items` answers nil for
+one server written without its "-", which would be reported as no server at
+all. `kept` is false too when it lists servers and every one is refused: each is
+reported here, and a group with none left is not worth a second line.
 */
 @(private)
-load_servers :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path: string) -> bool {
+load_servers :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path: string) -> (listed, kept: bool) {
 	if s := yaml.get(n, "servers"); !yaml.is_null(s) && s.kind != .Sequence {
 		errorf(l, "%s.servers: expected a list of servers, with a \"-\" in front of each one", path)
-		return false
+		return false, false
 	}
 	if servers := yaml.items(yaml.get(n, "servers")); len(servers) > 0 {
 		out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
@@ -1037,8 +1083,9 @@ load_servers :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path: str
 			}
 		}
 		dst.servers = out[:]
+		return true, len(out) > 0
 	}
-	return true
+	return true, true
 }
 
 /*
@@ -1126,11 +1173,16 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 		load_group_fields(l, entry, &route.upstream, path)
 		route.domains = load_route_domains(l, entry, path, i, &claimed)
 		// A route whose `servers` is not a list is refused outright rather than
-		// appended to be reported by `validate` as a route with no servers.
-		if !load_servers(l, entry, &route.upstream, path) {
+		// appended to be reported by `validate` as a route with no servers. One
+		// whose every server is refused is kept, so `validate` still reports
+		// the route's other mistakes, but not that it has no servers.
+		listed, kept := load_servers(l, entry, &route.upstream, path)
+		if !listed {
 			continue
 		}
-
+		if !kept {
+			append(&l.routes_refused, len(routes))
+		}
 		append(&routes, route)
 	}
 	cfg.upstream.zones = routes[:]
@@ -1349,38 +1401,8 @@ check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
 	if !cfg.special_use.enabled {
 		return
 	}
-	Shadow :: struct {
-		zone:   string,
-		on:     bool,
-		reason: string,
-	}
-	/*
-	A copy of `server.special_use_zone`'s own list, and it has to stay one.
-
-	This package cannot import `server` - `server` imports this one - so the
-	zones are written out again here rather than read from the single place that
-	decides them. A key added there and not here does not break anything loudly:
-	it leaves a route under the new zone loading cleanly and then never firing,
-	which is the exact failure this check exists to catch. Add the entry in both.
-
-	`localhost.` and `invalid.` have no key of their own: with the table on at
-	all they are answered there, which is what RFC 6761 asks for.
-
-	`special_use.private_reverse` is deliberately absent: `special_use_zone`
-	stands its empty zones down for a routed name, so a route under one of those
-	reverse zones is the way to send it to a router, not a route that never
-	fires.
-	*/
-	table := [?]Shadow {
-		{"localhost.", true, "special_use.enabled answers localhost. here (RFC 6761)"},
-		{"invalid.", true, "special_use.enabled answers invalid. here (RFC 6761)"},
-		{"onion.", cfg.special_use.onion, "special_use.onion answers onion. here"},
-		{"local.", cfg.special_use.local, "special_use.local answers local. here"},
-		{"test.", cfg.special_use.test, "special_use.test answers test. here"},
-		{"home.arpa.", cfg.special_use.home_arpa, "special_use.home_arpa answers home.arpa. here"},
-	}
 	for domain in route.domains {
-		for entry in table {
+		for entry in special_use_zones(cfg.special_use) {
 			if !entry.on || !dns.name_at_or_below(domain, entry.zone) {
 				continue
 			}
@@ -1475,41 +1497,8 @@ load_upstream_spec :: proc(
 		return {}, false
 	}
 
-	opt_string(l, n, "name", &spec.name, path)
-	spec.named = spec.name != ""
-	opt_string(l, n, "address", &spec.address, path)
-	opt_string(l, n, "hostname", &spec.hostname, path)
-	opt_string(l, n, "url", &spec.url, path)
-	opt_int(l, n, "port", &spec.port, path)
-	// 0 is the scheme's default, filled in below.
-	if spec.port < 0 || spec.port > 65535 {
-		errorf(l, "%s.port: must be between 1 and 65535, or 0 for the default", path)
+	if !load_upstream_fields(l, n, path, &spec) || !load_upstream_kind(l, n, path, &spec) {
 		return {}, false
-	}
-	opt_bool(l, n, "verify", &spec.verify, path)
-	if b := yaml.get(n, "bootstrap"); !yaml.is_null(b) {
-		spec.bootstrap = load_bootstrap(l, b, fmt.tprintf("%s.bootstrap", path))
-	}
-
-	kind_str: string
-	if opt_string(l, n, "type", &kind_str, path) {
-		switch dns.name_fold(kind_str, l.allocator) {
-		case "udp", "plain", "dns":
-			spec.kind = .UDP
-		case "tcp":
-			spec.kind = .TCP
-		case "tls", "dot", "dns-over-tls":
-			spec.kind = .TLS
-		case "https", "doh", "dns-over-https":
-			spec.kind = .HTTPS
-		case:
-			errorf(l, "%s.type: unknown type %q (want udp, tcp, tls or https)", path, kind_str)
-			return {}, false
-		}
-	} else if spec.url != "" {
-		spec.kind = .HTTPS
-	} else {
-		spec.kind = .UDP
 	}
 
 	// The address is a lookup when it is a name, on every kind, and the
@@ -1524,51 +1513,42 @@ load_upstream_spec :: proc(
 		errorf(l, "%s.address: %q is not an address or a name alone%s", path, spec.address, address_hint(spec.address))
 		return {}, false
 	}
-	if spec.kind == .HTTPS {
-		if spec.url == "" {
-			errorf(l, "%s: an https upstream needs a url", path)
-			return {}, false
-		}
-		scheme, host, url_path, split_ok := netx.split_url(spec.url)
-		if !split_ok || !dns.name_equal_fold(scheme, "https") {
-			errorf(l, "%s.url: expected an https:// url", path)
-			return {}, false
-		}
-		if !url_is_valid(spec.url) || !h2.authority_is_valid(spec.hostname) {
-			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
-			return {}, false
-		}
-		// `url_is_valid` has checked the port.
-		host_only, url_port, _ := netx.split_port(host)
-		if spec.hostname == "" {
-			spec.hostname = host_only
-		}
-		if spec.address == "" {
-			spec.address = host_only
-		}
-		if spec.port == 0 {
-			spec.port = url_port if url_port != 0 else 443
-		}
-		spec.path = netx.origin_form(url_path, l.allocator)
-	} else {
-		if spec.address == "" {
-			errorf(l, "%s: missing address", path)
-			return {}, false
-		}
-		// As the shorthand's `#name` is: an NBSP on the end is a certificate name
-		// no server has.
-		if !h2.authority_is_valid(spec.hostname) {
-			errorf(l, "%s.hostname: %s", path, HOST_RULE)
-			return {}, false
-		}
-		if spec.port == 0 {
-			spec.port = 853 if spec.kind == .TLS else 53
-		}
-		if spec.hostname == "" && netx.parse_address(spec.address) == nil {
-			spec.hostname = spec.address
-		}
+	if !(fill_https_spec(l, &spec, path) if spec.kind == .HTTPS else fill_plain_spec(l, &spec, path)) {
+		return {}, false
 	}
-	// The certificate name and SNI: a port there is a name no certificate has.
+	if !check_spec_hostname(l, spec, path) || !check_verify_has_a_name(l, spec, path) {
+		return {}, false
+	}
+	if spec.name == "" {
+		spec.name = describe_upstream(spec, l.allocator)
+	}
+	return spec, true
+}
+
+// The keys of a server in the map form; false where `port` is out of range.
+@(private)
+load_upstream_fields :: proc(l: ^Loader, n: ^yaml.Node, path: string, spec: ^Upstream_Spec) -> bool {
+	opt_string(l, n, "name", &spec.name, path)
+	spec.named = spec.name != ""
+	opt_string(l, n, "address", &spec.address, path)
+	opt_string(l, n, "hostname", &spec.hostname, path)
+	opt_string(l, n, "url", &spec.url, path)
+	opt_int(l, n, "port", &spec.port, path)
+	// 0 is the scheme's default, filled in below.
+	if spec.port < 0 || spec.port > int(max(u16)) {
+		errorf(l, "%s.port: must be between 1 and %d, or 0 for the default", path, max(u16))
+		return false
+	}
+	opt_bool(l, n, "verify", &spec.verify, path)
+	if b := yaml.get(n, "bootstrap"); !yaml.is_null(b) {
+		spec.bootstrap = load_bootstrap(l, b, fmt.tprintf("%s.bootstrap", path))
+	}
+	return true
+}
+
+// The certificate name and SNI: a port there is a name no certificate has.
+@(private)
+check_spec_hostname :: proc(l: ^Loader, spec: Upstream_Spec, path: string) -> bool {
 	if spec.hostname != "" && !netx.is_host(spec.hostname) {
 		hint := address_hint(spec.hostname)
 		// On https, `port:` is only where to dial; the authority's port is the url's.
@@ -1576,16 +1556,88 @@ load_upstream_spec :: proc(
 			hint = "; a port goes in the url"
 		}
 		errorf(l, "%s.hostname: %q is not a name alone%s", path, spec.hostname, hint)
-		return {}, false
+		return false
 	}
+	return true
+}
 
-	if !check_verify_has_a_name(l, spec, path) {
-		return {}, false
+// `type`, or the kind `url` implies; false where `type` names none.
+@(private)
+load_upstream_kind :: proc(l: ^Loader, n: ^yaml.Node, path: string, spec: ^Upstream_Spec) -> bool {
+	kind_str: string
+	if opt_string(l, n, "type", &kind_str, path) {
+		switch dns.name_fold(kind_str, l.allocator) {
+		case "udp", "plain", "dns":
+			spec.kind = .UDP
+		case "tcp":
+			spec.kind = .TCP
+		case "tls", "dot", "dns-over-tls":
+			spec.kind = .TLS
+		case "https", "doh", "dns-over-https":
+			spec.kind = .HTTPS
+		case:
+			errorf(l, "%s.type: unknown type %q (want udp, tcp, tls or https)", path, kind_str)
+			return false
+		}
+	} else if spec.url != "" {
+		spec.kind = .HTTPS
+	} else {
+		spec.kind = .UDP
 	}
-	if spec.name == "" {
-		spec.name = describe_upstream(spec, l.allocator)
+	return true
+}
+
+// An https upstream: its url, and the hostname, address and port it implies.
+@(private)
+fill_https_spec :: proc(l: ^Loader, spec: ^Upstream_Spec, path: string) -> bool {
+	if spec.url == "" {
+		errorf(l, "%s: an https upstream needs a url", path)
+		return false
 	}
-	return spec, true
+	scheme, host, url_path, split_ok := netx.split_url(spec.url)
+	if !split_ok || !dns.name_equal_fold(scheme, "https") {
+		errorf(l, "%s.url: expected an https:// url", path)
+		return false
+	}
+	if !url_is_valid(spec.url) || !h2.authority_is_valid(spec.hostname) {
+		errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
+		return false
+	}
+	// `url_is_valid` has checked the port.
+	host_only, url_port, _ := netx.split_port(host)
+	if spec.hostname == "" {
+		spec.hostname = host_only
+	}
+	if spec.address == "" {
+		spec.address = host_only
+	}
+	if spec.port == 0 {
+		spec.port = url_port if url_port != 0 else 443
+	}
+	spec.path = netx.origin_form(url_path, l.allocator)
+	return true
+}
+
+// A udp, tcp or tls upstream: its address, and the port and hostname it implies.
+@(private)
+fill_plain_spec :: proc(l: ^Loader, spec: ^Upstream_Spec, path: string) -> bool {
+	if spec.address == "" {
+		errorf(l, "%s: missing address", path)
+		return false
+	}
+	// As the shorthand's `#name` is: an NBSP on the end is a certificate name
+	// no server has.
+	if !h2.authority_is_valid(spec.hostname) {
+		errorf(l, "%s.hostname: %s", path, HOST_RULE)
+		return false
+	}
+	if spec.port == 0 {
+		spec.port = 853 if spec.kind == .TLS else 53
+	}
+	if spec.hostname == "" && netx.parse_address(spec.address) == nil {
+		spec.hostname = spec.address
+	}
+	return true
 }
 
 /*
@@ -1795,10 +1847,10 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 			enabled = true,
 		}
 		if e == nil || e.kind == .Scalar {
-			s, _ := yaml.as_string(e)
+			s, is_text := yaml.as_string(e)
 			// A bare `-` or `- ""` names nothing to read, and would otherwise be
 			// counted as a list by `--check` and load no rules at startup.
-			if s == "" {
+			if !is_text || s == "" {
 				errorf(l, "%s[%d]: needs either a url or a file", path, i)
 				continue
 			}
@@ -2724,7 +2776,9 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 	// port, brackets or an all-digit last label make it an address or an
 	// endpoint mistyped. The short form never gets here with an address.
 	if netx.parse_address(trimmed) != nil {
-		errorf(l, "%s: %s host %q is an address, and a %s points at a name", path, type, trimmed, type)
+		// MX and SRV are said letter by letter, so take "an".
+		article := "an" if type == "MX" || type == "SRV" else "a"
+		errorf(l, "%s: %s host %q is an address, and %s %s points at a name", path, type, trimmed, article, type)
 		return "", false
 	}
 	if netx.has_port(trimmed) {
@@ -2872,31 +2926,32 @@ ascii_only :: proc(l: ^Loader, s, what: string) -> bool {
 
 @(private)
 validate :: proc(l: ^Loader, cfg: ^Config) {
-	if len(cfg.upstream.servers) == 0 {
+	// Not where every server written was refused: each is reported already, and
+	// a second line saying there are none adds nothing (as for a route below).
+	if len(cfg.upstream.servers) == 0 && !l.servers_refused {
 		errorf(l, "upstream.servers: at least one upstream server is required")
 	}
+	validate_listeners(l, cfg)
+	validate_metrics(l, cfg)
+	check_bootstrap(l, cfg.upstream.servers)
+	check_default_upstream_names(l, cfg)
+	check_list_cache_names(l, cfg)
+	validate_routes(l, cfg)
+	validate_cache(l, cfg)
+	validate_udp_readers(l, cfg)
+	validate_rate_limit(l, cfg)
+	validate_server_limits(l, cfg)
+	validate_dnssec(l, cfg)
+	validate_cookies(l, cfg)
+	validate_special_use(l, cfg)
+}
+
+@(private)
+validate_listeners :: proc(l: ^Loader, cfg: ^Config) {
 	if !cfg.listeners.udp.enabled && !stream_listeners_enabled(cfg.listeners) {
 		errorf(l, "listeners: every listener is disabled, so nothing would be served")
 	}
 
-	check_tls :: proc(l: ^Loader, ln: Listener, name: string) {
-		if !ln.enabled {
-			return
-		}
-		if ln.cert_file == "" || ln.key_file == "" {
-			errorf(l, "listeners.%s: cert_file and key_file are required", name)
-			return
-		}
-		if !l.tls_files {
-			return
-		}
-		if !os.exists(ln.cert_file) {
-			errorf(l, "listeners.%s.cert_file: %q does not exist", name, ln.cert_file)
-		}
-		if !os.exists(ln.key_file) {
-			errorf(l, "listeners.%s.key_file: %q does not exist", name, ln.key_file)
-		}
-	}
 	check_tls(l, cfg.listeners.dot, "dot")
 	check_tls(l, cfg.listeners.doh, "doh")
 
@@ -2914,7 +2969,30 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 
 	check_ddr(l, cfg)
+}
 
+@(private)
+check_tls :: proc(l: ^Loader, ln: Listener, name: string) {
+	if !ln.enabled {
+		return
+	}
+	if ln.cert_file == "" || ln.key_file == "" {
+		errorf(l, "listeners.%s: cert_file and key_file are required", name)
+		return
+	}
+	if !l.tls_files {
+		return
+	}
+	if !os.exists(ln.cert_file) {
+		errorf(l, "listeners.%s.cert_file: %q does not exist", name, ln.cert_file)
+	}
+	if !os.exists(ln.key_file) {
+		errorf(l, "listeners.%s.key_file: %q does not exist", name, ln.key_file)
+	}
+}
+
+@(private)
+validate_metrics :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.metrics.enabled {
 		check_http_path(l, cfg.metrics.path, "metrics.path")
 		// Port 0 binds and works, on whichever port the kernel picked - which
@@ -2927,48 +3005,49 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			errorf(l, "metrics.address: %q is not an IP address%s", cfg.metrics.address, address_hint(cfg.metrics.address))
 		}
 	}
+}
 
-	check_bootstrap :: proc(l: ^Loader, specs: []Upstream_Spec) {
-		for spec in specs {
-			needs_resolution := spec.hostname != "" && netx.parse_address(spec.address) == nil
-			if needs_resolution && len(spec.bootstrap) == 0 {
-				errorf(
-					l,
-					"upstream server %q uses hostname %q but no bootstrap resolver is configured",
-					spec.name,
-					spec.hostname,
-				)
-			}
+@(private)
+check_bootstrap :: proc(l: ^Loader, specs: []Upstream_Spec) {
+	for spec in specs {
+		needs_resolution := spec.hostname != "" && netx.parse_address(spec.address) == nil
+		if needs_resolution && len(spec.bootstrap) == 0 {
+			errorf(
+				l,
+				"upstream server %q uses hostname %q but no bootstrap resolver is configured",
+				spec.name,
+				spec.hostname,
+			)
 		}
 	}
-	check_bootstrap(l, cfg.upstream.servers)
-	check_default_upstream_names(l, cfg)
-	check_list_cache_names(l, cfg)
+}
 
-	/*
-	Each route held to what the default group is held to: servers it can
-	actually reach, and an attempt count that lets it try.
+/*
+Each route held to what the default group is held to: servers it can
+actually reach, and an attempt count that lets it try.
 
-	A route with no usable server is worse than no route at all. The name it
-	claims would fall through to nothing - `make_group` refuses an empty group -
-	so it has to be caught here, where the file can be pointed at, rather than
-	at startup where it reads as "no usable upstream servers" about a resolver
-	whose default upstream is fine.
-	*/
-	/*
-	Named by their zone rather than by their index. An entry the loader refused
-	outright - a route that is not a mapping, or one with a `zones` key of its
-	own - is never appended, so the position of a route in this slice is not its
-	position in the file once anything ahead of it has gone wrong, and an index
-	that points at the wrong route is worse than no index at all.
-	*/
-	for route in cfg.upstream.zones {
+A route with no usable server is worse than no route at all. The name it
+claims would fall through to nothing - `make_group` refuses an empty group -
+so it has to be caught here, where the file can be pointed at, rather than
+at startup where it reads as "no usable upstream servers" about a resolver
+whose default upstream is fine.
+*/
+/*
+Named by their zone rather than by their index. An entry the loader refused
+outright - a route that is not a mapping, or one with a `zones` key of its
+own - is never appended, so the position of a route in this slice is not its
+position in the file once anything ahead of it has gone wrong, and an index
+that points at the wrong route is worse than no index at all.
+*/
+@(private)
+validate_routes :: proc(l: ^Loader, cfg: ^Config) {
+	for route, i in cfg.upstream.zones {
 		if len(route.domains) == 0 {
 			// Already reported by the loader, which refused every domain it was
 			// given; a second line saying the route is empty adds nothing.
 			continue
 		}
-		if len(route.upstream.servers) == 0 {
+		if len(route.upstream.servers) == 0 && !slice.contains(l.routes_refused[:], i) {
 			errorf(l, "upstream.zones: the route for %s needs at least one server", route.domains[0])
 		}
 		// Only where the route is the one that said so. `attempts` is inherited,
@@ -2982,7 +3061,10 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		check_bootstrap(l, route.upstream.servers)
 		check_route_reachable(l, cfg, route)
 	}
+}
 
+@(private)
+validate_cache :: proc(l: ^Loader, cfg: ^Config) {
 	// Only when there is a cache to size. A setting left over in a file that
 	// switched caching off should not be what stops the server starting.
 	if cfg.cache.enabled {
@@ -3005,15 +3087,19 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.cache.stale_timeout < 0 {
 		errorf(l, "cache.stale_timeout must not be negative; 0 waits for the upstream instead")
 	}
-	/*
-	The UDP readers, refused rather than clamped, for the reason
-	`max_udp_response` is: the number decides how much traffic this server can
-	hear at all, so a file naming one it will not get is a file whose author
-	should be told rather than quietly given something else. Checked whether or
-	not UDP is enabled - a mistyped figure under a listener that is off is still
-	a mistake, and one that would surface only when somebody turned the listener
-	on.
-	*/
+}
+
+/*
+The UDP readers, refused rather than clamped, for the reason
+`max_udp_response` is: the number decides how much traffic this server can
+hear at all, so a file naming one it will not get is a file whose author
+should be told rather than quietly given something else. Checked whether or
+not UDP is enabled - a mistyped figure under a listener that is off is still
+a mistake, and one that would surface only when somebody turned the listener
+on.
+*/
+@(private)
+validate_udp_readers :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.listeners.udp.readers < 0 {
 		errorf(l, "listeners.udp.readers must not be negative")
 	}
@@ -3037,6 +3123,10 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			DEFAULT_UDP_RECEIVE_BUFFER,
 		)
 	}
+}
+
+@(private)
+validate_rate_limit :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.server.rate_limit.enabled {
 		if cfg.server.rate_limit.responses_per_second < 1 {
 			errorf(l, "server.rate_limit.responses_per_second must be at least 1")
@@ -3093,6 +3183,10 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			len(cfg.server.rate_limit.overrides),
 		)
 	}
+}
+
+@(private)
+validate_server_limits :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.server.max_pending < 0 {
 		errorf(l, "server.max_pending must not be negative")
 	}
@@ -3139,7 +3233,10 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.upstream.attempts < 1 {
 		errorf(l, "upstream.attempts must be at least 1")
 	}
+}
 
+@(private)
+validate_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.dnssec.max_nsec3_iterations < 0 {
 		errorf(l, "dnssec.max_nsec3_iterations must not be negative")
 	}
@@ -3160,6 +3257,11 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.dnssec.max_cached_zones < 0 {
 		errorf(l, "dnssec.max_cached_zones must not be negative; 0 uses the built-in default")
 	}
+	check_trust_anchors(l, cfg)
+}
+
+@(private)
+check_trust_anchors :: proc(l: ^Loader, cfg: ^Config) {
 	// Parsed here rather than at startup so `--check` reports a bad anchor
 	// instead of a resolver that comes up refusing every name. Scratch: only
 	// the verdict is kept, and `start_validator` parses them again.
@@ -3213,8 +3315,11 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	   !dnssec.anchors_the_root(parsed_anchors[:]) {
 		errorf(l, "dnssec.trust_anchors covers no root anchor, so no name outside its zones could be validated; anchor \".\" as well")
 	}
+}
 
-	// Same reasoning: a secret that will not parse should fail `--check`, not
+@(private)
+validate_cookies :: proc(l: ^Loader, cfg: ^Config) {
+	// As for `check_trust_anchors`: a secret that will not parse should fail `--check`, not
 	// leave a machine handing out cookies its neighbours reject. Read with the
 	// parser the server itself uses, so the two cannot disagree.
 	scratch: [COOKIE_SECRET_LEN]u8
@@ -3239,7 +3344,10 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.cookies.require && !cfg.cookies.enabled {
 		errorf(l, "cookies.require needs cookies.enabled: there are no cookies to demand with it off")
 	}
+}
 
+@(private)
+validate_special_use :: proc(l: ^Loader, cfg: ^Config) {
 	/*
 	Same shape of mistake: `local`, `test` and `home_arpa` add names to a table
 	that is not consulted at all with `special_use.enabled` off, so the pair

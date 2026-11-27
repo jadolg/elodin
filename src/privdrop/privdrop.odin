@@ -163,6 +163,8 @@ resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 // The largest uid or gid: both types are 32 bits, and all ones is not an id.
 @(private)
 MAX_ID :: u64(max(u32)) - 1
+// `explain(.Id_Out_Of_Range)` spells it out.
+#assert(MAX_ID == 4294967294)
 
 #assert(size_of(posix.uid_t) == size_of(u32) && size_of(posix.gid_t) == size_of(u32))
 
@@ -277,6 +279,27 @@ already :: proc(id: Identity) -> bool {
 }
 
 /*
+`path` without its trailing slashes and `/.`: with either, the kernel resolves
+a symlink at what reads as the last component before O_NOFOLLOW is looked at.
+Only those: `..` is resolved after the links before it, so taking it out by
+text would name another directory than the one the process writes to.
+*/
+last_component_path :: proc(path: string) -> string {
+	p := path
+	for len(p) > 1 {
+		switch {
+		case strings.has_suffix(p, "/"):
+			p = p[:len(p) - 1]
+		case strings.has_suffix(p, "/."):
+			p = p[:len(p) - 2]
+		case:
+			return p
+		}
+	}
+	return p if p != "" else path
+}
+
+/*
 Hand a directory the process keeps writing to over to `id`.
 
 The blocklist cache is elodin's own output, and every list is downloaded and
@@ -298,27 +321,6 @@ its place is not followed.
 A path that does not exist is not a failure: nothing has been cached yet, and
 the process creates the directory itself, under its own account.
 */
-/*
-`path` without its trailing slashes and `/.`: with either, the kernel resolves
-a symlink at what reads as the last component before O_NOFOLLOW is looked at.
-Only those: `..` is resolved after the links before it, so taking it out by
-text would name another directory than the one the process writes to.
-*/
-last_component_path :: proc(path: string) -> string {
-	p := path
-	for len(p) > 1 {
-		switch {
-		case strings.has_suffix(p, "/"):
-			p = p[:len(p) - 1]
-		case strings.has_suffix(p, "/."):
-			p = p[:len(p) - 2]
-		case:
-			return p
-		}
-	}
-	return p if p != "" else path
-}
-
 hand_over :: proc(path: string, id: Identity) -> bool {
 	if path == "" {
 		return true

@@ -1164,6 +1164,38 @@ Special_Use_Config :: struct {
 	private_reverse: bool,
 }
 
+/*
+A zone the special-use table answers before anything is forwarded, whether
+`on` in this configuration, and the key that answers it, for a refusal.
+*/
+Special_Zone :: struct {
+	zone:   string,
+	on:     bool,
+	reason: string,
+}
+
+/*
+The zones `server.special_use_zone` answers, and that
+`check_route_reachable` refuses a route under, read from the one list.
+
+`localhost.` and `invalid.` have no key of their own: with the table on at all
+they are answered there, which is what RFC 6761 asks for.
+
+`private_reverse` is absent: `special_use_zone` stands its empty zones down for
+a routed name, so a route under one of those reverse zones is the way to send it
+to a router, not a route that never fires.
+*/
+special_use_zones :: proc(c: Special_Use_Config) -> [6]Special_Zone {
+	return {
+		{"localhost.", true, "special_use.enabled answers localhost. here (RFC 6761)"},
+		{"invalid.", true, "special_use.enabled answers invalid. here (RFC 6761)"},
+		{"onion.", c.onion, "special_use.onion answers onion. here"},
+		{"local.", c.local, "special_use.local answers local. here"},
+		{"test.", c.test, "special_use.test answers test. here"},
+		{"home.arpa.", c.home_arpa, "special_use.home_arpa answers home.arpa. here"},
+	}
+}
+
 Config :: struct {
 	log:         Log_Config,
 	server:      Server_Config,

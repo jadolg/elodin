@@ -1,24 +1,10 @@
 package config
 
+import "core:fmt"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 import "elodin:dns"
-
-// Whether loading `doc` fails with `wanted` as one of its messages, word for word.
-@(private = "file")
-refused_with :: proc(t: ^testing.T, doc, wanted: string, loc := #caller_location) {
-	_, err := load_string(doc, context.temp_allocator, tls_files = false)
-	e, has := err.?
-	if !testing.expectf(t, has, "accepted, wanted %q, from:\n%s", wanted, doc, loc = loc) {
-		return
-	}
-	for m in e.messages {
-		if m == wanted {
-			return
-		}
-	}
-	testing.expectf(t, false, "no message is %q: %v", wanted, e.messages, loc = loc)
-}
 
 /*
 The refusals a shared loader writes for each of its callers, word for word: the
@@ -60,7 +46,7 @@ test_shared_loaders_name_their_callers_keys :: proc(t: ^testing.T) {
 		{MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers: [\"tls://\"]\n", "upstream.zones[0].servers[0]: cannot parse \"tls://\""},
 		{
 			MINIMAL + "server:\n  max_connections: 0\n",
-			"server.max_connections must be at least 1 (it is 0); 512 is the default",
+			fmt.tprintf("server.max_connections must be at least 1 (it is 0); %d is the default", DEFAULT_MAX_CONNECTIONS),
 		},
 		{
 			MINIMAL + "listeners:\n  udp: {enabled: false}\n  tcp: {enabled: false}\n",
@@ -68,15 +54,57 @@ test_shared_loaders_name_their_callers_keys :: proc(t: ^testing.T) {
 		},
 	}
 	for c in cases {
-		refused_with(t, c.doc, c.wanted)
+		expect_refused(t, c.doc, c.wanted, exact = true, tls_files = false)
 	}
+	free_all(context.temp_allocator)
+}
 
-	// A route whose `servers` is not a list is dropped there, not reported a
-	// second time as a route with no servers.
-	_, err := load_string(MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers: 10.0.0.1\n", context.temp_allocator)
-	if e, has := err.?; testing.expect(t, has, "a route with servers: 10.0.0.1 loaded") {
-		testing.expectf(t, len(e.messages) == 1, "wanted one refusal: %v", e.messages)
+/*
+A group whose `servers` is not a list, or whose every server is refused, is
+reported once, for that: not a second time as a group with no servers. A file
+that names none is still told it needs one.
+*/
+@(test)
+test_a_refused_server_is_reported_once :: proc(t: ^testing.T) {
+	ROUTE :: MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers: "
+	expect_refused(t, ROUTE + "10.0.0.1\n", "upstream.zones[0].servers: expected a list", prefix = true, count = 1)
+	expect_refused(t, ROUTE + "[\"tls://\"]\n", "upstream.zones[0].servers[0]: cannot parse", prefix = true, count = 1)
+	expect_refused(t, "upstream:\n  servers: 1.1.1.1\n", "upstream.servers: expected a list", prefix = true, count = 1)
+	expect_refused(
+		t,
+		"upstream:\n  servers: [\"tls://1.1.1.1:853\"]\n",
+		"upstream.servers[0]: verify is on",
+		prefix = true,
+		count = 1,
+	)
+	expect_refused(
+		t,
+		"upstream:\n  servers: [\"tls://1.1.1.1:853\", 9.9.9.9]\n",
+		"upstream.servers[0]: verify is on",
+		prefix = true,
+		count = 1,
+	)
+	expect_refused(t, "log:\n  level: info\n", "upstream.servers: at least one upstream server is required", exact = true, count = 1)
+	expect_refused(t, "upstream:\n  servers: []\n", "upstream.servers: at least one upstream server is required", exact = true, count = 1)
+	expect_refused(t, ROUTE + "[]\n", "upstream.zones: the route for corp.example. needs at least one server", exact = true, count = 1)
+	free_all(context.temp_allocator)
+}
+
+// A route whose every server is refused is still checked for its other
+// mistakes, so a second --check finds nothing the first one could have said.
+@(test)
+test_a_route_with_no_server_left_is_still_validated :: proc(t: ^testing.T) {
+	src := MINIMAL + "  zones:\n    - domains: [corp.example]\n      attempts: 0\n      servers: [\"tls://\"]\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	if !testing.expectf(t, has, "accepted:\n%s", src) {
+		return
 	}
+	testing.expectf(t, len(e.messages) == 2, "wanted the server and the attempts, nothing else: %v", e.messages)
+	testing.expectf(t, slice.any_of_proc(e.messages, proc(m: string) -> bool {
+		return strings.has_prefix(m, "upstream.zones[0].servers[0]: cannot parse")
+	}), "the server is not reported: %v", e.messages)
+	testing.expectf(t, slice.contains(e.messages, "upstream.zones: the route for corp.example. needs attempts of at least 1"), "the attempts are not reported: %v", e.messages)
 	free_all(context.temp_allocator)
 }
 
@@ -103,28 +131,27 @@ test_a_space_outside_ascii_at_a_names_end_is_refused :: proc(t: ^testing.T) {
 		{MINIMAL + "rebind:\n  allow_domains: [\"\\_home.example\"]\n", "rebind.allow_domains[0]"},
 	}
 	for c in cases {
-		_, err := load_string(c.doc, context.temp_allocator)
-		e, has := err.?
-		if !testing.expectf(t, has, "accepted:\n%s", c.doc) {
-			continue
-		}
-		found := false
-		for m in e.messages {
-			found ||= strings.has_prefix(m, c.key) && strings.contains(m, "outside ASCII")
-		}
-		testing.expectf(t, found, "no refusal names %q: %v", c.key, e.messages)
+		expect_refused(t, c.doc, c.key, "outside ASCII")
 	}
 
 	// The address is not one with the space on it.
-	_, err := load_string(MINIMAL + REWRITE + "lan.example\n    answer: \"A 192.0.2.1\\_\"\n", context.temp_allocator)
-	testing.expect(t, err != nil, "an address with a no-break space after it was read as the address")
+	expect_refused(
+		t,
+		MINIMAL + REWRITE + "lan.example\n    answer: \"A 192.0.2.1\\_\"\n",
+		"rewrites[0].answer: A needs an IPv4 address, got \"192.0.2.1\\u00a0\"",
+		exact = true,
+	)
 
 	// Nor is a name with one inside it, which is two fields run together.
-	_, err = load_string(MINIMAL + REWRITE + "lan.example\n    answer: \"TXT\\_hello\"\n", context.temp_allocator)
-	testing.expect(t, err != nil, "\"TXT\\u00a0hello\" was read as a name")
+	expect_refused(
+		t,
+		MINIMAL + REWRITE + "lan.example\n    answer: \"TXT\\_hello\"\n",
+		"rewrites[0].answer: an answer needs one host name, got \"TXT\\u00a0hello\"",
+		exact = true,
+	)
 
 	// A domain of ASCII space alone is no domain, not the root.
-	refused_with(t, MINIMAL + REWRITE + "\"   \"\n    answer: 10.0.0.1\n", "rewrites[0]: missing domain")
+	expect_refused(t, MINIMAL + REWRITE + "\"   \"\n    answer: 10.0.0.1\n", "rewrites[0]: missing domain", exact = true)
 
 	// ASCII space is trimmed, and before the `*.` is looked for.
 	cfg, aerr := load_string(
@@ -182,12 +209,12 @@ test_a_name_outside_ascii_is_refused :: proc(t: ^testing.T) {
 		},
 	}
 	for c in cases {
-		refused_with(t, c.doc, c.wanted)
+		expect_refused(t, c.doc, c.wanted, exact = true)
 	}
 
 	// A space outside ASCII between an answer's fields is a field split, not a
 	// character to delete: deleted, `CNAMEhost.example` would load.
-	refused_with(t, REWRITE + "lan.example\n    answer: \"CNAME\\_host.example\"\n", "rewrites[0].answer: an answer needs one host name, got \"CNAME\\u00a0host.example\"")
+	expect_refused(t, REWRITE + "lan.example\n    answer: \"CNAME\\_host.example\"\n", "rewrites[0].answer: an answer needs one host name, got \"CNAME\\u00a0host.example\"", exact = true)
 
 	// A trust anchor's owner is the name checked; its fields split on any
 	// space, as `dnssec.parse_trust_anchor` reads them, so a no-break space
@@ -196,10 +223,11 @@ test_a_name_outside_ascii_is_refused :: proc(t: ^testing.T) {
 	testing.expectf(t, aerr == nil, "a no-break space between DS fields was refused: %v", aerr)
 	// The bare form has no owner: its first field is the key tag, and a digit
 	// past ASCII there is no DS record, not a name.
-	refused_with(
+	expect_refused(
 		t,
 		MINIMAL + "dnssec:\n  trust_anchors: [\"\uff12\uff10326 8 2 " + ROOT_DIGEST + "\"]\n",
 		"dnssec.trust_anchors[0]: \"\\uff12\\uff10326 8 2 " + ROOT_DIGEST + "\" is not a DS record",
+		exact = true,
 	)
 
 	// The A-label loads, and so does a name of raw octets written as `\DDD`,
@@ -223,14 +251,14 @@ folding takes both for it.
 @(test)
 test_rewrite_tokens_fold_ascii_only :: proc(t: ^testing.T) {
 	REWRITE :: MINIMAL + "rewrites:\n  - domain: lan.example\n    answer: "
-	_, err := load_string(REWRITE + "\"\u017frv 0 5 5060 sip.example\"\n", context.temp_allocator)
-	testing.expect(t, err != nil, "a long s was read as SRV")
+	expect_refused(t, REWRITE + "\"\u017frv 0 5 5060 sip.example\"\n", "rewrites[0].answer: \"\\u017frv 0 5 5060 sip.example\" is not an answer this understands", prefix = true)
 
 	// Read as `block` it would load; it is a host name outside ASCII instead.
-	refused_with(
+	expect_refused(
 		t,
 		REWRITE + "\"bloc\u212a\"\n",
 		"rewrites[0].answer: an answer host \"bloc\\u212a\" holds U+212A, which is outside ASCII; " + dns.IDN_HINT,
+		exact = true,
 	)
 
 	// And a TXT string keeps a space outside ASCII at its end: it is text, and
@@ -246,9 +274,8 @@ test_rewrite_tokens_fold_ascii_only :: proc(t: ^testing.T) {
 // name with one is: trimmed, it would admit a network the file does not spell.
 @(test)
 test_an_allow_from_entry_with_a_unicode_space_is_refused :: proc(t: ^testing.T) {
-	_, err := load_string(MINIMAL + "server:\n  allow_from: [\"10.0.0.0/8\\_\"]\n", context.temp_allocator)
-	testing.expect(t, err != nil, "10.0.0.0/8 with a no-break space was accepted")
-	_, ok := load_string(MINIMAL + "server:\n  allow_from: [\" 10.0.0.0/8 \"]\n", context.temp_allocator)
-	testing.expect(t, ok == nil, "ASCII space around an entry is trimmed")
+	expect_refused(t, MINIMAL + "server:\n  allow_from: [\"10.0.0.0/8\\_\"]\n", "server.allow_from[0]: \"10.0.0.0/8\\u00a0\" is not a network in CIDR form", prefix = true)
+	_, err := load_string(MINIMAL + "server:\n  allow_from: [\" 10.0.0.0/8 \"]\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "ASCII space around an entry was not trimmed: %v", err)
 	free_all(context.temp_allocator)
 }

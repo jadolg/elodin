@@ -2,6 +2,7 @@ package server
 
 import "core:mem"
 import "core:slice"
+import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -428,41 +429,26 @@ special_use_zone :: proc(
 	if !live(s).cfg.special_use.enabled {
 		return "", .None
 	}
-	// The zones below are listed a second time in `config.check_route_reachable`,
-	// which refuses an `upstream.zones` route that one of them would answer
-	// before anything is forwarded. The config package cannot import this one, so
-	// a zone added here has to be added there too or a route under it will load
-	// cleanly and never fire.
-	//
-	// The two with no key of their own.
-	if dns.name_at_or_below(name, "localhost.") {
-		return "localhost.", .Loopback
-	}
-	if dns.name_at_or_below(name, "invalid.") {
-		return denial_unless_zone_below(s, name, "invalid.", .Nonexistent)
-	}
-	// The three an operator can hand back to the upstream, each for a
-	// deployment that really is served there.
-	if live(s).cfg.special_use.onion && dns.name_at_or_below(name, "onion.") {
-		return denial_unless_zone_below(s, name, "onion.", .Nonexistent)
-	}
-	if live(s).cfg.special_use.local && dns.name_at_or_below(name, "local.") {
-		return denial_unless_zone_below(s, name, "local.", .Nonexistent)
-	}
-	if live(s).cfg.special_use.test && dns.name_at_or_below(name, "test.") {
-		return denial_unless_zone_below(s, name, "test.", .Nonexistent)
-	}
-	if live(s).cfg.special_use.home_arpa && dns.name_at_or_below(name, "home.arpa.") {
-		// The delegation's own DS, and only at the apex: a DS below it is a
-		// query about a name that exists nowhere but this network, and the
-		// answer to that one really is here.
-		if type == .DS && dns.name_equal_fold(name, "home.arpa.") {
-			return "", .None
+	for z in config.special_use_zones(live(s).cfg.special_use) {
+		if !z.on || !dns.name_at_or_below(name, z.zone) {
+			continue
 		}
-		return denial_unless_zone_below(s, name, "home.arpa.", .Empty_Zone)
+		switch z.zone {
+		case "localhost.":
+			return z.zone, .Loopback
+		case "home.arpa.":
+			// The delegation's own DS, and only at the apex: a DS below it is a
+			// query about a name that exists nowhere but this network, and the
+			// answer to that one really is here.
+			if type == .DS && dns.name_equal_fold(name, z.zone) {
+				return "", .None
+			}
+			return denial_unless_zone_below(s, name, z.zone, .Empty_Zone)
+		}
+		return denial_unless_zone_below(s, name, z.zone, .Nonexistent)
 	}
-	// The RFC 6303 reverse zones (issue #321). Not in `config.check_route_reachable`'s
-	// copy, because a route is exactly what stands this down: a router answering
+	// The RFC 6303 reverse zones (issue #321). Not in `config.special_use_zones`,
+	// because a route is exactly what stands this down: a router answering
 	// its LAN's PTRs is reached by routing the zone to it, and an operator who
 	// anchored the zone has real, signed data there. `home.arpa.` has its own key
 	// above and is not this one's to answer.

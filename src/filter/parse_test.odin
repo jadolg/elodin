@@ -810,7 +810,7 @@ test_a_rule_whose_name_is_not_ascii_is_counted :: proc(t: ^testing.T) {
 // line break at all: each line is still one rule, and the format is still read.
 @(test)
 test_crlf_lines_are_rules_and_sniffed :: proc(t: ^testing.T) {
-	hosts := "\xef\xbb\xbf# a list\r\n0.0.0.0 ads.example\r\n\r\n0.0.0.0 track.example"
+	hosts := BOM + "# a list\r\n0.0.0.0 ads.example\r\n\r\n0.0.0.0 track.example"
 	testing.expect_value(t, detect_format(hosts), Format.Hosts)
 	cases := []struct {
 		text:   string,
@@ -834,7 +834,14 @@ test_a_byte_order_mark_is_not_part_of_the_first_rule :: proc(t: ^testing.T) {
 	cases := []struct {
 		text:   string,
 		format: Format,
-	}{{"\xef\xbb\xbf0.0.0.0 ads.example\n", .Hosts}, {"\xef\xbb\xbfads.example\n", .Domains}, {"\xef\xbb\xbf||ads.example^\n", .Adblock}, {"\xef\xbb\xbf||ads.example^\n", .Auto}, {"# a.txt\n\xef\xbb\xbfads.example\n", .Domains}, {"# a.txt\n\xef\xbb\xbf0.0.0.0 ads.example\n", .Auto}}
+	}{
+		{BOM + "0.0.0.0 ads.example\n", .Hosts},
+		{BOM + "ads.example\n", .Domains},
+		{BOM + "||ads.example^\n", .Adblock},
+		{BOM + "||ads.example^\n", .Auto},
+		{"# a.txt\n" + BOM + "ads.example\n", .Domains},
+		{"# a.txt\n" + BOM + "0.0.0.0 ads.example\n", .Auto},
+	}
 	for c in cases {
 		block, allow := build(c.text, c.format)
 		testing.expectf(t, block.count == 1, "%v: count = %d", c.format, block.count)

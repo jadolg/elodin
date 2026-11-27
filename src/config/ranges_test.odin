@@ -1,5 +1,6 @@
 package config
 
+import "core:fmt"
 import "core:strings"
 import "core:testing"
 
@@ -43,15 +44,16 @@ of a second, which no TTL can carry.
 */
 @(test)
 test_a_ttl_outside_rfc_2181_range_is_refused :: proc(t: ^testing.T) {
+	in_range := fmt.tprintf("0 to %d", MAX_TTL)
 	rw :: proc(ttl: string) -> string {
 		return strings.concatenate(
 			{MINIMAL + "rewrites:\n  - domain: nas.home\n    answer: 192.168.1.50\n    ttl: ", ttl, "\n"},
 			context.temp_allocator,
 		)
 	}
-	expect_refused(t, rw("-1"), "rewrites[0].ttl", "0 to 2147483647")
-	expect_refused(t, rw("2147483648"), "rewrites[0].ttl", "0 to 2147483647")
-	expect_refused(t, rw("4294967295"), "rewrites[0].ttl", "0 to 2147483647")
+	expect_refused(t, rw("-1"), "rewrites[0].ttl", in_range)
+	expect_refused(t, rw("2147483648"), "rewrites[0].ttl", in_range)
+	expect_refused(t, rw("4294967295"), "rewrites[0].ttl", in_range)
 	expect_loads(t, rw("2147483647"))
 	expect_loads(t, rw("0"))
 	// Written as a duration, as every other TTL key can be, or as any YAML 1.2
@@ -72,15 +74,15 @@ test_a_ttl_outside_rfc_2181_range_is_refused :: proc(t: ^testing.T) {
 
 	for key in ([]string{"min_ttl", "max_ttl", "negative_ttl", "prefetch_min_ttl"}) {
 		doc := strings.concatenate({MINIMAL + "cache:\n  ", key, ": 2147483648\n"}, context.temp_allocator)
-		expect_refused(t, doc, strings.concatenate({"cache.", key}, context.temp_allocator), "0 to 2147483647")
+		expect_refused(t, doc, strings.concatenate({"cache.", key}, context.temp_allocator), in_range)
 	}
-	expect_refused(t, MINIMAL + "blocking:\n  block_ttl: 2147483648\n", "blocking.block_ttl", "0 to 2147483647")
-	expect_refused(t, MINIMAL + "blocking:\n  block_ttl: -1\n", "blocking.block_ttl", "0 to 2147483647")
+	expect_refused(t, MINIMAL + "blocking:\n  block_ttl: 2147483648\n", "blocking.block_ttl", in_range)
+	expect_refused(t, MINIMAL + "blocking:\n  block_ttl: -1\n", "blocking.block_ttl", in_range)
 	// Past 2^64 an integer is still out of range, not wrapped round to 1.
 	for v in ([]string{"18446744073709551617", "-18446744073709551615"}) {
-		expect_refused(t, rw(v), "rewrites[0].ttl", "0 to 2147483647")
+		expect_refused(t, rw(v), "rewrites[0].ttl", in_range)
 		doc := strings.concatenate({MINIMAL + "cache:\n  min_ttl: ", v, "\n"}, context.temp_allocator)
-		expect_refused(t, doc, "cache.min_ttl", "0 to 2147483647")
+		expect_refused(t, doc, "cache.min_ttl", in_range)
 	}
 	expect_loads(t, MINIMAL + "cache:\n  min_ttl: 2147483647\n  max_ttl: 2147483647\n")
 	expect_loads(t, MINIMAL + "blocking:\n  block_ttl: 2147483647\n")

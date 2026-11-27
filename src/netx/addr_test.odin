@@ -203,7 +203,8 @@ test_parse_decimal_is_digits_within_the_bound :: proc(t: ^testing.T) {
 		{"65535", 65535, 65535, true},
 		{"65536", 65535, 0, false},
 		{"18446744073709551615", max(u64), max(u64), true},
-		// Each of these is a number `strconv` reads, and the last two wrap to 0 and 8.
+		// `strconv` reads the first six, the first two wrapping to 0 and 8, and
+		// refuses the last three.
 		{"18446744073709551616", max(u64), 0, false},
 		{"18446744073709551624", 32, 0, false},
 		{"+8", 32, 0, false},

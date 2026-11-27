@@ -76,6 +76,64 @@ ADDED = [
 ]
 
 
+# Added code only: comments and strings may name the figure. A scalar
+# constant's own declaration (`NAME :: 512`, `NAME : T : 512`, T one token) is
+# where it is named; a type, a procedure or a composite literal is not one.
+SIZE_LITERAL = ("size-literal", r"(?<!\w)(?<!\d\.)(512|1232|65535)(?!\w|\.\d)", lambda p: True,
+                "name the size: dns.MAX_UDP_SIZE, config.DEFAULT_MAX_UDP_RESPONSE, server.UPSTREAM_UDP_SIZE, dns.MAX_MESSAGE")
+CONSTANT = re.compile(r"^\s*[A-Za-z_]\w*\s*:(\s*[^\s:=]+\s*)?:(?!=)"
+                      r"(?!\s*(#\w+\s+)*(proc|struct|union|enum|bit_set|bit_field|distinct|matrix|map)\b|\s*[\[{^])")
+# `65_535` is 65535.
+SEPARATOR = re.compile(r"(?<=\d)_(?=\d)")
+
+
+def block_end(source, i):
+    """The index past the block comment opened at `i`, nested ones counted, as Odin's nest."""
+    depth, end = 1, i + 2
+    while end < len(source) and depth:
+        step = source[end:end + 2]
+        depth += 1 if step == "/*" else -1 if step == "*/" else 0
+        end += 2 if step in ("/*", "*/") else 1
+    return end
+
+
+def token_end(source, i):
+    """The index past the comment or literal that opens at `i`, or None where code does."""
+    if source.startswith("//", i):
+        end = source.find("\n", i)
+        return len(source) if end < 0 else end
+    if source.startswith("/*", i):
+        return block_end(source, i)
+    if source[i] in "\"'`":
+        return skip_literal(source, i) + 1
+    return None
+
+
+def code_only(source):
+    """`source` with its comments and literals blanked, line breaks kept."""
+    out = list(source)
+    i = 0
+    while i < len(source):
+        end = token_end(source, i)
+        if end is None:
+            i += 1
+            continue
+        for k in range(i, min(end, len(out))):
+            if out[k] != "\n":
+                out[k] = " "
+        i = end
+    return "".join(out).splitlines()
+
+
+def check_code(path, n, text, code, hits):
+    """The rules that read code, not comments or literals, on added line `n` (`text` as written)."""
+    name, pattern, applies, message = SIZE_LITERAL
+    if n > len(code) or not applies(path) or ALLOW.search(text) or CONSTANT.match(code[n - 1]):
+        return
+    if re.search(pattern, SEPARATOR.sub("", code[n - 1])):
+        hits.append(f"{path}:{n}: {name}: {message}\n    {text.strip()}")
+
+
 def odin_files():
     out = subprocess.run(["git", "ls-files", "src/*.odin", "scripts/*.odin"], cwd=ROOT,  # nosec B603 B607
                          capture_output=True, text=True, check=True).stdout
@@ -245,8 +303,13 @@ def main():
             check(TREE, path, n, text, hits)
         expect_formats(path, source, hits)
     test_only_procs(sources, hits)
+    code = {}
     for path, n, text in added_lines(resolve_base()):
         check(ADDED, path, n, text, hits)
+        if path in sources:
+            if path not in code:
+                code[path] = code_only(sources[path])
+            check_code(path, n, text, code[path], hits)
     for h in hits:
         print(h, file=sys.stderr)
     if hits:

@@ -446,41 +446,80 @@ main :: proc() {
 	}
 	defer virtual.arena_destroy(&config_arena)
 
-	cfg, load_err := config.load_file(opts.config_path, virtual.arena_allocator(&config_arena))
+	cfg := load_config(opts.config_path, virtual.arena_allocator(&config_arena))
+	service := resolve_service(&cfg)
+	open_log(&cfg, opts, service)
+	defer logx.shutdown()
+	if openssl_problem != "" {
+		logx.warnf("%s", openssl_init_warning(openssl_problem, context.temp_allocator))
+	}
+
+	if opts.check_only {
+		check_config(&cfg, opts.config_path)
+		return
+	}
+
+	logx.eventf(.Info, "starting", "version=%s openssl=%s", logx.quote(server.VERSION), logx.quote(openssl_build(context.temp_allocator)))
+	logx.eventf(
+		.Info,
+		"sizing",
+		"%s origin=%s",
+		sizing_figures(cfg.server, cfg.listeners.udp.readers),
+		logx.quote(sizing_origin(cfg.server)),
+	)
+	log_config_warnings(&cfg)
+	// Before anything decodes on behalf of a request, and once: the slots are
+	// process-wide and a reload does not move them.
+	dns.set_heavy_decodes(cfg.server.heavy_decodes)
+	run(&cfg, opts, service)
+}
+
+// The configuration at `path`, or the end of the process with what is wrong with it.
+@(private)
+load_config :: proc(path: string, allocator := context.allocator) -> config.Config {
+	cfg, load_err := config.load_file(path, allocator)
 	if e, has := load_err.?; has {
-		fmt.eprintfln("elodin: %s is not usable:", opts.config_path)
+		fmt.eprintfln("elodin: %s is not usable:", path)
 		for msg in e.messages {
 			fmt.eprintfln("  - %s", msg)
 		}
 		os.exit(1)
 	}
+	return cfg
+}
 
-	/*
-	Resolved here rather than where it is used, so a name nobody has an account
-	for is a startup error instead of a process that comes up, takes port 53 and
-	only then finds it has nowhere to go. It also puts the account under
-	`--check`, which is where an operator looks before restarting a resolver.
-	*/
-	service: privdrop.Identity
-	if cfg.server.user != "" {
-		err: privdrop.Error
-		service, err = privdrop.resolve(cfg.server.user, cfg.server.group)
-		if err != .None {
-			fmt.eprintfln(
-				"elodin: server.user %q / server.group %q is not usable: %s",
-				cfg.server.user,
-				cfg.server.group,
-				privdrop.explain(err),
-			)
-			os.exit(1)
-		}
+/*
+Resolved here rather than where it is used, so a name nobody has an account
+for is a startup error instead of a process that comes up, takes port 53 and
+only then finds it has nowhere to go. It also puts the account under
+`--check`, which is where an operator looks before restarting a resolver.
+*/
+@(private)
+resolve_service :: proc(cfg: ^config.Config) -> (service: privdrop.Identity) {
+	if cfg.server.user == "" {
+		return
 	}
+	err: privdrop.Error
+	service, err = privdrop.resolve(cfg.server.user, cfg.server.group)
+	if err != .None {
+		fmt.eprintfln(
+			"elodin: server.user %q / server.group %q is not usable: %s",
+			cfg.server.user,
+			cfg.server.group,
+			privdrop.explain(err),
+		)
+		os.exit(1)
+	}
+	return
+}
 
-	/*
-	Not under `--check`, which only reads: it would create the file, as root
-	when run with sudo, and the start after it would then find a file it did not
-	make and leave it root's (`logx.init`'s owner). Its lines go to stderr.
-	*/
+/*
+Not under `--check`, which only reads: it would create the file, as root
+when run with sudo, and the start after it would then find a file it did not
+make and leave it root's (`logx.init`'s owner). Its lines go to stderr.
+*/
+@(private)
+open_log :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	log_file := "" if opts.check_only else cfg.log.file
 	// Only a start that will really drop: root, to an account that is not.
 	log_owner: Maybe(logx.Owner)
@@ -500,140 +539,138 @@ main :: proc() {
 			fmt.eprintfln("elodin: cannot open the log file %q%s; a start would log to stderr instead", cfg.log.file, hint)
 		}
 	}
-	defer logx.shutdown()
-	if openssl_problem != "" {
-		logx.warnf("%s", openssl_init_warning(openssl_problem, context.temp_allocator))
-	}
+}
 
-	if opts.check_only {
-		// The certificates are read here, which the loader does not do.
-		ddr_problems, ddr_warnings := server.ddr_check(&cfg, context.temp_allocator)
-		if len(ddr_problems) > 0 {
-			fmt.eprintfln("elodin: %s is not usable:", opts.config_path)
-			for msg in ddr_problems {
-				fmt.eprintfln("  - %s", msg)
-			}
-			os.exit(1)
+/*
+`--check`: whether the file at `config_path` would start a server, and the
+figures and warnings a start would log, on stdout. A refusal ends the process.
+*/
+@(private)
+check_config :: proc(cfg: ^config.Config, config_path: string) {
+	// The certificates are read here, which the loader does not do.
+	ddr_problems, ddr_warnings := server.ddr_check(cfg, context.temp_allocator)
+	if len(ddr_problems) > 0 {
+		fmt.eprintfln("elodin: %s is not usable:", config_path)
+		for msg in ddr_problems {
+			fmt.eprintfln("  - %s", msg)
 		}
-		fmt.printfln("%s is valid: %d upstreams, %d zone routes, %d blocklists, %d rewrites",
-			opts.config_path,
-			len(cfg.upstream.servers),
-			len(cfg.upstream.zones),
-			len(cfg.blocking.lists),
-			len(cfg.rewrites))
+		os.exit(1)
+	}
+	fmt.printfln("%s is valid: %d upstreams, %d zone routes, %d blocklists, %d rewrites",
+		config_path,
+		len(cfg.upstream.servers),
+		len(cfg.upstream.zones),
+		len(cfg.blocking.lists),
+		len(cfg.rewrites))
+	fmt.printfln(
+		"  %s",
+		sizing_line(
+			cfg.server,
+			cfg.listeners.udp.readers,
+			cfg.dnssec.max_chain_walks if cfg.dnssec.enabled else 0,
+			cfg.dnssec.max_connection_walks if cfg.dnssec.enabled else 0,
+		),
+	)
+	fmt.printfln("  %s", allow_from_line(cfg.server))
+	// Only where it applies, and without a granted figure: nothing here has
+	// bound a socket, so what the kernel would allow each reader is not
+	// known yet. Startup prints the same line with that filled in.
+	if cfg.listeners.udp.enabled {
+		fmt.printfln(
+			"  udp: %s%s",
+			server.udp_readers_line(cfg.listeners.udp.readers, cfg.listeners.udp.receive_buffer, 0),
+			udp_readers_origin(cfg.server),
+		)
+	}
+	// Only where it applies, as at startup: with no stream listener there is
+	// no connection table for either figure to bound.
+	if config.stream_listeners_enabled(cfg.listeners) {
 		fmt.printfln(
 			"  %s",
-			sizing_line(
-				cfg.server,
-				cfg.listeners.udp.readers,
-				cfg.dnssec.max_chain_walks if cfg.dnssec.enabled else 0,
-				cfg.dnssec.max_connection_walks if cfg.dnssec.enabled else 0,
-			),
+			server.connection_limits_line(cfg.server.max_connections, cfg.server.max_connections_per_prefix),
 		)
-		fmt.printfln("  %s", allow_from_line(cfg.server))
-		// Only where it applies, and without a granted figure: nothing here has
-		// bound a socket, so what the kernel would allow each reader is not
-		// known yet. Startup prints the same line with that filled in.
-		if cfg.listeners.udp.enabled {
-			fmt.printfln(
-				"  udp: %s%s",
-				server.udp_readers_line(cfg.listeners.udp.readers, cfg.listeners.udp.receive_buffer, 0),
-				udp_readers_origin(cfg.server),
-			)
-		}
-		// Only where it applies, as at startup: with no stream listener there is
-		// no connection table for either figure to bound.
-		if config.stream_listeners_enabled(cfg.listeners) {
-			fmt.printfln(
-				"  %s",
-				server.connection_limits_line(cfg.server.max_connections, cfg.server.max_connections_per_prefix),
-			)
-			/*
-			The descriptor limit is deliberately *not* said here, though it bounds
-			this same table and startup warns about it.
-
-			Every other figure in these lines is read from the file being checked.
-			That one would be read from whichever process runs the check - an
-			interactive shell with the distribution's 1024, where the service has
-			the unit's `LimitNOFILE` - so it would warn about a server that is
-			fine and stay silent about one that is not, and an operator would
-			reasonably read it as a statement about the server. See
-			`server.descriptor_limit_line`.
-			*/
-		}
 		/*
-		The networks with budgets of their own, in the words the startup log uses.
+		The descriptor limit is deliberately *not* said here, though it bounds
+		this same table and startup warns about it.
 
-		Here because this is where a wrong entry is cheapest to find. Nothing else
-		says which prefix a client will be accounted on - the counters are not
-		labelled per prefix, deliberately - so an entry that does not match the
-		clients it was written for shows up in these lines and in no number
-		anywhere. An operator reads `--check` before restarting, which is before
-		the mistake is serving anybody.
+		Every other figure in these lines is read from the file being checked.
+		That one would be read from whichever process runs the check - an
+		interactive shell with the distribution's 1024, where the service has
+		the unit's `LimitNOFILE` - so it would warn about a server that is
+		fine and stay silent about one that is not, and an operator would
+		reasonably read it as a statement about the server. See
+		`server.descriptor_limit_line`.
 		*/
-		if cfg.server.rate_limit.enabled {
-			// What the two rate-limit figures multiply out to, which is the
-			// quantity being chosen, and - where the estimate is one no answer
-			// can reach - that it charges nothing and is reported nowhere else.
-			if text, say := server.rate_limit_denomination_line(
-				cfg.server.rate_limit.responses_per_second,
-				cfg.server.rate_limit.response_size_estimate,
-				cfg.server.max_udp_response,
-				context.temp_allocator,
-				cfg.cookies.enabled,
-			); say {
-				fmt.printfln("  %s", text)
-			}
-			if text, say := server.response_size_estimate_warning(
-				cfg.server.rate_limit.response_size_estimate,
-				cfg.server.max_udp_response,
-				context.temp_allocator,
-			); say {
-				fmt.printfln("  warning: %s", text)
-			}
-			for line in server.rate_limit_override_lines(
-				cfg.server.rate_limit.overrides,
-				cfg.server.rate_limit.response_size_estimate,
-				cfg.server.max_udp_response,
-				context.temp_allocator,
-				cfg.cookies.enabled,
-			) {
-				fmt.printfln("  %s", line)
-			}
-		}
-		for rule in route_shaped_rules(&cfg, context.temp_allocator) {
-			fmt.printfln("  warning: %s", route_rule_warning(rule, context.temp_allocator))
-		}
-		for route in cfg.upstream.zones {
-			if text, say := route_implication_warning(&cfg, route, context.temp_allocator); say {
-				fmt.printfln("  warning: %s", text)
-			}
-		}
-		if text, say := mixed_validation_warning(&cfg); say {
-			fmt.printfln("  warning: %s", text)
-		}
-		if text, say := connection_memory_warning(&cfg); say {
-			fmt.printfln("  warning: %s", text)
-		}
-		for text in ddr_warnings {
-			fmt.printfln("  warning: %s", text)
-		}
-		return
 	}
+	if cfg.server.rate_limit.enabled {
+		print_rate_limit_lines(cfg)
+	}
+	print_check_warnings(cfg, ddr_warnings)
+}
 
-	logx.eventf(.Info, "starting", "version=%s openssl=%s", logx.quote(server.VERSION), logx.quote(openssl_build(context.temp_allocator)))
-	logx.eventf(
-		.Info,
-		"sizing",
-		"%s origin=%s",
-		sizing_figures(cfg.server, cfg.listeners.udp.readers),
-		logx.quote(sizing_origin(cfg.server)),
-	)
-	log_config_warnings(&cfg)
-	// Before anything decodes on behalf of a request, and once: the slots are
-	// process-wide and a reload does not move them.
-	dns.set_heavy_decodes(cfg.server.heavy_decodes)
-	run(&cfg, opts, service)
+/*
+The networks with budgets of their own, in the words the startup log uses.
+
+Here because this is where a wrong entry is cheapest to find. Nothing else
+says which prefix a client will be accounted on - the counters are not
+labelled per prefix, deliberately - so an entry that does not match the
+clients it was written for shows up in these lines and in no number
+anywhere. An operator reads `--check` before restarting, which is before
+the mistake is serving anybody.
+*/
+@(private)
+print_rate_limit_lines :: proc(cfg: ^config.Config) {
+	// What the two rate-limit figures multiply out to, which is the
+	// quantity being chosen, and - where the estimate is one no answer
+	// can reach - that it charges nothing and is reported nowhere else.
+	if text, say := server.rate_limit_denomination_line(
+		cfg.server.rate_limit.responses_per_second,
+		cfg.server.rate_limit.response_size_estimate,
+		cfg.server.max_udp_response,
+		context.temp_allocator,
+		cfg.cookies.enabled,
+	); say {
+		fmt.printfln("  %s", text)
+	}
+	if text, say := server.response_size_estimate_warning(
+		cfg.server.rate_limit.response_size_estimate,
+		cfg.server.max_udp_response,
+		context.temp_allocator,
+	); say {
+		fmt.printfln("  warning: %s", text)
+	}
+	for line in server.rate_limit_override_lines(
+		cfg.server.rate_limit.overrides,
+		cfg.server.rate_limit.response_size_estimate,
+		cfg.server.max_udp_response,
+		context.temp_allocator,
+		cfg.cookies.enabled,
+	) {
+		fmt.printfln("  %s", line)
+	}
+}
+
+// The warnings a start would log, in `--check`'s words; `ddr_warnings` are
+// `server.ddr_check`'s.
+@(private)
+print_check_warnings :: proc(cfg: ^config.Config, ddr_warnings: []string) {
+	for rule in route_shaped_rules(cfg, context.temp_allocator) {
+		fmt.printfln("  warning: %s", route_rule_warning(rule, context.temp_allocator))
+	}
+	for route in cfg.upstream.zones {
+		if text, say := route_implication_warning(cfg, route, context.temp_allocator); say {
+			fmt.printfln("  warning: %s", text)
+		}
+	}
+	if text, say := mixed_validation_warning(cfg); say {
+		fmt.printfln("  warning: %s", text)
+	}
+	if text, say := connection_memory_warning(cfg); say {
+		fmt.printfln("  warning: %s", text)
+	}
+	for text in ddr_warnings {
+		fmt.printfln("  warning: %s", text)
+	}
 }
 
 /*
@@ -809,13 +846,15 @@ connection_memory_warning :: proc(cfg: ^config.Config) -> (text: string, say: bo
 // leaves its frame out of the fiber stack guard's bound by this name, so a
 // rename has to be made there as well.
 run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
+	// Before the first thread: no_new_privs and Landlock reach only the threads
+	// started after them.
+	landlock_abi := confine_process(cfg, opts.config_path)
 	/*
 	The event loops, one thread each, as many as `listeners.udp.readers` says:
 	the usable CPUs, at most eight, unless the file names a figure. Everything
 	that waits on the network runs on them - see `loop` - and each takes one UDP
 	reader. Started before anything that could spawn on one.
 	*/
-	landlock_abi := confine_process(cfg, opts.config_path)
 	loops, loop_threads := start_loops(cfg.listeners.udp.readers, cfg.server.pin_loops)
 
 	filters := filter.engine_make()
@@ -902,18 +941,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	as long as its connection and the connection as long as the generation,
 	which is released after this.
 	*/
-	defer {
-		server.stop_listeners(&listeners)
-		server.stop_metrics(&listeners)
-		server.drain_queries(&s)
-		stop_loops(loops, loop_threads)
-		// Freed with them: nothing after this may find a loop to start work on.
-		s.loops = nil
-		server.destroy_listeners(&listeners)
-		// Last: a draining query can be a DoH request still building a profile,
-		// and this is what it signs with.
-		server.stop_profile_signer(&s)
-	}
+	defer shut_down(&s, &listeners, loops, loop_threads)
 
 	drop_privileges(cfg, service, opts.config_path)
 	filter_process(cfg, landlock_abi)
@@ -928,7 +956,30 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		logx.errorf("could not start reading from every listener, shutting down")
 		os.exit(1)
 	}
+	log_ready(cfg)
+	server.unpin(&s)
 
+	maintenance_loop(&s, &listeners, &rebuild, opts, lists_current)
+}
+
+// The shutdown `run` defers; see the order there.
+@(private)
+shut_down :: proc(s: ^server.Server, listeners: ^server.Listeners, loops: []^loop.Loop, loop_threads: []^thread.Thread) {
+	server.stop_listeners(listeners)
+	server.stop_metrics(listeners)
+	server.drain_queries(s)
+	stop_loops(loops, loop_threads)
+	// Freed with them: nothing after this may find a loop to start work on.
+	s.loops = nil
+	server.destroy_listeners(listeners)
+	// Last: a draining query can be a DoH request still building a profile,
+	// and this is what it signs with.
+	server.stop_profile_signer(s)
+}
+
+// The line that says the server answers.
+@(private)
+log_ready :: proc(cfg: ^config.Config) {
 	logx.eventf(
 		.Info,
 		"ready",
@@ -944,9 +995,6 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		// wrote, whether the thing that refuses such answers is running.
 		cfg.rebind.enabled,
 	)
-	server.unpin(&s)
-
-	maintenance_loop(&s, &listeners, &rebuild, opts, lists_current)
 }
 
 /*

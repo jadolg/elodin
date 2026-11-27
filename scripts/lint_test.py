@@ -83,6 +83,46 @@ for source, want in SOURCES:
     if bool(hits) != want:
         failures.append(f"expect-format on {source!r}: got {bool(hits)}, want {want}")
 
+# (source, line checked, size-literal expected)
+CODE = [
+    ("buf: [512]u8\n", 1, True),
+    ("n := 1232\n", 1, True),
+    ("if len(m) > 65535 {\n", 1, True),
+    ("MAX :: 65535\n", 1, False),
+    ("n := 1232 // lint:allow the RFC 9715 figure itself\n", 1, False),
+    ("n := f() // fits in 512 bytes\n", 1, False),
+    ('s := "512 bytes"\n', 1, False),
+    ("/*\nthe 1232 ceiling\n*/\n", 2, False),
+    ("x := 5120 + 0.512 + v512\n", 1, False),
+    ("MAX : u16 : 65535\n", 1, False),
+    ("\tbuf: []u8, limit := 1232,\n", 1, True),
+    ("\ta: u8, b: [512]u8,\n", 1, True),
+    ("outer: for x in buf[:512] {\n", 1, True),
+    ("for i in 512..<n {\n", 1, True),
+    ("case 1232..=max:\n", 1, True),
+    ("for i in 0..<512 {\n", 1, True),
+    ("x := 512.0\n", 1, False),
+    ("outer: for i := 0; i < 512; i += 1 {\n", 1, True),
+    ("case: n := 512\n", 1, True),
+    ("Frame :: distinct [512]u8\n", 1, True),
+    ("Buf :: [1232]u8\n", 1, True),
+    ("SIZES : [2]int : {512, 1232}\n", 1, True),
+    ("LIMIT : type_of(x) : 512\n", 1, False),
+    ("SHIFTED :: 65535 >> 1\n", 1, False),
+    ("n := 65_535\n", 1, True),
+    ("buf: [1_232]u8\n", 1, True),
+    ("read_reply :: proc(buf: []u8, limit := 1232) -> int {\n", 1, True),
+    ("Frame :: struct { data: [512]u8 }\n", 1, True),
+    ("/* outer /* inner */ replies over 512 bytes */\n", 1, False),
+    ("/* a /* b */ c */ n := 512\n", 1, True),
+    ("c := '\"' // 512\n", 1, False),
+]
+for source, n, want in CODE:
+    hits = []
+    lint.check_code(TEST, n, source.splitlines()[n - 1], lint.code_only(source), hits)
+    if bool(hits) != want:
+        failures.append(f"size-literal on {source!r}: got {bool(hits)}, want {want}")
+
 # (sources, procedures the test-only rule should name)
 PROCS = [
     ({"src/dns/a.odin": "used :: proc() {}\n", "src/dns/b.odin": "x := used()\n"}, []),

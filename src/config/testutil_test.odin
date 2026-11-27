@@ -26,9 +26,11 @@ expect_loads :: proc(t: ^testing.T, src: string, loc := #caller_location) -> (cf
 }
 
 /*
-Whether loading `src` is refused with a message holding every one of `wanted`
-(or starting with each, given `prefix`); `exactly_one` also wants that message
-to be the only one.
+Whether loading `src` is refused with a message holding every one of `wanted`,
+at least one (starting with each, given `prefix`, or equal to the one, given
+`exact`);
+`count`, when not 0, is how many refusals there are in all. `tls_files` is
+`load_string`'s.
 */
 @(private)
 expect_refused :: proc(
@@ -36,20 +38,25 @@ expect_refused :: proc(
 	src: string,
 	wanted: ..string,
 	prefix := false,
-	exactly_one := false,
+	exact := false,
+	count := 0,
+	tls_files := true,
 	loc := #caller_location,
 ) -> bool {
-	_, err := load_string(src, context.temp_allocator)
+	// No reason passes on any refusal, and two reasons cannot both equal one message.
+	assert(len(wanted) > 0 && (!exact || len(wanted) == 1), "expect_refused wants a reason, and one when exact")
+	_, err := load_string(src, context.temp_allocator, tls_files = tls_files)
 	e, has := err.?
 	if !testing.expectf(t, has, "accepted, wanted a refusal naming %v, from:\n%s", wanted, src, loc = loc) {
 		return false
 	}
-	if exactly_one && !testing.expectf(t, len(e.messages) == 1, "wanted one refusal naming %v: %v", wanted, e.messages, loc = loc) {
+	if count != 0 && !testing.expectf(t, len(e.messages) == count, "wanted %d refusals, one naming %v: %v", count, wanted, e.messages, loc = loc) {
 		return false
 	}
 	matched: for m in e.messages {
 		for w in wanted {
-			if !(strings.has_prefix(m, w) if prefix else strings.contains(m, w)) {
+			names := m == w if exact else (strings.has_prefix(m, w) if prefix else strings.contains(m, w))
+			if !names {
 				continue matched
 			}
 		}

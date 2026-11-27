@@ -13,31 +13,20 @@ because that is the whole argument for the syntax: the fields are in the order
 the RFC prints them, so a rule can be copied across without being translated.
 */
 @(private = "file")
-rules_from :: proc(t: ^testing.T, answers: string) -> []Rewrite {
-	src := strings.concatenate(
+answers_doc :: proc(answers: string) -> string {
+	return strings.concatenate(
 		{MINIMAL + "rewrites:\n  - domain: example.com\n    answers: ", answers, "\n"},
 		context.temp_allocator,
 	)
-	cfg, ok := expect_loads(t, src)
+}
+
+@(private = "file")
+rules_from :: proc(t: ^testing.T, answers: string, loc := #caller_location) -> []Rewrite {
+	cfg, ok := expect_loads(t, answers_doc(answers), loc)
 	if !ok {
 		return nil
 	}
 	return cfg.rewrites
-}
-
-// The message a bad answer produces, or "" when it was accepted.
-@(private = "file")
-error_from :: proc(answers: string) -> string {
-	src := strings.concatenate(
-		{MINIMAL + "rewrites:\n  - domain: example.com\n    answers: ", answers, "\n"},
-		context.temp_allocator,
-	)
-	_, err := load_string(src, context.temp_allocator)
-	e, has := err.?
-	if !has {
-		return ""
-	}
-	return e.messages[0]
 }
 
 @(test)
@@ -65,8 +54,8 @@ test_rewrite_mx_answer :: proc(t: ^testing.T) {
 /*
 A padded number is that number.
 
-`MX 000010` is ten, and refusing it while saying it "is not a number from 0 to
-65535" was a message arguing with itself. The reverse-name parser refuses a
+`MX 000010` is ten: refusing it while saying it "is not a number from 0 to
+65535" would be a message arguing with itself. The reverse-name parser refuses a
 padded octet on purpose - `050` there is a second spelling of a name - and the
 distinction is worth keeping straight: a preference is a number, and a number
 has one value however it is written.
@@ -90,10 +79,7 @@ test_rewrite_numbers_may_be_padded :: proc(t: ^testing.T) {
 	// digits long enough to overflow is refused rather than counted.
 	over := [?]string{`["MX 65536 mail.example.com"]`, `["MX 00065536 mail.example.com"]`}
 	for a in over {
-		msg := error_from(a)
-		if testing.expectf(t, msg != "", "%s was accepted", a) {
-			testing.expectf(t, strings.contains(msg, "preference"), "message %q", msg)
-		}
+		expect_refused(t, answers_doc(a), "rewrites[0].answers[0]", "preference")
 	}
 
 	free_all(context.temp_allocator)
@@ -214,16 +200,7 @@ test_a_cname_cannot_share_its_name :: proc(t: ^testing.T) {
 		`["CNAME one.example.com", "CNAME two.example.com"]`,
 	}
 	for a in answers {
-		msg := error_from(a)
-		if testing.expectf(t, msg != "", "%s was accepted", a) {
-			testing.expectf(
-				t,
-				strings.contains(msg, "CNAME"),
-				"%s: message %q should say which record is the problem",
-				a,
-				msg,
-			)
-		}
+		expect_refused(t, answers_doc(a), "CNAME")
 	}
 
 	// `block` is not a record and answers before the rest of the rule is looked
@@ -235,14 +212,13 @@ test_a_cname_cannot_share_its_name :: proc(t: ^testing.T) {
 }
 
 /*
-The short form is untouched, which is most of what is in anybody's file.
+The short form, which is most of what is in anybody's file.
 
-Pinned here beside the typed form because the two share a parser now: a bare
-address is still an address, a bare name is still a CNAME, and `block` is still
-the name sunk.
+Pinned here beside the typed form because the two share a parser: a bare
+address is an address, a bare name is a CNAME, and `block` is the name sunk.
 */
 @(test)
-test_rewrite_short_form_unchanged :: proc(t: ^testing.T) {
+test_rewrite_short_form :: proc(t: ^testing.T) {
 	rules := rules_from(t, `[192.168.1.50, "fd00::10", block]`)
 	if !testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 3, "expected three answers") {
 		return
@@ -270,21 +246,10 @@ has no index to name either.
 @(test)
 test_rewrite_errors_name_the_key_that_was_used :: proc(t: ^testing.T) {
 	singular := MINIMAL + "rewrites:\n  - domain: example.com\n    answer: \"MX ten mail.example.com\"\n"
-	_, serr := load_string(singular, context.temp_allocator)
-	if e, has := serr.?; testing.expect(t, has, "a bad singular answer was accepted") {
-		testing.expectf(
-			t,
-			strings.contains(e.messages[0], "rewrites[0].answer:"),
-			"message %q should name the `answer` key with no index",
-			e.messages[0],
-		)
-	}
+	expect_refused(t, singular, "rewrites[0].answer: MX preference", prefix = true)
 
 	// A list keeps its index, however long it is.
-	msg := error_from(`["MX ten mail.example.com"]`)
-	if testing.expect(t, msg != "", "a bad listed answer was accepted") {
-		testing.expect(t, strings.contains(msg, "rewrites[0].answers[0]"), "a list names its index")
-	}
+	expect_refused(t, answers_doc(`["MX ten mail.example.com"]`), "rewrites[0].answers[0]: MX preference", prefix = true)
 
 	free_all(context.temp_allocator)
 }
@@ -343,25 +308,8 @@ test_rewrite_typed_answers_are_checked :: proc(t: ^testing.T) {
 		{`['TXT "one" two']`, "outside a quoted string"},
 	}
 	for c in cases {
-		msg := error_from(c.answers)
-		if testing.expectf(t, msg != "", "%s was accepted", c.answers) {
-			testing.expectf(
-				t,
-				strings.contains(msg, c.wants),
-				"%s: message %q does not mention %q",
-				c.answers,
-				msg,
-				c.wants,
-			)
-			// Every one of them names the rule and the answer that was wrong.
-			testing.expectf(
-				t,
-				strings.contains(msg, "rewrites[0].answers[0]"),
-				"%s: message %q does not say which answer",
-				c.answers,
-				msg,
-			)
-		}
+		// Every one of them names the rule and the answer that was wrong.
+		expect_refused(t, answers_doc(c.answers), c.wants, "rewrites[0].answers[0]")
 	}
 	free_all(context.temp_allocator)
 }
@@ -371,9 +319,9 @@ A type this does not answer, and a type that does not exist, are both errors
 rather than a CNAME to a name with a space in it.
 
 `PTR nas.home` is the plausible one - the reverse synthesis is documented right
-beside this - and without the check it became an alias to the name
+beside this - and read as a name it would be an alias to the name
 `ptr nas.home`, which `encode_name` puts on the wire quite happily, so every
-client asking that name got it, whatever type they asked for. A typo has the
+client asking that name would get it, whatever type they asked for. A typo has the
 same non-reading and so gets the same refusal.
 */
 @(test)
@@ -384,24 +332,14 @@ test_rewrite_unknown_type_token_is_refused :: proc(t: ^testing.T) {
 		`["CAA 0 issue letsencrypt.org"]`,
 		`["HTTPS 1 . alpn=h2"]`,
 		`["MXX 10 mail.example.com"]`,
-		// No type at all, several fields: the shape that has always become a
-		// nonsense CNAME.
+		// No type at all, several fields: read as a name, a nonsense CNAME.
 		`["some random text"]`,
 	}
 	for a in answers {
-		msg := error_from(a)
-		if testing.expectf(t, msg != "", "%s was accepted", a) {
-			testing.expectf(
-				t,
-				strings.contains(msg, "record type"),
-				"%s: message %q should say a type comes first",
-				a,
-				msg,
-			)
-		}
+		expect_refused(t, answers_doc(a), "rewrites[0].answers[0]", "record type")
 	}
 
-	// And the six it does answer are still answered, so the refusal is about the
+	// And MX, a type it does answer, is answered, so the refusal is about the
 	// token rather than about anything having a space in it.
 	rules := rules_from(t, `["MX 10 mail.example.com"]`)
 	testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 1, "MX should still parse")
@@ -438,10 +376,10 @@ test_rewrite_block_folds_case :: proc(t: ^testing.T) {
 A name the wire cannot carry is a startup error, not a rule that quietly does
 nothing.
 
-What made this worth a check at load time is where the failure went: the record
-fails to encode at query time, `apply_rewrite` gives up, and the query carries
-on to the upstream - so the internal name the rule was written for leaves the
-building and the public answer comes back, with nothing logged. A 64-byte label
+Checked at load time because of where the failure would go: the record would
+fail to encode at query time, `apply_rewrite` would give up, and the query would
+carry on to the upstream - so the internal name the rule was written for leaves
+the building and the public answer comes back, with nothing logged. A 64-byte label
 and a name over 255 bytes are the two ways to write one.
 */
 @(test)
@@ -463,15 +401,7 @@ test_rewrite_names_must_fit_on_the_wire :: proc(t: ^testing.T) {
 		strings.concatenate({`["MX 10 `, deep, `"]`}, context.temp_allocator),
 	}
 	for a in answers {
-		msg := error_from(a)
-		if testing.expectf(t, msg != "", "an unencodable name was accepted: %s", a) {
-			testing.expectf(
-				t,
-				strings.contains(msg, "cannot be put on the wire"),
-				"message %q should say the name cannot be sent",
-				msg,
-			)
-		}
+		expect_refused(t, answers_doc(a), "rewrites[0].answers[0]", "cannot be put on the wire")
 	}
 
 	// 63 bytes is the label limit, so one of exactly that is fine.
@@ -496,10 +426,7 @@ pass `--check` while doing it.
 @(test)
 test_a_rule_may_not_have_both_answer_keys :: proc(t: ^testing.T) {
 	src := MINIMAL + "rewrites:\n  - domain: example.com\n    answer: 192.168.1.50\n    answers: [\"MX 10 mail.example.com\"]\n"
-	_, err := load_string(src, context.temp_allocator)
-	if e, has := err.?; testing.expect(t, has, "both keys were accepted") {
-		testing.expect(t, strings.contains(e.messages[0], "both"), "the message should say which mistake this is")
-	}
+	expect_refused(t, src, "rewrites[0]", "both")
 	free_all(context.temp_allocator)
 }
 
@@ -509,7 +436,7 @@ The rule's own `domain:` is held to the wire's limits too.
 A rule is matched against a name that came off the wire, so a domain the wire
 cannot carry is a rule no query can ever equal: it sits in a configuration
 `--check` passed, matching nothing, which is the outcome the answer-side check
-was added to prevent.
+is there to prevent.
 */
 @(test)
 test_rewrite_domain_must_fit_the_wire :: proc(t: ^testing.T) {
@@ -525,14 +452,7 @@ test_rewrite_domain_must_fit_the_wire :: proc(t: ^testing.T) {
 		},
 		context.temp_allocator,
 	)
-	_, err := load_string(src, context.temp_allocator)
-	if e, has := err.?; testing.expect(t, has, "an unencodable domain was accepted") {
-		testing.expect(
-			t,
-			strings.contains(e.messages[0], "rewrites[0].domain"),
-			"the message should name the domain",
-		)
-	}
+	expect_refused(t, src, "rewrites[0].domain cannot be put on the wire", prefix = true)
 
 	// A wildcard's suffix is a name as well, and is checked the same way.
 	wild := strings.concatenate(
@@ -543,9 +463,7 @@ test_rewrite_domain_must_fit_the_wire :: proc(t: ^testing.T) {
 		},
 		context.temp_allocator,
 	)
-	_, werr := load_string(wild, context.temp_allocator)
-	_, whas := werr.?
-	testing.expect(t, whas, "an unencodable wildcard suffix was accepted")
+	expect_refused(t, wild, "rewrites[0].domain cannot be put on the wire", prefix = true)
 
 	free_all(context.temp_allocator)
 }
@@ -574,10 +492,7 @@ test_a_rule_may_not_hold_more_than_a_message :: proc(t: ^testing.T) {
 	}
 	strings.write_string(&b, "]")
 
-	msg := error_from(strings.to_string(b))
-	if testing.expect(t, msg != "", "300 full-length TXT records were accepted") {
-		testing.expect(t, strings.contains(msg, "at most"), "the message should name the limit")
-	}
+	expect_refused(t, answers_doc(strings.to_string(b)), "rewrites[0]", "at most")
 
 	// A handful of the same records is fine, the limit being about hundreds.
 	ok_rules := rules_from(t, `["TXT one", "TXT two", "TXT three"]`)
@@ -604,13 +519,9 @@ test_a_bad_answer_drops_its_rule :: proc(t: ^testing.T) {
 	}
 	// The rule with the bad answer is gone rather than standing with one answer
 	// missing; the rule after it is untouched.
-	for rule in cfg.rewrites {
-		testing.expectf(
-			t,
-			rule.domain != "example.com.",
-			"the rule with the unparseable answer was kept: %v",
-			rule,
-		)
+	if testing.expectf(t, len(cfg.rewrites) == 1, "wanted only other.example.: %v", cfg.rewrites) {
+		testing.expect_value(t, cfg.rewrites[0].domain, "other.example.")
+		testing.expect_value(t, cfg.rewrites[0].answers[0].v4, [4]u8{192, 168, 1, 51})
 	}
 
 	free_all(context.temp_allocator)
@@ -627,10 +538,7 @@ server chose is a mail domain that fails to verify with nothing in the log.
 @(test)
 test_rewrite_txt_string_length_limit :: proc(t: ^testing.T) {
 	long := strings.repeat("x", 256, context.temp_allocator)
-	msg := error_from(strings.concatenate({`["TXT `, long, `"]`}, context.temp_allocator))
-	if testing.expect(t, msg != "", "a 256-byte TXT string was accepted") {
-		testing.expect(t, strings.contains(msg, "255"), "the message should name the limit")
-	}
+	expect_refused(t, answers_doc(strings.concatenate({`["TXT `, long, `"]`}, context.temp_allocator)), "rewrites[0].answers[0]", "255")
 
 	// And 255 exactly is fine, the limit being inclusive.
 	ok_len := strings.repeat("x", 255, context.temp_allocator)
@@ -649,18 +557,12 @@ as `upstream.zones` and `rebind.allow_domains` refuse the root.
 */
 @(test)
 test_a_wildcard_on_the_root_is_refused :: proc(t: ^testing.T) {
-	_, err := load_string(
+	// The root refusal itself, not any other error on the same domain.
+	expect_refused(
+		t,
 		MINIMAL + "rewrites:\n  - domain: \"*.\"\n    answer: 192.168.1.50\n",
-		context.temp_allocator,
+		"rewrites[0].domain",
+		"rewrites every name",
 	)
-	if e, has := err.?; testing.expect(t, has, "a rewrite of every name was accepted") {
-		// The root refusal itself, not any other error on the same domain.
-		testing.expectf(
-			t,
-			strings.contains(e.messages[0], "rewrites[0].domain") && strings.contains(e.messages[0], "rewrites every name"),
-			"the message should refuse the root wildcard by name: %s",
-			e.messages[0],
-		)
-	}
 	free_all(context.temp_allocator)
 }
