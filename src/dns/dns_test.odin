@@ -24,12 +24,25 @@ a_answer :: proc(name: string, ttl: u32, last: u8 = 1) -> Record {
 }
 
 // Fails `t` for every allocation `track` still holds and for any bad free.
+// `testkit.expect_no_leaks` is the other packages' copy; `testkit` imports
+// this package, so its tests cannot import it.
 @(private)
 expect_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, loc := #caller_location) {
 	for _, entry in track.allocation_map {
 		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location, loc = loc)
 	}
 	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array), loc = loc)
+}
+
+// How many of `records` are of type OPT.
+@(private)
+count_opt_records :: proc(records: []Record) -> (n: int) {
+	for rec in records {
+		if rec.type == .OPT {
+			n += 1
+		}
+	}
+	return
 }
 
 @(test)
@@ -342,7 +355,8 @@ test_peek_helpers :: proc(t: ^testing.T) {
 	testing.expect_value(t, pq.type, Type.AAAA)
 
 	set_id_in_place(wire, 0x0001)
-	id2, _ := peek_id(wire)
+	id2, id_ok := peek_id(wire)
+	testing.expect(t, id_ok, "peek_id failed")
 	testing.expect_value(t, id2, u16(1))
 	free_all(context.temp_allocator)
 }
@@ -355,7 +369,8 @@ test_name_helpers :: proc(t: ^testing.T) {
 	testing.expect(t, name_equal_fold("WWW.Example.COM.", "www.example.com."), "fold compare failed")
 	testing.expect_value(t, name_trim_root("example.com."), "example.com")
 
-	c := name_canonical("Example.COM", context.temp_allocator)
+	c, c_ok := name_canonical("Example.COM", context.temp_allocator)
+	testing.expect(t, c_ok, "name_canonical failed")
 	testing.expect_value(t, c, "example.com.")
 	free_all(context.temp_allocator)
 }
@@ -627,6 +642,7 @@ recognises as an answer to its question with TC set.
 */
 @(test)
 test_truncated_response :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	query := Message {
 		id       = 0xbeef,
 		question = []Question{{name = "example.com.", type = .A, class = .IN}},
@@ -704,7 +720,6 @@ test_truncated_response :: proc(t: ^testing.T) {
 			testing.expectf(t, got[i] == 0, "%s: section count at byte %d is not zero", c.what, i)
 		}
 	}
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -718,11 +733,12 @@ Covers all three paths that build a locally-made answer: `make_response` (the
 decoded path), and the two that patch a header without decoding one,
 `error_response`'s malformed-query fallback and `truncated_response`. Pinned
 here because it is easy to reach for the opposite rule - tying RA to RD looks
-tempting next to the RD=0 refusal in `resolve_query`, and was in fact tried
-and reverted; this guards against trying it again.
+tempting next to the RD=0 refusal in `resolve_query`, and this holds the two
+apart.
 */
 @(test)
 test_ra_is_a_capability_flag_not_tied_to_rd :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	question := []Question{{name = "example.com.", type = .A, class = .IN}}
 
 	recursive := Message {
@@ -730,7 +746,10 @@ test_ra_is_a_capability_flag_not_tied_to_rd :: proc(t: ^testing.T) {
 		question = question,
 	}
 	recursive.flags.rd = true
-	resp := make_response(recursive, .No_Error, context.temp_allocator)
+	resp, rerr := make_response(recursive, .No_Error, context.temp_allocator)
+	if !testing.expect_value(t, rerr, mem.Allocator_Error.None) {
+		return
+	}
 	testing.expect(t, resp.flags.ra, "RA not set for a query that asked for recursion")
 
 	non_recursive := Message {
@@ -738,7 +757,10 @@ test_ra_is_a_capability_flag_not_tied_to_rd :: proc(t: ^testing.T) {
 		question = question,
 	}
 	non_recursive.flags.rd = false
-	refused := make_response(non_recursive, .Refused, context.temp_allocator)
+	refused, ferr := make_response(non_recursive, .Refused, context.temp_allocator)
+	if !testing.expect_value(t, ferr, mem.Allocator_Error.None) {
+		return
+	}
 	testing.expect(t, refused.flags.ra, "RA not set for a query that did not ask for recursion")
 
 	// The header-patching paths: built from a query's own bytes rather than a
@@ -766,8 +788,6 @@ test_ra_is_a_capability_flag_not_tied_to_rd :: proc(t: ^testing.T) {
 	trunc_no_rd, trunc_no_rd_ok := truncated_response(no_rd_wire, MAX_UDP_SIZE, context.temp_allocator)
 	testing.expect(t, trunc_no_rd_ok, "truncated_response built nothing for an RD=0 query")
 	testing.expect(t, trunc_no_rd[3] & 0x80 != 0, "RA not set in truncated_response for an RD=0 query")
-
-	free_all(context.temp_allocator)
 }
 
 @(test)
@@ -823,8 +843,8 @@ test_name_length_counts_the_root_octet :: proc(t: ^testing.T) {
 	_, _, terr := decode_name(too_long[:], 0, context.temp_allocator)
 	testing.expect_value(t, terr, Decode_Error.Name_Too_Long)
 
-	// The encoder is the other side of that same line, and it is the side the
-	// decoder was just made to agree with, so pin it too: the presentation form
+	// The encoder is the other side of that same line, so pin it too: the
+	// presentation form
 	// of those same five labels has to come back Name_Too_Long rather than a
 	// 256th octet.
 	presentation := make([dynamic]u8, 0, 256, context.temp_allocator)
@@ -848,7 +868,7 @@ name to point at - which is what an authoritative server does when it compresses
 the hostname of an AFSDB or the mailbox of an RP against a name it has already
 written.
 */
-@(private = "file")
+@(private)
 message_prefix :: proc(answers: int) -> (m: [dynamic]u8, ns_target: int) {
 	m = make([dynamic]u8, 0, 128, context.temp_allocator)
 	append(&m, 0x12, 0x34, 0x80, 0x00, 0x00, 0x01, u8(answers >> 8), u8(answers), 0x00, 0x00, 0x00, 0x00)
@@ -869,7 +889,7 @@ message_prefix :: proc(answers: int) -> (m: [dynamic]u8, ns_target: int) {
 }
 
 // An answer owned by example.com. carrying `rdata` verbatim.
-@(private = "file")
+@(private)
 append_answer :: proc(m: ^[dynamic]u8, type: Type, rdata: []u8) {
 	append(m, 0xc0, 0x0c)
 	append(m, u8(u16(type) >> 8), u8(u16(type)))
@@ -954,10 +974,10 @@ Re-encoding an answer keeps the hostname its AFSDB record named.
 An answer that has a cookie attached with no OPT record to rewrite, that is
 stripped of DNSSEC records for a client which did not ask for them, or that is
 shrunk to fit a UDP limit, goes out through the message writer rather than
-straight from the upstream's bytes. Before the RDATA was expanded, the pointer
-inside it survived into the new message and resolved against a byte that had
-nothing to do with the name it was written for, so the client was handed a
-plausible-looking answer naming the wrong host.
+straight from the upstream's bytes. A re-encode that did not expand the RDATA
+would carry the pointer inside it into the new message, where it resolves
+against a byte that has nothing to do with the name it was written for, and the
+client is handed a plausible-looking answer naming the wrong host.
 */
 @(test)
 test_raw_rdata_pointer_survives_reencode :: proc(t: ^testing.T) {
@@ -1356,6 +1376,7 @@ rather than modelled (issue #299).
 */
 @(test)
 test_a_single_name_rdata_is_bounded_by_its_rdlength :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	for type in ([]Type{.NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .NSAP_PTR}) {
 		// example.com. <type> with RDLENGTH 0, then stolen.example. A 192.0.2.1.
 		short := []u8{
@@ -1401,7 +1422,6 @@ test_a_single_name_rdata_is_bounded_by_its_rdlength :: proc(t: ^testing.T) {
 			testing.expectf(t, bytes.has_suffix(twire, []u8{0xde, 0xad, 0xbe, 0xef}), "%v: the trailing bytes were lost: % x", type, twire)
 		}
 	}
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -1410,10 +1430,11 @@ the decoder's standing posture for RDATA that does not add up (see
 `test_raw_rdata_that_cannot_be_walked_is_kept`), and the writer refuses it, the
 honest degradation `test_encode_refuses_a_modelled_type_holding_a_pointer`
 gives. What it must not do is finish the pointer with the next record's first
-byte. The name types reach this through #299's bound; MX always did.
+byte. The name types and MX reach this alike.
 */
 @(test)
 test_rdata_cut_off_inside_a_pointer_is_kept_and_not_written :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	cases := []struct {
 		type:  Type,
 		rdata: []u8,
@@ -1442,7 +1463,6 @@ test_rdata_cut_off_inside_a_pointer_is_kept_and_not_written :: proc(t: ^testing.
 		_, _, eerr := encode_message(msg, context.temp_allocator)
 		testing.expectf(t, eerr == .Bad_Rdata, "%v kept raw with its pointer: encoded with %v", c.type, eerr)
 	}
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -1523,27 +1543,27 @@ is below the root, and a dot escaped inside a label (`\.` from configuration,
 @(test)
 test_name_below_counts_labels_not_suffix_bytes :: proc(t: ^testing.T) {
 	Case :: struct {
-		name, zone:     string,
+		name, zone:         string,
 		below, at_or_below: bool,
 	}
 	cases := [?]Case {
-		{"www.example.com.", "example.com.", true, true},
-		{"WWW.Example.COM.", "example.com.", true, true},
-		{"example.com.", "example.com.", false, true},
-		{"notexample.com.", "example.com.", false, false},
-		{"example.org.", "example.com.", false, false},
-		{"com.", "example.com.", false, false},
+		{name = "www.example.com.", zone = "example.com.", below = true, at_or_below = true},
+		{name = "WWW.Example.COM.", zone = "example.com.", below = true, at_or_below = true},
+		{name = "example.com.", zone = "example.com.", below = false, at_or_below = true},
+		{name = "notexample.com.", zone = "example.com.", below = false, at_or_below = false},
+		{name = "example.org.", zone = "example.com.", below = false, at_or_below = false},
+		{name = "com.", zone = "example.com.", below = false, at_or_below = false},
 		// The root holds every name but itself.
-		{"www.example.com.", ".", true, true},
-		{"com.", ".", true, true},
-		{".", ".", false, true},
+		{name = "www.example.com.", zone = ".", below = true, at_or_below = true},
+		{name = "com.", zone = ".", below = true, at_or_below = true},
+		{name = ".", zone = ".", below = false, at_or_below = true},
 		// One label, "a.example", whose dot is escaped.
-		{"a\\.example.com.", "example.com.", false, false},
-		{"a\\046example.com.", "example.com.", false, false},
-		{"a\\.example.com.", "a\\.example.com.", false, true},
-		{"b.a\\.example.com.", "a\\.example.com.", true, true},
+		{name = "a\\.example.com.", zone = "example.com.", below = false, at_or_below = false},
+		{name = "a\\046example.com.", zone = "example.com.", below = false, at_or_below = false},
+		{name = "a\\.example.com.", zone = "a\\.example.com.", below = false, at_or_below = true},
+		{name = "b.a\\.example.com.", zone = "a\\.example.com.", below = true, at_or_below = true},
 		// An escaped backslash ends where it ends: the dot after it is real.
-		{"a\\\\.example.com.", "example.com.", true, true},
+		{name = "a\\\\.example.com.", zone = "example.com.", below = true, at_or_below = true},
 	}
 	for c in cases {
 		testing.expectf(t, name_below(c.name, c.zone) == c.below, "name_below(%q, %q) is %v", c.name, c.zone, !c.below)
@@ -1598,17 +1618,21 @@ with none gets none back.
 */
 @(test)
 test_make_response_echoes_one_question_at_most :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	two := Message {
 		id       = 0x6932,
 		question = []Question{{name = "a.example.", type = .A, class = .IN}, {name = "b.example.", type = .A, class = .IN}},
 	}
-	resp := make_response(two, .Form_Err, context.temp_allocator)
+	resp, rerr := make_response(two, .Form_Err, context.temp_allocator)
+	if !testing.expect_value(t, rerr, mem.Allocator_Error.None) {
+		return
+	}
 	if testing.expect_value(t, len(resp.question), 1) {
 		testing.expect_value(t, resp.question[0].name, "a.example.")
 	}
-	none := make_response(Message{id = 0x6933}, .Form_Err, context.temp_allocator)
+	none, nerr := make_response(Message{id = 0x6933}, .Form_Err, context.temp_allocator)
+	testing.expect_value(t, nerr, mem.Allocator_Error.None)
 	testing.expect_value(t, len(none.question), 0)
-	free_all(context.temp_allocator)
 }
 
 // A label ends at its unescaped dot, or at the name's end; an escape, `\X` or

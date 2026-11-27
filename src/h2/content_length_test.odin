@@ -36,16 +36,16 @@ test_a_request_is_held_to_its_content_length :: proc(t: ^testing.T) {
 		served:   bool,
 	}
 	cases := []Case {
-		{"a length its DATA adds up to", {"3"}, {"a", "bc"}, false, true},
-		{"one its DATA falls short of", {"100"}, {"abc"}, false, false},
-		{"one its DATA runs past", {"2"}, {"abc"}, false, false},
-		{"zero, with no DATA", {"0"}, nil, false, true},
-		{"five, with no DATA", {"5"}, nil, false, false},
-		{"a match ended by trailers", {"3"}, {"abc"}, true, true},
-		{"a mismatch ended by trailers", {"4"}, {"abc"}, true, false},
-		{"two equal lengths", {"3", "3"}, {"abc"}, false, false},
-		{"a length that is not digits", {"0x3"}, {"abc"}, false, false},
-		{"no length at all", nil, {"abc"}, false, true},
+		{what = "a length its DATA adds up to", lengths = {"3"}, data = {"a", "bc"}, trailers = false, served = true},
+		{what = "one its DATA falls short of", lengths = {"100"}, data = {"abc"}, trailers = false, served = false},
+		{what = "one its DATA runs past", lengths = {"2"}, data = {"abc"}, trailers = false, served = false},
+		{what = "zero, with no DATA", lengths = {"0"}, data = nil, trailers = false, served = true},
+		{what = "five, with no DATA", lengths = {"5"}, data = nil, trailers = false, served = false},
+		{what = "a match ended by trailers", lengths = {"3"}, data = {"abc"}, trailers = true, served = true},
+		{what = "a mismatch ended by trailers", lengths = {"4"}, data = {"abc"}, trailers = true, served = false},
+		{what = "two equal lengths", lengths = {"3", "3"}, data = {"abc"}, trailers = false, served = false},
+		{what = "a length that is not digits", lengths = {"0x3"}, data = {"abc"}, trailers = false, served = false},
+		{what = "no length at all", lengths = nil, data = {"abc"}, trailers = false, served = true},
 	}
 	for row in cases {
 		track: mem.Tracking_Allocator
@@ -95,19 +95,19 @@ test_a_response_is_held_to_its_content_length :: proc(t: ^testing.T) {
 		accepted: bool,
 	}
 	cases := []Case {
-		{"a length its DATA adds up to", "200", {"3"}, {"a", "bc"}, false, true},
-		{"one its DATA falls short of", "200", {"100"}, {"abc"}, false, false},
-		{"one its DATA runs past", "200", {"2"}, {"abc"}, false, false},
-		{"one with no DATA", "200", {"7"}, nil, false, false},
-		{"two equal lengths", "200", {"3", "3"}, {"abc"}, false, false},
-		{"a length that is not digits", "200", {"three"}, {"abc"}, false, false},
+		{what = "a length its DATA adds up to", status = "200", lengths = {"3"}, data = {"a", "bc"}, head = false, accepted = true},
+		{what = "one its DATA falls short of", status = "200", lengths = {"100"}, data = {"abc"}, head = false, accepted = false},
+		{what = "one its DATA runs past", status = "200", lengths = {"2"}, data = {"abc"}, head = false, accepted = false},
+		{what = "one with no DATA", status = "200", lengths = {"7"}, data = nil, head = false, accepted = false},
+		{what = "two equal lengths", status = "200", lengths = {"3", "3"}, data = {"abc"}, head = false, accepted = false},
+		{what = "a length that is not digits", status = "200", lengths = {"three"}, data = {"abc"}, head = false, accepted = false},
 		// Not digits, with no DATA for the length it does not have to differ
 		// from: refused for its form alone.
-		{"a length that is not digits, and no DATA", "200", {"x"}, nil, false, false},
-		{"a reply to HEAD", "200", {"100"}, nil, true, true},
-		{"a 204", "204", {"100"}, nil, false, true},
-		{"a 304", "304", {"100"}, nil, false, true},
-		{"no length at all", "200", nil, {"abc"}, false, true},
+		{what = "a length that is not digits, and no DATA", status = "200", lengths = {"x"}, data = nil, head = false, accepted = false},
+		{what = "a reply to HEAD", status = "200", lengths = {"100"}, data = nil, head = true, accepted = true},
+		{what = "a 204", status = "204", lengths = {"100"}, data = nil, head = false, accepted = true},
+		{what = "a 304", status = "304", lengths = {"100"}, data = nil, head = false, accepted = true},
+		{what = "no length at all", status = "200", lengths = nil, data = {"abc"}, head = false, accepted = true},
 	}
 	for row in cases {
 		track: mem.Tracking_Allocator
@@ -138,9 +138,8 @@ test_a_response_is_held_to_its_content_length :: proc(t: ^testing.T) {
 			testing.expectf(t, s.reset && !s.done, "%s: done %v, reset %v; want it failed", row.what, s.done, s.reset)
 			testing.expectf(t, saw_frame(&log, .Rst_Stream, 1) && log.rst_code == .Protocol_Error, "%s: no RST_STREAM(PROTOCOL_ERROR)", row.what)
 		}
-		delete(s.body)
 		delete_key(&c.streams, 1)
-		free(s, allocator)
+		client_stream_destroy(c, s)
 		client_done(t, c, &track, row.what, &log)
 	}
 
@@ -177,9 +176,8 @@ test_a_response_is_held_to_its_content_length :: proc(t: ^testing.T) {
 		if !row.malformed {
 			testing.expectf(t, s.status == 503 && s.retry_after == 30, "%s: head %d, retry-after %d, want 503 and 30 kept", row.what, s.status, s.retry_after)
 		}
-		delete(s.body)
 		delete_key(&c.streams, 1)
-		free(s, allocator)
+		client_stream_destroy(c, s)
 		client_done(t, c, &track, row.what, &log)
 	}
 }
@@ -218,9 +216,8 @@ test_data_past_the_content_length_is_refused_at_once :: proc(t: ^testing.T) {
 		testing.expect(t, ok, "client: the connection was dropped")
 		testing.expectf(t, s.reset && !s.done, "client: done %v, reset %v before the stream ended; want it failed", s.done, s.reset)
 		testing.expect(t, saw_frame(&log, .Rst_Stream, 1) && log.rst_code == .Protocol_Error, "client: no RST_STREAM(PROTOCOL_ERROR)")
-		delete(s.body)
 		delete_key(&c.streams, 1)
-		free(s, allocator)
+		client_stream_destroy(c, s)
 		client_done(t, c, &track, "client", &log)
 	}
 }

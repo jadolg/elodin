@@ -56,15 +56,8 @@ superseded_junk :: proc(wire: []u8) -> []u8 {
 // An RRSIG over the A record whose expiration passed an hour ago.
 @(private = "file")
 superseded_lapsed_rrsig :: proc() -> dns.Record {
-	expiration := u32(time.time_to_unix(time.now())) - 3600
-	data := make([]u8, 23, context.temp_allocator)
-	data[0], data[1], data[2], data[3] = 0, 1, 8, 2 // covers A, RSASHA256, 2 labels
-	dns.write_ttl_at(data, 4, 300)
-	dns.write_ttl_at(data, 8, expiration)
-	dns.write_ttl_at(data, 12, expiration - 30 * 86400)
-	// Key tag, the root as signer, and a signature nothing checks.
-	copy(data[16:], []u8{0x12, 0x34, 0, 0xde, 0xad, 0xbe, 0xef})
-	return dns.Record{name = STALE_NAME, type = .RRSIG, class = .IN, ttl = 300, data = dns.Rdata_Raw{data = data}}
+	expiration := u32(time.time_to_unix(time.now())) - 3600 // lint:allow wall-clock: an RRSIG's expiration is an instant on it
+	return dns.Record{name = STALE_NAME, type = .RRSIG, class = .IN, ttl = 300, data = rrsig_over(.A, expiration = expiration, original_ttl = 300)}
 }
 
 @(private = "file")

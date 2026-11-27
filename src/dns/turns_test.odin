@@ -78,7 +78,7 @@ test_decoding_gives_the_loop_turns :: proc(t: ^testing.T) {
 		heavy_read := 0
 		_, s.expanding_err = decode_message(expanding_answer(3900), context.temp_allocator, &heavy_read)
 		s.expanding = s.other_ran
-		release_against(&h, &heavy_read)
+		request_release(&heavy_read)
 		sync.sema_post(&s.done)
 	}, &s)
 

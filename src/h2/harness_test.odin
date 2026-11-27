@@ -28,14 +28,6 @@ untrack_allocations :: proc(track: ^mem.Tracking_Allocator) {
 	mem.tracking_allocator_destroy(track)
 }
 
-@(private)
-expect_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, what: string, loc := #caller_location) {
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%s: %d bytes leaked, allocated at %v", what, entry.size, entry.location, loc = loc)
-	}
-	testing.expectf(t, len(track.bad_free_array) == 0, "%s: %d bad frees", what, len(track.bad_free_array), loc = loc)
-}
-
 // RFC 7541 C.3.1: GET http / www.example.com, four fields.
 @(private)
 REQUEST_BLOCK :: "828684410f7777772e6578616d706c652e636f6d"
@@ -65,6 +57,25 @@ Frame_Log :: struct {
 	goaway_last: u32,
 	// Error code of the last RST_STREAM written.
 	rst_code:    Error_Code,
+	// Posted for each HEADERS written, for a test on another thread to wait on.
+	headers:     sync.Sema,
+}
+
+// The whole frame at `pos^` in `buf` and its body, moving `pos` past it; false at
+// the end, or at a frame whose body has not all arrived.
+@(private)
+next_frame :: proc(buf: []u8, pos: ^int) -> (h: Frame_Header, body: []u8, ok: bool) {
+	if pos^ + FRAME_HEADER_SIZE > len(buf) {
+		return
+	}
+	h = parse_frame_header(buf[pos^:]) or_return
+	end := pos^ + FRAME_HEADER_SIZE + h.length
+	if end > len(buf) {
+		return h, nil, false
+	}
+	body = buf[pos^ + FRAME_HEADER_SIZE:end]
+	pos^ = end
+	return h, body, true
 }
 
 // Logs every frame written. A client's preface is not a frame, and is skipped
@@ -79,23 +90,21 @@ log_write :: proc(user: rawptr, buf: []u8) -> bool {
 	if len(buf) >= len(PREFACE) && string(buf[:len(PREFACE)]) == PREFACE {
 		pos = len(PREFACE)
 	}
-	for pos + FRAME_HEADER_SIZE <= len(buf) {
-		h, ok := parse_frame_header(buf[pos:])
-		if !ok {
-			break
-		}
+	for h, body in next_frame(buf, &pos) {
 		append(&log.frames, h)
-		if h.type == .Window_Update && h.stream_id == 0 && h.length == 4 && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
-			log.credit += int(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
+		if h.type == .Headers {
+			sync.sema_post(&log.headers)
 		}
-		if h.type == .Goaway && pos + FRAME_HEADER_SIZE + 8 <= len(buf) {
-			log.goaway_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE + 4:]))
-			log.goaway_last = read_u32(buf[pos + FRAME_HEADER_SIZE:])
+		if h.type == .Window_Update && h.stream_id == 0 && len(body) == 4 {
+			log.credit += int(read_u32(body))
 		}
-		if h.type == .Rst_Stream && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
-			log.rst_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
+		if h.type == .Goaway && len(body) >= 8 {
+			log.goaway_code = Error_Code(read_u32(body[4:]))
+			log.goaway_last = read_u32(body)
 		}
-		pos += FRAME_HEADER_SIZE + h.length
+		if h.type == .Rst_Stream && len(body) >= 4 {
+			log.rst_code = Error_Code(read_u32(body))
+		}
 	}
 	return true
 }
@@ -160,15 +169,10 @@ log_headers :: proc(user: rawptr, buf: []u8) -> bool {
 	if len(buf) >= len(PREFACE) && string(buf[:len(PREFACE)]) == PREFACE {
 		pos = len(PREFACE)
 	}
-	for pos + FRAME_HEADER_SIZE <= len(buf) {
-		h, ok := parse_frame_header(buf[pos:])
-		if !ok || pos + FRAME_HEADER_SIZE + h.length > len(buf) {
-			break
-		}
+	for h, body in next_frame(buf, &pos) {
 		if h.type == .Headers && len(log.block) == 0 {
-			append(&log.block, ..buf[pos + FRAME_HEADER_SIZE:pos + FRAME_HEADER_SIZE + h.length])
+			append(&log.block, ..body)
 		}
-		pos += FRAME_HEADER_SIZE + h.length
 	}
 	return true
 }
@@ -195,7 +199,7 @@ conn_done :: proc(t: ^testing.T, c: ^Conn, track: ^mem.Tracking_Allocator, what:
 	}
 	conn_unref(c)
 	free_all(context.temp_allocator)
-	expect_no_leaks(t, track, what, loc)
+	testkit.expect_no_leaks(t, track, what, loc = loc)
 }
 
 // Ends a tracked client test: the log, the client, then the leak check.
@@ -206,7 +210,7 @@ client_done :: proc(t: ^testing.T, c: ^Client, track: ^mem.Tracking_Allocator, w
 	}
 	client_unref(c)
 	free_all(context.temp_allocator)
-	expect_no_leaks(t, track, what, loc)
+	testkit.expect_no_leaks(t, track, what, loc = loc)
 }
 
 /*
@@ -227,7 +231,7 @@ wait_for_waiter :: proc(c: ^loop.Cond, n := 1) -> bool {
 		if parked >= n {
 			return true
 		}
-		time.sleep(time.Millisecond)
+		time.sleep(time.Millisecond) // lint:allow the poll's interval; the deadline above bounds it, and a waiter parking posts nothing
 	}
 	return false
 }
@@ -281,26 +285,15 @@ serve_harness_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 serve_harness_write :: proc(user: rawptr, buf: []u8) -> bool {
 	h := cast(^Serve_Harness)user
 	append(&h.written, ..buf)
+	// A frame whose body has not all arrived ends the scan; the write that
+	// carries the rest scans it again.
 	pos := 0
-	for pos + FRAME_HEADER_SIZE <= len(h.written) {
-		fh, ok := parse_frame_header(h.written[pos:])
-		if !ok {
-			break
+	for fh, body in next_frame(h.written[:], &pos) {
+		if fh.type == .Goaway && len(body) >= 8 {
+			h.saw_goaway = true
+			h.code = Error_Code(read_u32(body[4:]))
+			h.last = read_u32(body)
 		}
-		// The frame's body has not all arrived yet; wait for the write that
-		// carries the rest.
-		if pos + FRAME_HEADER_SIZE + fh.length > len(h.written) {
-			break
-		}
-		if fh.type == .Goaway {
-			body := h.written[pos + FRAME_HEADER_SIZE:]
-			if len(body) >= 8 {
-				h.saw_goaway = true
-				h.code = Error_Code(read_u32(body[4:]))
-				h.last = read_u32(body)
-			}
-		}
-		pos += FRAME_HEADER_SIZE + fh.length
 	}
 	return true
 }
@@ -327,12 +320,7 @@ request_log_write :: proc(user: rawptr, buf: []u8) -> bool {
 		return true
 	}
 	pos := 0
-	for pos + FRAME_HEADER_SIZE <= len(buf) {
-		h, ok := parse_frame_header(buf[pos:])
-		if !ok {
-			break
-		}
-		body := buf[pos + FRAME_HEADER_SIZE:]
+	for h, body in next_frame(buf, &pos) {
 		#partial switch h.type {
 		case .Rst_Stream:
 			if len(body) >= 4 {
@@ -342,7 +330,6 @@ request_log_write :: proc(user: rawptr, buf: []u8) -> bool {
 		case .Goaway:
 			log.goaway = true
 		}
-		pos += FRAME_HEADER_SIZE + h.length
 	}
 	return true
 }
@@ -440,6 +427,16 @@ frame_bytes :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: []u8) 
 	return out[:]
 }
 
+// Marks `c` closed and wakes every response parked on it, as a connection going
+// away does, so a test's join cannot hang on a wait it already failed.
+@(private)
+close_conn :: proc(c: ^Conn) {
+	loop.lock(&c.mu)
+	c.closed = true
+	loop.cond_broadcast(&c.cond)
+	loop.unlock(&c.mu)
+}
+
 // A handler that releases its request and leaves the stream unanswered.
 @(private)
 destroying_handler :: proc(conn: ^Conn, req: ^Request) {
@@ -453,5 +450,9 @@ ignore_request :: proc(conn: ^Conn, req: ^Request) {
 
 // x-t: 1, a literal with incremental indexing: it becomes dynamic index 62, so
 // a decoder that skipped it falls out of step with the peer's encoder.
+// RST_STREAM's payload for CANCEL.
 @(private)
-TRAILER := [?]u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
+RST_CANCEL :: [4]u8{0, 0, 0, u8(Error_Code.Cancel)}
+
+@(private)
+TRAILER :: [?]u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}

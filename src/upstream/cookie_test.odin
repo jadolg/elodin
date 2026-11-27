@@ -235,9 +235,7 @@ test_upstream_cookie_strip_leaves_no_orphan_on_heap :: proc(t: ^testing.T) {
 	// The stripped reply is the caller's to free. Once it is gone, nothing the
 	// exchange put on the heap may remain.
 	delete(response, heap)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes orphaned on the heap, allocated at %v", entry.size, entry.location)
-	}
+	testkit.expect_no_leaks(t, &track, "the exchange's heap")
 	free_all(context.temp_allocator)
 }
 

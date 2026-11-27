@@ -6,7 +6,6 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
-import "elodin:loop"
 import "elodin:testkit"
 
 /*
@@ -217,7 +216,7 @@ test_an_entry_the_table_has_no_room_for_fails_the_block :: proc(t: ^testing.T) {
 	}
 	// The name, the value and the list's growth, in each run.
 	testing.expectf(t, refusals >= 3 * len(RUNS), "%d refusals", refusals)
-	expect_no_leaks(t, &track, "table entry without room")
+	testkit.expect_no_leaks(t, &track, "table entry without room")
 }
 
 /*
@@ -415,7 +414,7 @@ test_a_request_without_room_is_refused_not_served_short :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, counts[.Wrong] == 0, "%v", counts)
 	testing.expectf(t, counts[.Connection_Ended] > 0 && counts[.Stream_Refused] > 0 && counts[.Not_Made] > 0, "%v", counts)
-	expect_no_leaks(t, &track, "request without room")
+	testkit.expect_no_leaks(t, &track, "request without room")
 }
 
 /*
@@ -464,13 +463,7 @@ test_a_request_body_without_room_is_refused :: proc(t: ^testing.T) {
 		conn_unref(c)
 		delete(log.frames)
 	}
-	expect_no_leaks(t, &track, "request body without room")
-}
-
-// Takes the request and answers nothing, leaving its stream for the test to.
-@(private = "file")
-drop_request :: proc(conn: ^Conn, req: ^Request) {
-	request_destroy(conn, req)
+	testkit.expect_no_leaks(t, &track, "request body without room")
 }
 
 // The frames a response wrote, in order.
@@ -479,12 +472,8 @@ written_frames :: proc(h: ^Serve_Harness) -> (frames: [dynamic]Frame_Header, ok:
 	frames = make([dynamic]Frame_Header, 0, 4, context.allocator)
 	pos := 0
 	for pos < len(h.written) {
-		fh := parse_frame_header(h.written[pos:]) or_return
-		if pos + FRAME_HEADER_SIZE + fh.length > len(h.written) {
-			return
-		}
+		fh, _ := next_frame(h.written[:], &pos) or_return // lint:allow only the headers are kept
 		append(&frames, fh)
-		pos += FRAME_HEADER_SIZE + fh.length
 	}
 	return frames, true
 }
@@ -516,7 +505,7 @@ test_a_response_without_room_is_reset_not_cut_short :: proc(t: ^testing.T) {
 			h := Serve_Harness {
 				written = make([dynamic]u8, 0, 64, allocator),
 			}
-			c := make_conn(IO{user = &h, read = no_read, write = serve_harness_write}, drop_request, nil, allocator)
+			c := make_conn(IO{user = &h, read = no_read, write = serve_harness_write}, destroying_handler, nil, allocator)
 			if !testing.expect(t, c != nil, "cannot make the connection") {
 				delete(h.written)
 				return
@@ -579,7 +568,7 @@ test_a_response_without_room_is_reset_not_cut_short :: proc(t: ^testing.T) {
 	// HEADERS and two DATA frames, so a reset after none, one and two of them.
 	testing.expectf(t, len(reference) == 3, "%v", reference)
 	testing.expectf(t, resets >= 3, "%d resets", resets)
-	expect_no_leaks(t, &track, "response without room")
+	testkit.expect_no_leaks(t, &track, "response without room")
 }
 
 // A client with no room for itself is not made. Its preface needs no memory;
@@ -612,7 +601,7 @@ test_a_client_without_room_is_not_made :: proc(t: ^testing.T) {
 	testing.expect(t, saw_frame(&log, .Settings), "no SETTINGS")
 	client_unref(c)
 	delete(log.frames)
-	expect_no_leaks(t, &track, "client without room")
+	testkit.expect_no_leaks(t, &track, "client without room")
 }
 
 /*
@@ -703,7 +692,7 @@ test_a_response_without_room_fails_as_this_ends :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, refusals[0] > 0 && refusals[1] > 0, "%v refusals", refusals)
-	expect_no_leaks(t, &track, "response without room")
+	testkit.expect_no_leaks(t, &track, "response without room")
 }
 
 /*
@@ -828,7 +817,7 @@ test_a_request_without_room_is_not_sent_short :: proc(t: ^testing.T) {
 	// HEADERS, two DATA frames, and the timeout's RST_STREAM(CANCEL).
 	testing.expectf(t, len(reference) == 4, "%v", reference)
 	testing.expectf(t, refusals[0] > 0 && refusals[1] > 0, "%v refusals", refusals)
-	expect_no_leaks(t, &track, "request without room")
+	testkit.expect_no_leaks(t, &track, "request without room")
 }
 
 /*
@@ -864,7 +853,7 @@ test_hpack_state_without_room_ends_the_connection_as_this_ends :: proc(t: ^testi
 		}
 
 		slog: Frame_Log
-		sc := logged_conn(&slog, drop_request, allocator)
+		sc := logged_conn(&slog, destroying_handler, allocator)
 		sc.decoder.allocator = testkit.fail_nth(&f)
 		testing.expectf(t, !handle_headers(sc, h, c.block), "server: %v kept the connection", c.want)
 		testing.expect_value(t, slog.goaway_code, c.want)
@@ -912,7 +901,7 @@ test_control_frames_need_no_room :: proc(t: ^testing.T) {
 	slog, clog: Frame_Log
 	slog.frames = make([dynamic]Frame_Header, 0, 8, allocator)
 	clog.frames = make([dynamic]Frame_Header, 0, 8, allocator)
-	sc := make_conn(IO{user = &slog, read = no_read, write = log_write}, drop_request, nil, allocator)
+	sc := make_conn(IO{user = &slog, read = no_read, write = log_write}, destroying_handler, nil, allocator)
 	cc: ^Client
 	server_ok, client_ok: [5]bool
 	{
@@ -1000,7 +989,7 @@ test_a_header_block_continued_without_room_can_be_retried :: proc(t: ^testing.T)
 		conn_unref(c)
 		delete(log.frames)
 	}
-	expect_no_leaks(t, &track, "continuation without room")
+	testkit.expect_no_leaks(t, &track, "continuation without room")
 }
 
 /*
@@ -1065,7 +1054,7 @@ test_a_frame_the_server_has_no_room_to_read_leaves_its_request_retryable :: proc
 	}
 	testing.expectf(t, ended > 0, "no refusal ended the connection")
 	delete(input)
-	expect_no_leaks(t, &track, "frame without room to read")
+	testkit.expect_no_leaks(t, &track, "frame without room to read")
 }
 
 // A fragment the block has no room for leaves none of it behind, though the
@@ -1117,7 +1106,7 @@ test_credit_a_response_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T)
 	allocator := track_allocations(&track)
 	defer free_all(context.temp_allocator)
 	sig: Frame_Signal
-	c := make_conn(IO{user = &sig, read = no_read, write = signal_write}, drop_request, nil, allocator)
+	c := make_conn(IO{user = &sig, read = no_read, write = signal_write}, destroying_handler, nil, allocator)
 	if !testing.expect(t, c != nil, "cannot make the connection") {
 		return
 	}
@@ -1165,10 +1154,7 @@ test_credit_a_response_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T)
 	testing.expect(t, sent, "the second response never sent its body")
 	if !sent {
 		// Ends the second response's wait.
-		loop.lock(&c.mu)
-		c.closed = true
-		loop.cond_broadcast(&c.cond)
-		loop.unlock(&c.mu)
+		close_conn(c)
 	}
 	thread.join(ft)
 	thread.destroy(ft)
@@ -1179,7 +1165,7 @@ test_credit_a_response_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T)
 	testing.expect(t, !first.sent, "the first response was reported sent")
 	testing.expect_value(t, c.send_window, 0)
 	conn_unref(c)
-	expect_no_leaks(t, &track, "response credit passed on")
+	testkit.expect_no_leaks(t, &track, "response credit passed on")
 }
 
 /*
@@ -1192,7 +1178,7 @@ test_a_continue_with_no_room_is_skipped :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
 	allocator := track_allocations(&track)
 	log: Frame_Log
-	c := logged_conn(&log, drop_request, allocator)
+	c := logged_conn(&log, destroying_handler, allocator)
 	f := testkit.Fail_Nth {
 		backing = context.temp_allocator,
 	}

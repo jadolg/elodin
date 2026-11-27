@@ -99,7 +99,7 @@ OOM_MESSAGE := Message {
 		{name = "example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {192, 0, 2, 1}}},
 		{name = "example.com.", type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = []string{"hello", "world"}}},
 		{name = "long.example.com.", type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = OOM_LONG_TXT[:]}},
-		// Twenty labels, past the offsets `writer_init` reserves room for.
+		// More labels than the offsets `writer_init` reserves room for.
 		{name = "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {192, 0, 2, 3}}},
 		{name = "example.com.", type = .MX, class = .IN, ttl = 300, data = Rdata_MX{preference = 10, exchange = "mail.example.com."}},
 		{name = "example.com.", type = Type(65280), class = .IN, ttl = 300, data = Rdata_Raw{data = OOM_COOKIE[:]}},
@@ -176,8 +176,8 @@ fail_nth_proc :: proc(
 
 /*
 Run `build` in an arena of every size up to `OOM_SWEEP_MAX`, with the same arena
-as `context.temp_allocator` for the scratch the rebuilds take, and hand back
-whether every successful build matched `want`.
+as `context.temp_allocator` for the scratch the rebuilds take, and fail `t` where
+a successful build does not match `want`.
 */
 @(private = "file")
 oom_sweep :: proc(t: ^testing.T, what: string, want: []u8, build: proc(allocator: mem.Allocator) -> ([]u8, bool)) {
@@ -322,12 +322,9 @@ test_name_fold_with_no_memory :: proc(t: ^testing.T) {
 test_name_canonical_with_no_memory :: proc(t: ^testing.T) {
 	_, ok := name_canonical("Example.COM", mem.nil_allocator())
 	testing.expect(t, !ok)
-	cases := [?][2]string{{"", "."}, {".", "."}, {"A.b", "a.b."}, {"A.b.", "a.b."}, {"a..", "a.."}}
-	for c in cases {
-		got, built := name_canonical(c[0], context.temp_allocator)
-		testing.expect(t, built)
-		testing.expect_value(t, got, c[1])
-	}
+	// The spellings themselves are `test_name_canonical_is_the_decoders_spelling`'s.
+	got, built := name_canonical("A.b", context.temp_allocator)
+	testing.expect(t, built && got == "a.b.", "a name that canonicalises with room to spare did not")
 }
 
 @(test)
@@ -362,7 +359,10 @@ test_error_responses_at_every_budget :: proc(t: ^testing.T) {
 	// The wanted answers are built on the heap's temp arena, which outlives the
 	// sweeps: `error_response` leaves its message's OPT record in the allocator.
 	defer free_all(context.temp_allocator)
-	want_err, _ := error_response(query, decoded, .Serv_Fail, context.temp_allocator)
+	want_err, want_err_ok := error_response(query, decoded, .Serv_Fail, context.temp_allocator)
+	if !testing.expect(t, want_err_ok, "error_response built nothing with memory to spare") {
+		return
+	}
 	@(static) servfail: []u8
 	servfail = want_err
 	oom_sweep(t, "error_response", want_err, proc(a: mem.Allocator) -> ([]u8, bool) {
@@ -374,8 +374,8 @@ test_error_responses_at_every_budget :: proc(t: ^testing.T) {
 		// Or the header alone, where the encode ran dry and twelve bytes did not:
 		// the query's ID and a SERVFAIL, with nothing claimed behind them.
 		if built && len(out) == HEADER_SIZE {
-			id, _ := peek_id(out)
-			whole := peek_rcode(out) == .Serv_Fail && id == 0x1234 && out[2] & 0x80 != 0
+			id, id_ok := peek_id(out)
+			whole := id_ok && peek_rcode(out) == .Serv_Fail && id == 0x1234 && out[2] & 0x80 != 0
 			for b in out[4:] {
 				whole &&= b == 0
 			}
@@ -385,7 +385,10 @@ test_error_responses_at_every_budget :: proc(t: ^testing.T) {
 	})
 
 	// The header-only fallback, for a query that did not decode.
-	want_hdr, _ := error_response(query, {}, .Form_Err, context.temp_allocator)
+	want_hdr, want_hdr_ok := error_response(query, {}, .Form_Err, context.temp_allocator)
+	if !testing.expect(t, want_hdr_ok, "the header-only fallback built nothing with memory to spare") {
+		return
+	}
 	oom_sweep(t, "error_response fallback", want_hdr, proc(a: mem.Allocator) -> ([]u8, bool) {
 		return error_response(query, {}, .Form_Err, a)
 	})
@@ -438,7 +441,8 @@ test_an_extended_rcode_is_not_answered_with_the_header_alone :: proc(t: ^testing
 	mem.arena_init(&f.arena, backing)
 	bare, bare_built := error_response(nil, q, .Serv_Fail, first)
 	if testing.expect(t, bare_built && len(bare) == HEADER_SIZE, "a caller with no query bytes got no SERVFAIL") {
-		id, _ := peek_id(bare)
+		id, id_ok := peek_id(bare)
+		testing.expect(t, id_ok, "peek_id failed")
 		testing.expect_value(t, id, 0x4321)
 		testing.expect_value(t, peek_rcode(bare), Rcode.Serv_Fail)
 		testing.expect(t, bare[2] & 0x80 != 0, "the header built for it is not a response")

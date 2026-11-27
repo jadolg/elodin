@@ -95,12 +95,11 @@ test_cap_ttls_bounds_the_wire_and_spares_the_opt :: proc(t: ^testing.T) {
 /*
 Junk past the answer section does not stop the answer section being bounded.
 
-This is the case that decided the shape of `cap_ttls`. Records are laid out
-answer first, so by the time a walk goes wrong in an authority or additional
-section the records a client actually acts on have already been bounded.
-Refusing the whole message instead - which this did for a round - turned a
-mangled additional section into SERVFAIL for a name whose answer was clean,
-and `server` has three tests of its own saying it must not.
+Records are laid out answer first, so by the time a walk goes wrong in an
+authority or additional section the records a client actually acts on have
+already been bounded. `cap_ttls` keeps that bound rather than refusing the whole
+message, which would turn a mangled additional section into SERVFAIL for a name
+whose answer was clean.
 
 The offsets are taken before the header is mangled, because afterwards nothing
 in this package will walk the message far enough to find them again - which is

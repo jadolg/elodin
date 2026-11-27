@@ -16,7 +16,10 @@ age_into :: proc(c: ^Cache, key: string, lifetime: u32, left: time.Duration) -> 
 	if !put(c, key, wire, msg) {
 		return false
 	}
-	e := c.shards[0].entries[key]
+	e := entry_of(c, key)
+	if e == nil {
+		return false
+	}
 	e.expires = loop.moment_add(loop.moment_now(), left)
 	e.inserted = loop.moment_add(e.expires, -time.Duration(lifetime) * time.Second)
 	return true

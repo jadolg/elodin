@@ -93,8 +93,8 @@ test_setting_values_out_of_range_are_refused :: proc(t: ^testing.T) {
 	}{
 		{.Max_Frame_Size, DEFAULT_MAX_FRAME - 1, .Protocol_Error, true},
 		{.Max_Frame_Size, DEFAULT_MAX_FRAME, .No_Error, false},
-		{.Max_Frame_Size, 16777215, .No_Error, false},
-		{.Max_Frame_Size, 16777216, .Protocol_Error, true},
+		{.Max_Frame_Size, MAX_FRAME_SIZE_LIMIT, .No_Error, false},
+		{.Max_Frame_Size, MAX_FRAME_SIZE_LIMIT + 1, .Protocol_Error, true},
 		{.Initial_Window_Size, MAX_WINDOW, .No_Error, false},
 		{.Initial_Window_Size, MAX_WINDOW + 1, .Flow_Control_Error, true},
 		{.Header_Table_Size, max(u32), .No_Error, false},

@@ -22,10 +22,9 @@ GOAWAY, silence).
 
 // `stopping` exists because closing a socket does not reliably wake a thread
 // already blocked reading it from another thread on Linux (see
-// upstream/h2client.odin, which carries the production version of this same
-// fix): the client socket below carries a short receive timeout so its
-// reader polls for this flag instead of depending on close() to cut a read
-// short.
+// upstream/h2client.odin, which does the same): the client socket below
+// carries a short receive timeout so its reader polls for this flag instead of
+// depending on close() to cut a read short.
 @(private = "file")
 Test_Conn :: struct {
 	socket:   net.TCP_Socket,
@@ -45,8 +44,7 @@ test_io_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 		}
 		// See `netx.timed_out`: on Linux, SO_RCVTIMEO expiring on a
 		// blocking recv() is EAGAIN, which core:net reports as .Would_Block,
-		// not .Timeout. Only continuing on .Timeout made every poll tick race
-		// with client_request's own deadline as a spurious connection close.
+		// not .Timeout; either one is a poll tick, not a connection close.
 		if netx.timed_out(err) {
 			continue
 		}
@@ -82,7 +80,12 @@ test_dial_client :: proc(t: ^testing.T, bound: net.Endpoint) -> (c: ^Client, ct:
 		testing.expectf(t, false, "cannot dial the mock: %v", derr)
 		return nil, nil, nil, false
 	}
-	_ = net.set_option(sock, .Receive_Timeout, 200 * time.Millisecond)
+	// Without it the reader never polls `stopping`, and the join can hang.
+	if serr := net.set_option(sock, .Receive_Timeout, 200 * time.Millisecond); serr != nil {
+		net.close(sock)
+		testing.expectf(t, false, "cannot set the client's receive timeout: %v", serr)
+		return nil, nil, nil, false
+	}
 	tc = new(Test_Conn)
 	tc.socket = sock
 	io := IO{user = tc, read = test_io_read, write = test_io_write}
@@ -115,22 +118,6 @@ serve_socket :: proc(socket: net.TCP_Socket, handler: Handler) {
 	serve(hc)
 	conn_wait_idle(hc)
 	conn_unref(hc)
-}
-
-@(private = "file")
-Test_Server :: struct {
-	listener: net.TCP_Socket,
-	handler:  Handler,
-}
-
-@(private = "file")
-test_server_once :: proc(s: ^Test_Server) {
-	client, _, err := net.accept_tcp(s.listener)
-	if err != nil {
-		return
-	}
-	defer net.close(client)
-	serve_socket(client, s.handler)
 }
 
 /*
@@ -249,7 +236,7 @@ test_client_request_round_trip :: proc(t: ^testing.T) {
 	}
 	delete(resp.body, allocator)
 
-	expect_no_leaks(t, &track, "round trip")
+	testkit.expect_no_leaks(t, &track, "round trip")
 	free_all(context.temp_allocator)
 }
 
@@ -383,30 +370,22 @@ as the HTTP/1.1 client does (#525).
 @(test)
 test_client_response_past_max_body_is_too_large :: proc(t: ^testing.T) {
 	for extra in 0 ..< 2 {
-		listener, bound, lok := test_listen(t)
-		if !lok {
-			return
-		}
-		srv := Test_Server{listener = listener, handler = sized_handler}
-		server_thread := thread.create_and_start_with_poly_data(&srv, test_server_once)
 		// The client's own memory, the stream's body among it, is tracked; the
 		// response handed back is not.
 		heap := context.allocator
 		held: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&held, heap)
 		defer mem.tracking_allocator_destroy(&held)
-		c: ^Client
-		ct: ^thread.Thread
-		tc: ^Test_Conn
-		cok: bool
+		p := Peer{handler = sized_handler}
+		started: bool
 		{
 			context.allocator = mem.tracking_allocator(&held)
-			c, ct, tc, cok = test_dial_client(t, bound)
+			started = start_peer(t, &p)
 		}
-		if cok {
+		if started {
 			request := []u8{1, 2}
 			resp, err := client_request(
-				c,
+				p.c,
 				Client_Request{method = "POST", scheme = "https", authority = "mock.invalid", path = "/dns-query", body = request[:1 + extra]},
 				2 * time.Second,
 				heap,
@@ -424,12 +403,8 @@ test_client_response_past_max_body_is_too_large :: proc(t: ^testing.T) {
 				testing.expect_value(t, resp.status, 200)
 			}
 			delete(resp.body)
-			test_close_client(ct, tc)
-			client_unref(c)
+			end_peer(&p)
 		}
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
 	}
 	free_all(context.temp_allocator)
 }
@@ -459,7 +434,7 @@ test_client_oversized_response_during_upload_is_too_large :: proc(t: ^testing.T)
 		if !test_send(client, out[:]) {
 			return
 		}
-		_, _ = test_wait_for_frame_type(client, .Rst_Stream)
+		_, _ = test_wait_for_frame_type(client, .Rst_Stream) // lint:allow holds the connection open; the request's error below is the check
 	}
 	p := Peer{script = run_script}
 	if !start_peer(t, &p) {
@@ -498,10 +473,8 @@ expect_client_reset_as :: proc(t: ^testing.T, code: Error_Code, want: Client_Err
 		if !ok {
 			return
 		}
-		out := make([dynamic]u8, 0, 13, context.temp_allocator)
-		write_frame_header(&out, 4, .Rst_Stream, 0, 1)
-		append_u32(&out, u32(code))
-		_ = test_send(client, out[:])
+		payload := [4]u8{0, 0, 0, u8(code)}
+		_ = test_send(client, frame_bytes(.Rst_Stream, 0, 1, payload[:])) // lint:allow a lost frame shows as the request's error below
 	}
 	reset_code := code
 	p := Peer{script = run_script, data = &reset_code}
@@ -513,7 +486,7 @@ expect_client_reset_as :: proc(t: ^testing.T, code: Error_Code, want: Client_Err
 
 	_, err := client_request(
 		c,
-		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		GET_REQUEST,
 		2 * time.Second,
 	)
 	testing.expect_value(t, err, want)
@@ -530,11 +503,9 @@ test_client_goaway_refuses_a_stream_it_does_not_name :: proc(t: ^testing.T) {
 		if !ok {
 			return
 		}
-		out := make([dynamic]u8, 0, 17, context.temp_allocator)
-		write_frame_header(&out, 8, .Goaway, 0, 0)
-		append_u32(&out, 0)
-		append_u32(&out, u32(Error_Code.No_Error))
-		_ = test_send(client, out[:])
+		// Last stream 0, NO_ERROR.
+		payload: [8]u8
+		_ = test_send(client, frame_bytes(.Goaway, 0, 0, payload[:])) // lint:allow a lost frame shows as the request's error below
 	}
 	p := Peer{script = run_script}
 	if !start_peer(t, &p) {
@@ -545,7 +516,7 @@ test_client_goaway_refuses_a_stream_it_does_not_name :: proc(t: ^testing.T) {
 
 	_, err := client_request(
 		c,
-		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		GET_REQUEST,
 		2 * time.Second,
 	)
 	testing.expect_value(t, err, Client_Error.Refused)
@@ -575,7 +546,7 @@ test_client_takes_no_request_once_stream_ids_are_exhausted :: proc(t: ^testing.T
 
 	_, err := client_request(
 		c,
-		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		GET_REQUEST,
 		2 * time.Second,
 	)
 	testing.expect_value(t, err, Client_Error.Closed)
@@ -595,18 +566,16 @@ test_client_lets_a_pending_request_finish_when_stream_ids_are_exhausted :: proc(
 	// releases it, so that nothing but exhaustion can be what ends stream A
 	// early.
 	Script :: struct {
-		headers_seen: bool,
-		stop:         bool,
+		headers_seen: sync.Sema,
+		stop:         sync.Sema,
 	}
 	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
 		s := (^Script)(data)
 		// This is stream A's HEADERS; never respond to it.
 		if _, ok := test_wait_for_frame_type(client, .Headers); ok {
-			sync.atomic_store(&s.headers_seen, true)
+			sync.sema_post(&s.headers_seen)
 		}
-		for !sync.atomic_load(&s.stop) {
-			time.sleep(10 * time.Millisecond)
-		}
+		sync.sema_wait(&s.stop)
 	}
 	srv: Script
 	p := Peer{script = run_script, data = &srv}
@@ -617,8 +586,8 @@ test_client_lets_a_pending_request_finish_when_stream_ids_are_exhausted :: proc(
 	c := p.c
 	// Set before `end_peer` joins the peer, not just at the end of the happy
 	// path: an early return between here and there would otherwise leave
-	// run_script spinning on `stop` forever and that join hanging with it.
-	defer sync.atomic_store(&srv.stop, true)
+	// run_script waiting on `stop` forever and that join hanging with it.
+	defer sync.sema_post(&srv.stop)
 
 	// One id short of exhaustion: stream A's request takes the last valid id,
 	// so a second request right behind it is the one that trips the close.
@@ -635,7 +604,7 @@ test_client_lets_a_pending_request_finish_when_stream_ids_are_exhausted :: proc(
 		started := time.tick_now()
 		_, w.err = client_request(
 			w.c,
-			Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+			GET_REQUEST,
 			4 * time.Second,
 		)
 		w.elapsed = time.tick_since(started)
@@ -653,15 +622,13 @@ test_client_lets_a_pending_request_finish_when_stream_ids_are_exhausted :: proc(
 	}
 
 	// Wait for stream A's HEADERS to land and for A to park on its response.
-	for i := 0; i < 200 && !sync.atomic_load(&srv.headers_seen); i += 1 {
-		time.sleep(5 * time.Millisecond)
-	}
-	testing.expect(t, sync.atomic_load(&srv.headers_seen), "stream A's HEADERS frame was never observed")
+	seen := sync.sema_wait_with_timeout(&srv.headers_seen, time.Second)
+	testing.expect(t, seen, "stream A's HEADERS frame was never observed")
 	testing.expect(t, wait_for_waiter(&c.cond), "stream A never waited for its response")
 
 	_, berr := client_request(
 		c,
-		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		GET_REQUEST,
 		time.Second,
 	)
 	testing.expect_value(t, berr, Client_Error.Closed)
@@ -670,7 +637,7 @@ test_client_lets_a_pending_request_finish_when_stream_ids_are_exhausted :: proc(
 	testing.expect(t, wait_for_waiter(&c.cond), "stream A stopped waiting for its response")
 
 	// The peer hangs up; that, and not the exhaustion, ends stream A.
-	sync.atomic_store(&srv.stop, true)
+	sync.sema_post(&srv.stop)
 	thread.join(a)
 	testing.expect_value(t, w.err, Client_Error.Closed)
 	testing.expect(t, w.elapsed < 2 * time.Second, "the pending request rode out its own deadline after the peer hung up")
@@ -681,9 +648,9 @@ test_client_lets_a_pending_request_finish_when_stream_ids_are_exhausted :: proc(
 test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 	/*
 	The client advertises the RFC 9113 6.5.2 default MAX_FRAME_SIZE (16384) by
-	sending none, yet the reader loop bounded an incoming frame at the receive
-	window, 64x that. An upstream told one size and allowed another could send a
-	frame in between; the client should refuse it as a FRAME_SIZE_ERROR.
+	sending none, so the reader loop bounds an incoming frame at that size, not
+	at the receive window, 64x it. A frame in between is refused as a
+	FRAME_SIZE_ERROR.
 	*/
 	Script :: struct {
 		saw:  bool,
@@ -734,7 +701,7 @@ test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 
 	_, err := client_request(
 		c,
-		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		GET_REQUEST,
 		2 * time.Second,
 	)
 	testing.expect_value(t, err, Client_Error.Closed)
@@ -751,8 +718,8 @@ test_client_request_times_out_on_silence :: proc(t: ^testing.T) {
 	// Says nothing at all until the test is done with it, or for two seconds,
 	// after which it hangs up and a request still waiting ends as Closed.
 	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
-		_, _ = test_wait_for_frame_type(client, .Headers)
-		_ = sync.sema_wait_with_timeout((^sync.Sema)(data), 2 * time.Second)
+		_, _ = test_wait_for_frame_type(client, .Headers) // lint:allow silence follows either way; the request's timeout below is the check
+		_ = sync.sema_wait_with_timeout((^sync.Sema)(data), 2 * time.Second) // lint:allow the timeout is the way out when the test does not post
 	}
 	done: sync.Sema
 	p := Peer{script = run_script, data = &done}
@@ -766,7 +733,7 @@ test_client_request_times_out_on_silence :: proc(t: ^testing.T) {
 	started := time.tick_now()
 	_, err := client_request(
 		c,
-		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		GET_REQUEST,
 		200 * time.Millisecond,
 	)
 	elapsed := time.tick_since(started)
@@ -881,6 +848,7 @@ test_client_serve_takes_turns :: proc(t: ^testing.T) {
 		ran_at:  int,
 		started: bool,
 		opened:  bool,
+		spawned: bool,
 	}
 	feed := Feed {
 		ran_at = -1,
@@ -891,7 +859,7 @@ test_client_serve_takes_turns :: proc(t: ^testing.T) {
 			f.started = true
 			// Behind the reader on the ready list, so it runs only once the reader
 			// parks or yields.
-			_, _ = loop.spawn(loop.current_loop(), proc(data: rawptr) {
+			_, f.spawned = loop.spawn(loop.current_loop(), proc(data: rawptr) {
 				f := (^Feed)(data)
 				f.ran_at = f.frames
 			}, f)
@@ -931,19 +899,21 @@ test_client_serve_takes_turns :: proc(t: ^testing.T) {
 	job := Job {
 		c = c,
 	}
-	_, _ = loop.spawn(l, proc(data: rawptr) {
+	_, spawned := loop.spawn(l, proc(data: rawptr) {
 		j := (^Job)(data)
 		client_serve(j.c)
 		sync.sema_post(&j.done)
 	}, &job)
-	finished := sync.sema_wait_with_timeout(&job.done, 5 * time.Second)
+	finished := spawned && sync.sema_wait_with_timeout(&job.done, 5 * time.Second)
 	loop.stop(l)
 	thread.join(th)
 	thread.destroy(th)
 	loop.destroy(l)
 	client_unref(c)
 
+	testing.expect(t, spawned, "the reader was not spawned")
 	testing.expect(t, finished, "the reader did not finish")
+	testing.expect(t, feed.spawned, "the fiber beside the reader was not spawned")
 	// The premise: the reader never had to wait for a frame.
 	testing.expect_value(t, feed.frames, FRAMES)
 	testing.expectf(
@@ -978,7 +948,7 @@ test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
 	c.credit_owed = CREDIT_BATCH - 1
 	hook.armed = true
 	payload := []u8{'o', 'k'}
-	client_handle_data(c, Frame_Header{length = len(payload), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, payload)
+	testing.expect(t, client_handle_data(c, Frame_Header{length = len(payload), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, payload), "a frame the case builds on was refused")
 
 	testing.expect(t, hook.fired, "the retire hook never ran, so nothing was reproduced")
 	testing.expect(t, hook.retired != nil, "the stream was not retired")
@@ -1010,7 +980,7 @@ test_oversized_response_returns_connection_credit :: proc(t: ^testing.T) {
 
 	clear(&log.frames)
 	payload := make([]u8, MAX_BODY + 1, context.temp_allocator)
-	client_handle_data(c, Frame_Header{length = len(payload), type = .Data, stream_id = 1}, payload)
+	testing.expect(t, client_handle_data(c, Frame_Header{length = len(payload), type = .Data, stream_id = 1}, payload), "a frame the case builds on was refused")
 
 	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a response that was refused")
 
@@ -1022,10 +992,9 @@ test_oversized_response_returns_connection_credit :: proc(t: ^testing.T) {
 /*
 The client half of the same rule.
 
-`client_handle_window_update` refuses a window pushed past 2^31-1;
-`client_handle_settings` applied its retroactive delta to every open stream and
-checked nothing, so an upstream could take the shared multiplexed connection's
-streams past the maximum a byte at a time.
+`client_handle_window_update` refuses a window pushed past 2^31-1, and
+`client_handle_settings` refuses a retroactive delta that would take any open
+stream on the shared multiplexed connection past that maximum.
 */
 @(test)
 test_client_settings_window_change_is_bounded :: proc(t: ^testing.T) {
@@ -1064,9 +1033,9 @@ test_client_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 
 /*
 The client half of the same rule: RFC 9113 6.1 makes DATA on stream 0 a
-connection error of type PROTOCOL_ERROR. `client_handle_data` looked it up in
-the stream table and fell through same as any other miss, instead of
-recognizing the connection control stream can never hold one.
+connection error of type PROTOCOL_ERROR. `client_handle_data` refuses it before
+the stream table: the connection control stream never holds one, so it is not
+a miss like any other.
 */
 @(test)
 test_client_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
@@ -1138,9 +1107,9 @@ test_client_data_on_an_even_stream_is_rejected :: proc(t: ^testing.T) {
 /*
 The client half of the same half-closed rule: RFC 9113 5.1 allows a stream
 that already said END_STREAM only WINDOW_UPDATE, PRIORITY, or RST_STREAM
-after that. `client_handle_data` did not check `s.done` and appended straight
-to `s.body`, silently accepting more of a response the caller may already be
-reading as complete.
+after that. `client_handle_data` checks `s.done` before it appends to
+`s.body`, so it adds nothing to a response the caller may already be reading as
+complete.
 */
 @(test)
 test_client_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
@@ -1215,9 +1184,8 @@ test_client_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
 /*
 RFC 9113 6.2: HEADERS is only ever sent on a stream, never on the connection
 control stream - a connection error of type PROTOCOL_ERROR, the same as DATA
-on stream 0. `client_handle_headers` went straight to padding/priority
-stripping and HPACK decode with no such check, unlike the server's
-`handle_headers`.
+on stream 0. `client_handle_headers` refuses it, as the server's
+`handle_headers` does, before padding/priority stripping and HPACK decode.
 */
 @(test)
 test_client_headers_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
@@ -1246,10 +1214,9 @@ The HEADERS half of the same idle-stream rule `client_handle_data` got:
 an id this client never allocated - past `next_stream_id`, or even, since
 this client opens only odd ids and push is refused - is idle, and RFC 9113
 5.1 makes DATA or HEADERS on one a connection error of type PROTOCOL_ERROR.
-`client_handle_headers` had the stream-0 guard above but nothing past it, so
-a HEADERS block on an id that could never belong to a request still ran the
-full HPACK decode and was silently dropped by `client_finish_headers`'s
-not-found path.
+`client_handle_headers` refuses a HEADERS block on an id that could never
+belong to a request; it does not decode it and leave it to
+`client_finish_headers`'s not-found path.
 */
 @(test)
 test_client_headers_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
@@ -1322,11 +1289,11 @@ test_client_headers_after_end_stream_is_refused :: proc(t: ^testing.T) {
 
 /*
 `client_send_body` is the one place the client itself writes DATA on a stream
-mid-request. It checked `c.closed` and `s.reset` but not `s.done` or
-`s.rst_sent` - so an upstream answering early (HEADERS+END_STREAM while the
-request body is still uploading) and then drawing our own RST_STREAM with a
-stray DATA frame left the body-sending thread writing further DATA frames
-on a stream this connection had itself just reset.
+mid-request. It checks `s.done` and `s.rst_sent` as well as `c.closed` and
+`s.reset`: an upstream that answers early (HEADERS+END_STREAM while the
+request body is still uploading) and then draws our own RST_STREAM with a
+stray DATA frame stops the body-sending thread, which writes no DATA on a
+stream this connection has itself reset.
 */
 @(test)
 test_client_send_body_stops_once_the_stream_is_reset_by_us :: proc(t: ^testing.T) {
@@ -1391,10 +1358,10 @@ test_client_send_body_stops_successfully_on_an_early_response :: proc(t: ^testin
 /*
 RFC 9113 5.1 forbids sending frames other than PRIORITY on a stream already
 closed with RST_STREAM - which is exactly what `rst_sent` records. The
-`s.done` branch above sent RST_STREAM(NO_ERROR) unconditionally, so a stream
-already answered with RST_STREAM(STREAM_CLOSED) (`rst_sent` true, reached via
-`client_handle_data`'s or `client_finish_headers`'s own already_ended path)
-drew a second RST_STREAM from the very code meant to avoid exactly that.
+`s.done` branch sends RST_STREAM(NO_ERROR) only while `rst_sent` is false, so
+a stream already answered with RST_STREAM(STREAM_CLOSED) (`rst_sent` true,
+reached via `client_handle_data`'s or `client_finish_headers`'s own
+already_ended path) draws no second RST_STREAM.
 */
 @(test)
 test_client_send_body_does_not_double_rst_a_stream_already_reset_by_us :: proc(t: ^testing.T) {
@@ -1468,8 +1435,8 @@ test_client_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.
 	log: Frame_Log
 	c := logged_client(&log, allocator)
 
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	ok := client_handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst)
+	rst := RST_CANCEL
+	ok := client_handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst[:])
 	testing.expect(t, !ok, "RST_STREAM on stream 0 was accepted")
 
 	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for RST_STREAM on stream 0")
@@ -1478,13 +1445,12 @@ test_client_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.
 }
 
 /*
-`client_send_body`'s `s.done` branch read `rst_sent` to decide whether to
-send RST(NO_ERROR), but never set it - so the RST it just sent did not
-suppress the next one. `client_handle_data`'s `already_ended` is still true
-here via `s.done` alone, and its own `need_rst` needed `rst_sent` to stay
-false to fire again: a DATA frame the peer already had in flight then drew a
-second RST_STREAM(STREAM_CLOSED) on a stream this end had just closed with
-RST_STREAM(NO_ERROR) - which RFC 9113 5.1 forbids.
+`client_send_body`'s `s.done` branch sets `rst_sent` when it sends
+RST(NO_ERROR), so the RST it sends suppresses the next one.
+`client_handle_data`'s `already_ended` is true here via `s.done` alone, and its
+`need_rst` fires only while `rst_sent` is false: a DATA frame the peer already
+had in flight draws no second RST_STREAM(STREAM_CLOSED) on a stream this end
+has closed with RST_STREAM(NO_ERROR), which RFC 9113 5.1 forbids.
 */
 @(test)
 test_client_send_body_early_response_rst_suppresses_a_later_one :: proc(t: ^testing.T) {
@@ -1559,16 +1525,9 @@ test_client_send_body_flow_control_timeout_rst_is_not_forgotten :: proc(t: ^test
 
 /*
 `:status` is exactly three digits (RFC 9113 8.3.2), and this is where an
-upstream's word for how its answer went is taken.
-
-`strconv.parse_int` with its default base reads more than that: `0x1` is a 1,
-`1_0` is a 10, a sign is allowed, and a fourth digit is quietly dropped because
-the field is not measured. A response that says `0x2c8` where a conforming peer
-would say nothing intelligible then reads as 712 here - and further along, as
-whatever the number happens to fall on either side of a `== 200`.
-
-Anything that is not three digits is no status at all, and 0 is how that is
-already reported for a `:status` the peer left out.
+upstream's word for how its answer went is taken. Anything else, including hex,
+binary, separators, signs and a fourth digit, reads as 0, the value of a missing
+`:status`.
 */
 @(test)
 test_h2_status_is_three_digits :: proc(t: ^testing.T) {
@@ -1660,7 +1619,8 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 	defer client_unref(c)
 
 	body := []u8{0xde, 0xad, 0xbe, 0xef, 0x00}
-	_, _ = client_request(
+	// Nothing reads for the client, so no answer comes.
+	_, rerr := client_request(
 		c,
 		Client_Request {
 			method = "POST",
@@ -1672,6 +1632,7 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 		},
 		10 * time.Millisecond,
 	)
+	testing.expect_value(t, rerr, Client_Error.Timeout)
 
 	length, err := logged_field(&log, "content-length")
 	testing.expectf(t, err == .None, "the request's header block does not decode: %v", err)
@@ -1873,7 +1834,7 @@ test_client_answers_earn_back_the_control_budget :: proc(t: ^testing.T) {
 		}
 		doubled += 1
 	}
-	testing.expectf(t, doubled < 4 * MAX_CONTROL_FRAMES_PER_SECOND, "two PINGs per answer were never capped")
+	testing.expect(t, doubled < 4 * MAX_CONTROL_FRAMES_PER_SECOND, "two PINGs per answer were never capped")
 	client_done(t, c, &track, "client earned budget")
 }
 
@@ -1956,12 +1917,7 @@ Limit_Request :: struct {
 
 @(private = "file")
 limit_request_run :: proc(r: ^Limit_Request) {
-	req := Client_Request {
-		method    = "GET",
-		scheme    = "https",
-		authority = "mock.invalid",
-		path      = "/dns-query",
-	}
+	req := GET_REQUEST
 	_, r.err = client_request(r.c, req, 5 * time.Second)
 }
 
@@ -1979,17 +1935,19 @@ limit_opened :: proc(c: ^Client, log: ^Frame_Log) -> (n: int, last: u32) {
 	return
 }
 
-// Waits for the client to have written `want` HEADERS, for up to two seconds.
+// Waits for the client to have written `want` HEADERS, for up to two seconds
+// for each one still to come.
 @(private = "file")
 limit_wait_opened :: proc(c: ^Client, log: ^Frame_Log, want: int) -> (last: u32, ok: bool) {
-	for _ in 0 ..< 400 {
+	for {
 		n, id := limit_opened(c, log)
 		if n >= want {
 			return id, true
 		}
-		time.sleep(5 * time.Millisecond)
+		if !sync.sema_wait_with_timeout(&log.headers, 2 * time.Second) {
+			return 0, false
+		}
 	}
-	return 0, false
 }
 
 // Finishes a stream as a response with END_STREAM would.
@@ -2069,12 +2027,7 @@ test_client_wait_for_a_stream_slot_ends_on_deadline_or_close :: proc(t: ^testing
 		client_stream_destroy(c, held)
 	}
 
-	req := Client_Request {
-		method    = "GET",
-		scheme    = "https",
-		authority = "mock.invalid",
-		path      = "/dns-query",
-	}
+	req := GET_REQUEST
 	start := time.tick_now()
 	_, err := client_request(c, req, 100 * time.Millisecond)
 	testing.expect_value(t, err, Client_Error.Timeout)
@@ -2087,11 +2040,7 @@ test_client_wait_for_a_stream_slot_ends_on_deadline_or_close :: proc(t: ^testing
 	testing.expect(t, wait_for_waiter(&c.slot_cond), "the request never waited for a slot")
 	start = time.tick_now()
 	// What client_serve does on its way out.
-	loop.lock(&c.mu)
-	c.closed = true
-	loop.cond_broadcast(&c.cond)
-	loop.cond_broadcast(&c.slot_cond)
-	loop.unlock(&c.mu)
+	close_client(c)
 	thread.join(th)
 	thread.destroy(th)
 	testing.expect_value(t, r.err, Client_Error.Closed)
@@ -2122,7 +2071,7 @@ test_client_a_zero_stream_limit_with_nothing_open_closes_the_connection :: proc(
 	start := time.tick_now()
 	_, err := client_request(
 		c,
-		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		GET_REQUEST,
 		2 * time.Second,
 	)
 	testing.expect_value(t, err, Client_Error.Closed)
@@ -2438,13 +2387,22 @@ test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
 @(test)
 test_client_continuation_on_stream_zero_with_no_block_open_is_refused :: proc(t: ^testing.T) {
 	c := client_make(IO{read = no_read, write = discard_write})
-	// x-t: 1, with incremental indexing: a decoder that took it has an entry.
-	block := []u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
-	ok := client_handle_continuation(c, Frame_Header{length = len(block), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 0}, block)
+	// A decoder that took it has an entry.
+	block := TRAILER
+	ok := client_handle_continuation(c, Frame_Header{length = len(block), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 0}, block[:])
 	testing.expect(t, !ok, "a CONTINUATION on stream 0 with no block open was accepted")
 	testing.expect_value(t, len(c.decoder.entries), 0)
 	client_unref(c)
 	free_all(context.temp_allocator)
+}
+
+// The bare GET every request-shape case here sends.
+@(private = "file")
+GET_REQUEST :: Client_Request {
+	method    = "GET",
+	scheme    = "https",
+	authority = "mock.invalid",
+	path      = "/dns-query",
 }
 
 @(private = "file")
@@ -2500,7 +2458,7 @@ test_client_response_without_room_is_this_ends :: proc(t: ^testing.T) {
 	want := DOH_REQUEST.body
 	testing.expectf(t, string(resp.body) == string(want), "answered %x", resp.body)
 	delete(resp.body, allocator)
-	expect_no_leaks(t, &track, "response without room")
+	testkit.expect_no_leaks(t, &track, "response without room")
 	free_all(context.temp_allocator)
 }
 
@@ -2526,10 +2484,7 @@ test_client_request_cut_short_by_this_ends_memory_is_out_of_memory :: proc(t: ^t
 		}
 		// :status 200, and a literal with incremental indexing for the table.
 		block := []u8{0x88, 0x40, 3, 'x', '-', 'a', 1, 'b'}
-		out := make([dynamic]u8, 0, FRAME_HEADER_SIZE + len(block), context.temp_allocator)
-		write_frame_header(&out, len(block), .Headers, FLAG_END_HEADERS | FLAG_END_STREAM, h.stream_id)
-		append(&out, ..block)
-		if !test_send(client, out[:]) {
+		if !test_send(client, frame_bytes(.Headers, FLAG_END_HEADERS | FLAG_END_STREAM, h.stream_id, block)) {
 			return
 		}
 		for {
@@ -2668,7 +2623,7 @@ test_a_request_with_no_room_passes_its_slot_on :: proc(t: ^testing.T) {
 	c.allocator = allocator
 	loop.unlock(&c.mu)
 	client_unref(c)
-	expect_no_leaks(t, &track, "slot passed on")
+	testkit.expect_no_leaks(t, &track, "slot passed on")
 	free_all(context.temp_allocator)
 }
 
@@ -2744,7 +2699,7 @@ test_credit_a_body_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T) {
 	testing.expect_value(t, first.err, Client_Error.Out_Of_Memory)
 	testing.expect_value(t, second.err, Client_Error.Closed)
 	client_unref(c)
-	expect_no_leaks(t, &track, "credit passed on")
+	testkit.expect_no_leaks(t, &track, "credit passed on")
 	free_all(context.temp_allocator)
 }
 
@@ -2803,10 +2758,7 @@ test_a_head_reply_is_not_held_to_its_content_length :: proc(t: ^testing.T) {
 		// :status 200 (static index 8), and content-length: 100 by its name's
 		// static index, 28.
 		block := []u8{0x88, 0x0f, 0x0d, 3, '1', '0', '0'}
-		out := make([dynamic]u8, 0, FRAME_HEADER_SIZE + len(block), context.temp_allocator)
-		write_frame_header(&out, len(block), .Headers, FLAG_END_HEADERS | FLAG_END_STREAM, h.stream_id)
-		append(&out, ..block)
-		_ = test_send(client, out[:]) // lint:allow a lost reply shows as the request's error below
+		_ = test_send(client, frame_bytes(.Headers, FLAG_END_HEADERS | FLAG_END_STREAM, h.stream_id, block)) // lint:allow a lost reply shows as the request's error below
 	}
 	p := Peer{script = run_script}
 	if !start_peer(t, &p) {

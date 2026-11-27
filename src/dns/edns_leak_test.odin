@@ -8,41 +8,18 @@ A message whose OPT record is not the last one in the additional section, which
 is what sends `rewrite_edns_option` down its decode-and-re-encode path.
 */
 @(private = "file")
-opt_not_last :: proc(options: []EDNS_Option, allocator := context.temp_allocator) -> []u8 {
-	questions := make([]Question, 1, allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
-
+opt_not_last :: proc(options: []EDNS_Option) -> []u8 {
 	opt := make_opt(1232, false)
 	if options != nil {
 		opt.data = Rdata_OPT{options = options}
 	}
-
-	trailing := Record {
-		name  = "ns.example.com.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = Rdata_A{addr = {192, 0, 2, 1}},
-	}
-
-	additional := make([]Record, 2, allocator)
-	additional[0] = opt
-	additional[1] = trailing
-
-	m := Message {
-		id         = 0x1234,
-		question   = questions,
-		additional = additional,
-	}
-	wire, _, err := encode_message(m, allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_wire(
+		{
+			id = 0x1234,
+			question = []Question{{name = "example.com.", type = .A, class = .IN}},
+			additional = []Record{opt, a_answer("ns.example.com.", 60)},
+		},
+	)
 }
 
 /*
@@ -58,7 +35,6 @@ procedure keeps.
 @(test)
 test_remove_edns_option_frees_its_scratch :: proc(t: ^testing.T) {
 	wire := opt_not_last([]EDNS_Option{{code = u16(EDNS_Option_Code.Cookie), data = []u8{1, 2, 3, 4, 5, 6, 7, 8}}})
-	testing.expect(t, wire != nil, "could not build the query")
 
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)

@@ -69,7 +69,6 @@ dropping it is a shorter copy and a smaller ARCOUNT.
 @(test)
 test_remove_opt_cuts_a_trailing_record :: proc(t: ^testing.T) {
 	wire := answer_with(one_opt())
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	out, ok := remove_opt(wire, context.temp_allocator)
 	testing.expect(t, ok, "remove_opt failed")
@@ -113,7 +112,6 @@ test_remove_opt_rebuilds_around_a_record_after_it :: proc(t: ^testing.T) {
 		data  = Rdata_A{addr = {192, 0, 2, 9}},
 	}
 	wire := answer_with(additional)
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	out, ok := remove_opt(wire, context.temp_allocator)
 	testing.expect(t, ok, "remove_opt failed")
@@ -138,7 +136,6 @@ test_remove_opt_rebuilds_around_a_record_after_it :: proc(t: ^testing.T) {
 @(test)
 test_remove_opt_with_no_record_is_a_no_op :: proc(t: ^testing.T) {
 	wire := answer_with(nil)
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	out, ok := remove_opt(wire, context.temp_allocator)
 	testing.expect(t, ok, "remove_opt failed on a message with no OPT record")
@@ -163,7 +160,6 @@ because an answer that arrived without an OPT record arrived without signatures.
 @(test)
 test_ensure_opt_mints_a_bare_record :: proc(t: ^testing.T) {
 	wire := answer_with(nil)
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	out, ok := ensure_opt(wire, 1232, context.temp_allocator)
 	testing.expect(t, ok, "ensure_opt failed")
@@ -204,7 +200,6 @@ test_ensure_opt_leaves_an_existing_record_alone :: proc(t: ^testing.T) {
 		data = []u8{'x'},
 	}
 	wire := answer_with(one_opt(options))
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	out, ok := ensure_opt(wire, 4096, context.temp_allocator)
 	testing.expect(t, ok, "ensure_opt failed")
@@ -235,7 +230,6 @@ come back as the answer it was, not merely as one that still decodes.
 @(test)
 test_ensure_opt_and_remove_opt_round_trip :: proc(t: ^testing.T) {
 	wire := answer_with(nil)
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	minted, added := ensure_opt(wire, 1232, context.temp_allocator)
 	testing.expect(t, added, "ensure_opt failed")

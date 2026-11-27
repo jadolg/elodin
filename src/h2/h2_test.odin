@@ -7,7 +7,6 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
-import "elodin:loop"
 import "elodin:testkit"
 
 /*
@@ -199,17 +198,11 @@ test_frame_header_round_trip :: proc(t: ^testing.T) {
 
 	// The reserved top bit must be masked off on receipt.
 	out[5] |= 0x80
-	h2, _ := parse_frame_header(out[:])
+	h2, ok2 := parse_frame_header(out[:])
+	testing.expect(t, ok2, "parse failed with the reserved bit set")
 	testing.expect_value(t, h2.stream_id, u32(0x7fffffff))
 	free_all(context.temp_allocator)
 }
-
-/*
-The three tests below run against a tracking allocator rather than the temp
-allocator the rest of the file uses, because what they check is that a failed or
-abandoned request releases what it allocated. A leak here is reachable by any
-peer that can open a connection, so it is worth asserting on directly.
-*/
 
 @(test)
 test_decode_error_releases_partial_list :: proc(t: ^testing.T) {
@@ -226,7 +219,7 @@ test_decode_error_releases_partial_list :: proc(t: ^testing.T) {
 	testing.expect(t, err != .None, "an out-of-range index was accepted")
 
 	dynamic_table_destroy(&table)
-	expect_no_leaks(t, &track, "decode error")
+	testkit.expect_no_leaks(t, &track, "decode error")
 }
 
 @(test)
@@ -243,7 +236,10 @@ test_teardown_releases_parked_request :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "handle_headers failed")
 
 	s, found := c.streams[1]
-	testing.expect(t, found, "stream 1 was not created")
+	if !testing.expect(t, found, "stream 1 was not created") {
+		conn_done(t, c, &track, "parked request")
+		return
+	}
 	testing.expect(t, s.pending != nil, "no request was parked on the stream")
 
 	// The peer goes away here, which is all it takes.
@@ -258,7 +254,7 @@ test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 
 	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
 	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
@@ -273,11 +269,12 @@ test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
 }
 
 /*
-#303: MAX_BODY bounded a stream, not a connection. Every stream opened up to
-MAX_CONCURRENT and parked at MAX_BODY without END_STREAM, the credit for
-each frame handed straight back, and one connection held 8 MiB of bodies. Counted
-from the streams themselves rather than from `request_bytes`, so the test measures
-what is held and not the bookkeeping that is meant to bound it.
+MAX_BODY bounds a stream and MAX_CONN_REQUEST bounds a connection: every stream
+opened up to MAX_CONCURRENT and parked at MAX_BODY without END_STREAM, the
+credit for each frame handed straight back, holds no more than
+MAX_CONN_REQUEST of bodies between them. Counted from the streams themselves rather than from
+`request_bytes`, so the test measures what is held and not the bookkeeping that
+is meant to bound it.
 */
 @(test)
 test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
@@ -295,7 +292,7 @@ test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 		id := u32(2 * n + 1)
 		// About the body bound, not the stream-error budget it would spend.
 		c.control.frames = 0
-		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+		testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block), "a frame the case builds on was refused")
 		for _ in 0 ..< MAX_BODY / DEFAULT_MAX_FRAME {
 			// A peer stops sending on a stream once it is refused.
 			if _, open := c.streams[id]; !open {
@@ -397,7 +394,7 @@ test_answered_request_gives_its_charge_back :: proc(t: ^testing.T) {
 	c := make_conn(IO{read = no_read, write = discard_write}, destroying_handler, nil, allocator)
 
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 	body := make([]u8, MAX_BODY, context.temp_allocator)
 	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
 	testing.expect(t, ok, "handle_data failed")
@@ -443,8 +440,8 @@ test_a_response_carries_the_date_it_is_given :: proc(t: ^testing.T) {
 /*
 RFC 9113 6.1: DATA is only ever sent on a stream, never on the connection
 control stream, so one arriving with stream_id 0 is a connection error of
-type PROTOCOL_ERROR. `handle_headers` already checks this; `handle_data` did
-not, and fell through to look up a stream that can never be in the map.
+type PROTOCOL_ERROR. `handle_data` refuses it, as `handle_headers` does, before
+it looks up a stream that can never be in the map.
 */
 @(test)
 test_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
@@ -466,9 +463,8 @@ test_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
 /*
 RFC 9113 5.1: a stream id past the highest one this connection has ever opened
 is idle, and DATA is not among the frames idle accepts - a connection error of
-type PROTOCOL_ERROR, the same as stream 0. `handle_data` instead found nothing
-in the stream table and fell through the ordinary not-found path, handing back
-a connection WINDOW_UPDATE for a stream id that was never opened.
+type PROTOCOL_ERROR, the same as stream 0. `handle_data` refuses it rather than
+take the ordinary not-found path, which hands back a connection WINDOW_UPDATE.
 */
 @(test)
 test_data_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
@@ -522,10 +518,9 @@ test_data_on_an_even_stream_is_rejected :: proc(t: ^testing.T) {
 /*
 RFC 9113 5.1: a stream id at or below `last_stream_id` that is not in the
 table was opened and has since closed - a stream error of type STREAM_CLOSED,
-distinct from the idle case above. `handle_data` fell through the ordinary
-not-found path for this too, handing back a connection WINDOW_UPDATE and no
-RST_STREAM for a stream the peer had already been told, or could easily work
-out, was gone.
+distinct from the idle case. `handle_data` answers it with RST_STREAM, not
+with the ordinary not-found path's bare connection WINDOW_UPDATE, since the
+peer has been told, or can work out, that the stream is gone.
 */
 @(test)
 test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.T) {
@@ -543,8 +538,8 @@ test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	rst := RST_CANCEL
+	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst[:])
 	testing.expect(t, rok, "handle_frame failed")
 	_, still_open := c.streams[1]
 	testing.expect(t, !still_open, "an orphaned reset stream was not retired")
@@ -580,12 +575,12 @@ test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(
 	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	rst := RST_CANCEL
+	testing.expect(t, handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst[:]), "a frame the case builds on was refused")
 
 	body := []u8{'x'}
 	for _ in 0 ..< MAX_CLOSED_STREAM_RST {
-		handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+		testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 	}
 	testing.expect_value(t, c.closed_stream_rst_budget, 0)
 
@@ -595,7 +590,7 @@ test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA on a closed stream should still be tolerated once the budget is spent")
 
-	testing.expectf(t, !saw_frame(&log, .Rst_Stream), "an RST_STREAM was sent after the closed-stream budget was spent")
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "an RST_STREAM was sent after the closed-stream budget was spent")
 	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a frame that was refused")
 
 	conn_done(t, c, &track, "closed stream rst budget", &log)
@@ -619,9 +614,9 @@ test_data_in_flight_on_a_stream_this_end_reset_is_ignored :: proc(t: ^testing.T)
 	c := logged_conn(&log, ignore_request, allocator)
 
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
-	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	_, still_open := c.streams[1]
 	testing.expect(t, !still_open, "an oversized stream was not retired")
@@ -666,7 +661,7 @@ test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
 		case .Concurrency:
 			// Parked for their bodies, so all still open.
 			for _ in 0 ..< MAX_CONCURRENT {
-				handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+				testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block), "a frame the case builds on was refused")
 				id += 2
 			}
 		case .Room:
@@ -675,7 +670,7 @@ test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
 			// :method GET, :scheme http, and no :path.
 			block = []u8{0x82, 0x86}
 		}
-		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+		testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block), "a frame the case builds on was refused")
 		if cause == .Room {
 			c.request_bytes = 0
 		}
@@ -683,9 +678,9 @@ test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
 
 		body := []u8{'x'}
 		for _ in 0 ..< 3 {
-			handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
+			testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body), "a frame the case builds on was refused")
 		}
-		handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = id}, body)
+		testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = id}, body), "a frame the case builds on was refused")
 		testing.expectf(t, count_frames(&log, .Rst_Stream, id) == 1, "%v: RST_STREAM frames after the body in flight: %d, want 1", cause, count_frames(&log, .Rst_Stream, id))
 		testing.expectf(t, c.closed_stream_rst_budget == MAX_CLOSED_STREAM_RST, "%v: closed_stream_rst_budget %d, want %d", cause, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
 
@@ -709,14 +704,13 @@ test_trailers_in_flight_on_a_stream_this_end_reset_are_decoded_and_ignored :: pr
 	c := logged_conn(&log, ignore_request, allocator)
 
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
-	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	clear(&log.frames)
 
-	// x-t: 1, literal with incremental indexing: becomes dynamic index 62.
-	trailer := []u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
+	trailer := TRAILER
 	ok := handle_headers(c, Frame_Header{length = 3, type = .Headers, flags = FLAG_END_STREAM, stream_id = 1}, trailer[:3])
 	ok = ok && handle_continuation(c, Frame_Header{length = len(trailer) - 3, type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 1}, trailer[3:])
 	testing.expect(t, ok, "trailers in flight on a stream this end reset dropped the connection")
@@ -748,10 +742,10 @@ test_headers_after_drawing_stream_closed_is_a_connection_error :: proc(t: ^testi
 
 	block := request_block()
 	body := []u8{'x'}
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
-	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
+	rst := RST_CANCEL
+	testing.expect(t, handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst[:]), "a frame the case builds on was refused")
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	testing.expect(t, !handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82}), "HEADERS on a stream the peer reset was accepted")
 
@@ -774,14 +768,14 @@ test_a_reset_id_the_peer_then_ends_takes_no_header_block :: proc(t: ^testing.T) 
 
 		block := request_block()
 		c.request_bytes = MAX_CONN_REQUEST
-		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+		testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 		c.request_bytes = 0
 		if end_with_rst {
-			rst := []u8{0, 0, 0, 8} // CANCEL
-			handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+			rst := RST_CANCEL
+			testing.expect(t, handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst[:]), "a frame the case builds on was refused")
 		} else {
 			body := []u8{'x'}
-			handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
+			testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body), "a frame the case builds on was refused")
 		}
 		ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82})
 		testing.expectf(t, !ok, "end_with_rst=%v: a header block after the peer ended the stream was accepted", end_with_rst)
@@ -805,7 +799,7 @@ test_a_block_without_end_stream_on_a_reset_id_is_a_connection_error :: proc(t: ^
 
 	block := request_block()
 	c.request_bytes = MAX_CONN_REQUEST
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 	c.request_bytes = 0
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, !ok, "a block without END_STREAM on a reset id was taken as trailers")
@@ -839,7 +833,7 @@ test_a_stream_refused_on_its_end_stream_is_not_remembered :: proc(t: ^testing.T)
 		switch cause {
 		case .Concurrency:
 			for _ in 0 ..< MAX_CONCURRENT {
-				handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+				testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block), "a frame the case builds on was refused")
 				id += 2
 			}
 		case .Room:
@@ -849,11 +843,11 @@ test_a_stream_refused_on_its_end_stream_is_not_remembered :: proc(t: ^testing.T)
 		case .Oversized:
 			flags = FLAG_END_HEADERS
 		}
-		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = flags, stream_id = id}, block)
+		testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = flags, stream_id = id}, block), "a frame the case builds on was refused")
 		c.request_bytes = 0
 		if cause == .Oversized {
 			big := make([]u8, MAX_BODY + 1, context.temp_allocator)
-			handle_data(c, Frame_Header{length = len(big), type = .Data, flags = FLAG_END_STREAM, stream_id = id}, big)
+			testing.expect(t, handle_data(c, Frame_Header{length = len(big), type = .Data, flags = FLAG_END_STREAM, stream_id = id}, big), "a frame the case builds on was refused")
 		}
 		testing.expectf(t, count_frames(&log, .Rst_Stream, id) == 1, "%v: RST_STREAM frames: %d, want 1", cause, count_frames(&log, .Rst_Stream, id))
 		ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}, []u8{0x82})
@@ -880,9 +874,9 @@ test_headers_on_a_reset_stream_still_being_answered_are_ignored :: proc(t: ^test
 	defer conn_unref(c)
 
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block), "a frame the case builds on was refused")
 	body := []u8{'x'}
-	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	s := c.streams[1]
 
@@ -912,20 +906,20 @@ test_a_reset_id_pushed_out_of_the_ring_falls_back_to_the_budget :: proc(t: ^test
 
 	block := request_block()
 	big := make([]u8, MAX_BODY + 1, context.temp_allocator)
-	open_and_overflow :: proc(c: ^Conn, id: u32, block, big: []u8) {
-		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
-		handle_data(c, Frame_Header{length = len(big), type = .Data, stream_id = id}, big)
+	open_and_overflow :: proc(t: ^testing.T, c: ^Conn, id: u32, block, big: []u8) {
+		testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block), "a frame the case builds on was refused")
+		testing.expect(t, handle_data(c, Frame_Header{length = len(big), type = .Data, stream_id = id}, big), "a frame the case builds on was refused")
 	}
 	// Streams 1 and 3 first, then enough after them to push out 1 but not 3.
 	for i in 0 ..< RESET_IDS + 1 {
-		open_and_overflow(c, u32(2 * i + 1), block, big)
+		open_and_overflow(t, c, u32(2 * i + 1), block, big)
 		c.control = {}
 	}
 	clear(&log.frames)
 	body := []u8{'x'}
-	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body)
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body), "a frame the case builds on was refused")
 	testing.expect_value(t, count_frames(&log, .Rst_Stream, 3), 0)
-	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST - 1)
 	free_all(context.temp_allocator)
@@ -934,8 +928,8 @@ test_a_reset_id_pushed_out_of_the_ring_falls_back_to_the_budget :: proc(t: ^test
 /*
 RFC 9113 5.1: once a stream is half-closed (remote), the peer has said it is
 done sending, and anything but WINDOW_UPDATE, PRIORITY, or RST_STREAM from it
-is a stream error of type STREAM_CLOSED. `handle_data` instead appended
-straight to `s.body`, silently accepting a body that was already complete.
+is a stream error of type STREAM_CLOSED. `handle_data` refuses it before it
+appends to `s.body`, so a body that is already complete takes nothing more.
 */
 @(test)
 test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
@@ -1011,8 +1005,8 @@ test_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, ok, "handle_headers failed")
 
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	rst := RST_CANCEL
+	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst[:])
 	testing.expect(t, rok, "handle_frame failed")
 
 	live, open := c.streams[1]
@@ -1112,8 +1106,7 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	A DATA frame arriving for a stream must not write through a pointer the
 	reader thread picked up before it released the lock, whoever retired the
 	stream in between - here, nothing so far has dispatched a handler for it,
-	so the request is still parked; `test_data_after_end_stream_is_refused`
-	covers the same race for a stream a handler already owns.
+	so the request is still parked.
 	*/
 	track: mem.Tracking_Allocator
 	allocator := track_allocations(&track)
@@ -1140,7 +1133,7 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	// One byte short of a batch, so this DATA's credit is written.
 	c.credit_owed = CREDIT_BATCH - 1
 	body := []u8{'x'}
-	handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body), "a frame the case builds on was refused")
 
 	testing.expect(t, hook.fired, "the close hook never ran, so nothing was reproduced")
 	testing.expect(t, hook.closed != nil, "the stream was not retired")
@@ -1167,9 +1160,9 @@ A dynamic table size update may not exceed the size this end advertised.
 
 RFC 7541 6.3: "The new maximum size MUST be lower than or equal to the limit
 determined by the protocol using HPACK", and 4.2 makes a larger value a
-decoding error. The limit here is 4096 - what `dynamic_table_init` is given on
-both the server and the client connection, and what SETTINGS_HEADER_TABLE_SIZE
-states.
+decoding error. The limit here is DEFAULT_HEADER_TABLE_SIZE - what
+`dynamic_table_init` is given on both the server and the client connection, and
+what SETTINGS_HEADER_TABLE_SIZE states.
 
 The decoder bounds an update by the number the table was built with, not by a
 constant of its own.
@@ -1181,7 +1174,7 @@ record.
 */
 @(test)
 test_dynamic_table_update_is_bounded_by_the_advertised_limit :: proc(t: ^testing.T) {
-	LIMIT :: 4096
+	LIMIT :: DEFAULT_HEADER_TABLE_SIZE
 
 	Case :: struct {
 		size:     int,
@@ -1341,11 +1334,14 @@ test_reset_stream_is_retired :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "handle_headers failed")
 
 	s, found := c.streams[1]
-	testing.expect(t, found, "stream 1 was not created")
+	if !testing.expect(t, found, "stream 1 was not created") {
+		conn_done(t, c, &track, "reset stream")
+		return
+	}
 	testing.expect(t, s.pending != nil, "no request was parked on the stream")
 
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	rst := RST_CANCEL
+	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst[:])
 	testing.expect(t, rok, "handle_frame(RST_STREAM) failed")
 
 	_, still_open := c.streams[1]
@@ -1379,8 +1375,8 @@ test_rst_stream_with_a_bad_frame_size_is_a_connection_error :: proc(t: ^testing.
 /*
 RFC 9113 6.4: RST_STREAM always names a stream; stream 0 is a connection
 error of type PROTOCOL_ERROR, the same as every other frame this package
-checks for it. Unguarded, this looked up `c.streams[0]` - always a miss -
-and returned true as if a peer sending it meant nothing in particular.
+checks for it, refused before any lookup of `c.streams[0]`, which is always a
+miss.
 */
 @(test)
 test_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.T) {
@@ -1390,8 +1386,8 @@ test_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.T) {
 	log: Frame_Log
 	c := logged_conn(&log, ignore_request, allocator)
 
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	ok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst)
+	rst := RST_CANCEL
+	ok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst[:])
 	testing.expect(t, !ok, "RST_STREAM on stream 0 was accepted")
 
 	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for RST_STREAM on stream 0")
@@ -1410,7 +1406,7 @@ test_reset_streams_do_not_exhaust_concurrency :: proc(t: ^testing.T) {
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
-	rst := []u8{0, 0, 0, 8} // CANCEL
+	rst := RST_CANCEL
 	for i in 0 ..< MAX_CONCURRENT {
 		block := request_block()
 		id := u32(1 + 2 * i)
@@ -1419,7 +1415,7 @@ test_reset_streams_do_not_exhaust_concurrency :: proc(t: ^testing.T) {
 			Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id},
 			block,
 		)
-		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = id}, rst)
+		testing.expect(t, handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = id}, rst[:]), "a frame the case builds on was refused")
 	}
 
 	testing.expectf(t, len(c.streams) == 0, "%d reset streams are still held on the connection", len(c.streams))
@@ -1463,8 +1459,8 @@ test_reset_stream_with_a_handler_is_left_for_it :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, ok, "handle_headers failed")
 
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	rst := RST_CANCEL
+	testing.expect(t, handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst[:]), "a frame the case builds on was refused")
 
 	live, open := c.streams[1]
 	testing.expect(t, open, "a dispatched stream was retired out from under its handler")
@@ -1486,14 +1482,14 @@ test_reset_stream_with_a_handler_is_left_for_it :: proc(t: ^testing.T) {
 @(private = "file")
 Respond_Ctx :: struct {
 	conn: ^Conn,
-	done: bool,
+	done: sync.Sema,
 }
 
 @(private = "file")
 respond_worker :: proc(r: ^Respond_Ctx) {
 	body := []u8{1, 2, 3, 4}
 	respond(r.conn, 1, Response{status = 200, content_type = "application/dns-message", body = body})
-	sync.atomic_store(&r.done, true)
+	sync.sema_post(&r.done)
 }
 
 @(test)
@@ -1527,19 +1523,12 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 	worker := thread.create_and_start_with_poly_data(&r, respond_worker)
 
 	// Generously past the timeout above, and still far short of forever.
-	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
-	for !sync.atomic_load(&r.done) && time.tick_diff(time.tick_now(), deadline) > 0 {
-		time.sleep(10 * time.Millisecond)
-	}
-	finished := sync.atomic_load(&r.done)
+	finished := sync.sema_wait_with_timeout(&r.done, 5 * time.Second)
 	testing.expect(t, finished, "respond never gave up waiting for a window that was never granted")
 
 	if !finished {
 		// Release it so the suite can finish rather than hang on the join.
-		loop.lock(&c.mu)
-		c.closed = true
-		loop.cond_broadcast(&c.cond)
-		loop.unlock(&c.mu)
+		close_conn(c)
 	}
 	thread.join(worker)
 	thread.destroy(worker)
@@ -1548,11 +1537,10 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 }
 
 /*
-Setting `cancelled` without waking anyone parked on it just relocates the
-problem the test above covers: a handler stuck in `write_body`'s no-credit
-wait only re-reads `cancelled` when it wakes, and nothing woke it, so it slept
-out the full `write_timeout` on a stream already known dead instead of giving
-up the moment the violation was seen.
+Setting `cancelled` also wakes whoever is parked on it: a handler stuck in
+`write_body`'s no-credit wait only re-reads `cancelled` when it wakes, so it
+gives up the moment the violation is seen rather than sleeping out the full
+`write_timeout` on a stream already known dead.
 */
 @(test)
 test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
@@ -1581,22 +1569,15 @@ test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 	testing.expect(t, wait_for_waiter(&c.cond), "the responder never parked waiting for credit")
 
 	body := []u8{'x'}
-	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 
 	// Well short of write_timeout: a broadcast wakes it in microseconds, so
 	// anything past a few hundred milliseconds means nothing woke it at all.
-	deadline := time.tick_add(time.tick_now(), 1 * time.Second)
-	for !sync.atomic_load(&r.done) && time.tick_diff(time.tick_now(), deadline) > 0 {
-		time.sleep(10 * time.Millisecond)
-	}
-	finished := sync.atomic_load(&r.done)
+	finished := sync.sema_wait_with_timeout(&r.done, 1 * time.Second)
 	testing.expect(t, finished, "the parked responder was not woken by the violation that cancelled its stream")
 
 	if !finished {
-		loop.lock(&c.mu)
-		c.closed = true
-		loop.cond_broadcast(&c.cond)
-		loop.unlock(&c.mu)
+		close_conn(c)
 	}
 	thread.join(worker)
 	thread.destroy(worker)
@@ -1607,11 +1588,10 @@ test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 /*
 `write_body`'s own flow-control deadline sends RST_STREAM(.Cancel) - the same
 kind of one-shot RST_STREAM `handle_data`'s already_ended path sends, gated
-on `cancelled` there specifically so a peer cannot draw two. `write_body`
-sent its RST without setting `cancelled`, so a DATA frame landing in the
-window between that RST and `respond`'s `close_stream` would still find
-`cancelled == false` and send a second RST_STREAM on a stream this end had
-just reset.
+on `cancelled` there specifically so a peer cannot draw two. `write_body` sets
+`cancelled` with its RST, so a DATA frame landing in the window between that
+RST and `respond`'s `close_stream` finds `cancelled` set and sends no second
+RST_STREAM on a stream this end has just reset.
 */
 @(test)
 test_write_body_deadline_marks_the_stream_cancelled :: proc(t: ^testing.T) {
@@ -1678,11 +1658,11 @@ test_oversized_body_returns_connection_credit :: proc(t: ^testing.T) {
 	c := logged_conn(&log, ignore_request, allocator)
 
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 
 	clear(&log.frames)
 	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
-	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 
 	testing.expect(
 		t,
@@ -1699,10 +1679,10 @@ and the result of that adjustment has to be checked as well as the value itself.
 
 RFC 9113 section 6.9.2 makes a flow-control window pushed past 2^31-1 a
 connection error of type FLOW_CONTROL_ERROR. `handle_window_update` checks for
-exactly that, and this path applied its delta and looked at nothing, so the two
-routes to the same window disagreed about the same limit. The guard that is
-there only refuses a settings *value* over the maximum, which does not stop the
-accumulated window from getting there a byte at a time.
+exactly that, and this path checks the window its delta produces as well, so
+the two routes to the same window agree about the same limit. Refusing a
+settings *value* over the maximum alone does not stop the accumulated window
+from getting there a byte at a time.
 */
 @(test)
 test_settings_window_change_is_bounded :: proc(t: ^testing.T) {
@@ -1713,7 +1693,7 @@ test_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 	c := logged_conn(&log, ignore_request, allocator)
 
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 
 	// Exactly the maximum is allowed, and is where a peer parks a stream before
 	// nudging it over with a settings change.
@@ -1933,21 +1913,12 @@ test_data_on_a_refused_stream_returns_connection_credit :: proc(t: ^testing.T) {
 // Malformed requests (RFC 9113 sections 8.2 and 8.3)
 // ---------------------------------------------------------------------------
 
-// HPACK literal without indexing, new name: no table state, so a block with any
-// field name at all can be built here without going through the encoder - which
-// only ever emits names the static table knows.
-@(private = "file")
-put_field :: proc(out: ^[dynamic]u8, name, value: string) {
-	append(out, 0x00)
-	write_string(out, name)
-	write_string(out, value)
-}
-
+// `fields` as one header block, each field encoded with no table state.
 @(private = "file")
 build_block :: proc(fields: []Header_Field) -> []u8 {
 	out := make([dynamic]u8, 0, 128, context.temp_allocator)
 	for f in fields {
-		put_field(&out, f.name, f.value)
+		encode_header(&out, f.name, f.value)
 	}
 	return out[:]
 }
@@ -1958,7 +1929,7 @@ stream error of type PROTOCOL_ERROR: the request must be reset rather than
 answered, and the connection must survive so the streams around it are not
 punished for it.
 
-Nothing here is proxied onward today, so none of it is a smuggling primitive on
+Nothing here is proxied onward, so none of it is a smuggling primitive on
 its own. It becomes one the moment another hop sits in front of or behind this
 endpoint - an h2-to-h1 front end that downgrades a request carrying
 `transfer-encoding` is the classic h2.TE desync - and the HTTP/1.1 side of this
@@ -2193,8 +2164,8 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 		},
 		// RFC 3986 3.1: scheme names are case-insensitive, and 8.3.1 puts no
 		// case restriction on :scheme. An uppercase one names the same scheme
-		// and has to draw the same :path checks, which comparing it
-		// case-sensitively let a peer skip by capitalising a letter.
+		// and draws the same :path checks; a peer does not skip them by
+		// capitalising a letter.
 		{
 			"an uppercase :scheme carrying an absolute-form :path",
 			{
@@ -2205,9 +2176,9 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 			},
 		},
 		// RFC 3986 3.1: a scheme is ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ),
-		// ASCII only. The long s (U+017F) folds to `s` under Unicode rules, so
-		// `http\u017f` was read as https, and any other spelling outside the
-		// grammar named no scheme at all and skipped the :path checks (#432).
+		// ASCII only. The long s (U+017F) folds to `s` under Unicode rules, but
+		// `http\u017f` is outside the grammar: the stream is reset, neither read
+		// as https nor as a scheme that skips the :path checks.
 		{
 			"a :scheme with a long s",
 			{{":method", "GET"}, {":scheme", "http\u017f"}, {":authority", "dns.example"}, {":path", "/dns-query"}},
@@ -2401,7 +2372,7 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 		free_all(context.temp_allocator)
 	}
 
-	expect_no_leaks(t, &track, "malformed requests")
+	testkit.expect_no_leaks(t, &track, "malformed requests")
 }
 
 // The other half of the check above: a conformant request still gets through,
@@ -2514,7 +2485,7 @@ test_conformant_requests_are_served :: proc(t: ^testing.T) {
 		free_all(context.temp_allocator)
 	}
 
-	expect_no_leaks(t, &track, "conformant requests")
+	testkit.expect_no_leaks(t, &track, "conformant requests")
 }
 
 /*
@@ -2554,6 +2525,7 @@ expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []
 	testing.expectf(t, refused, "%s: %d frames in a burst were all answered", what, sent)
 	testing.expectf(t, sent == MAX_CONTROL_FRAMES_PER_SECOND + 1, "%s: refused at frame %d, not the first one over the budget", what, sent)
 	testing.expectf(t, saw_frame(&log, .Goaway), "%s: the flood was dropped without a GOAWAY", what)
+	testing.expectf(t, log.goaway_code == .Enhance_Your_Calm, "%s: GOAWAY said %v, not ENHANCE_YOUR_CALM", what, log.goaway_code)
 
 	conn_done(t, c, &track, what, &log)
 }
@@ -2702,7 +2674,7 @@ test_reset_streams_free_their_slot_for_the_peer :: proc(t: ^testing.T) {
 
 	// Dispatched to a handler that never answers, then reset by the peer.
 	block := request_block()
-	rst := []u8{0, 0, 0, 8} // CANCEL
+	rst := RST_CANCEL
 	id := u32(1)
 	open :: proc(c: ^Conn, id: ^u32, block: []u8) -> bool {
 		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id^}
@@ -2712,7 +2684,7 @@ test_reset_streams_free_their_slot_for_the_peer :: proc(t: ^testing.T) {
 	for _ in 0 ..< MAX_CONCURRENT {
 		sid := id
 		testing.expect(t, open(c, &id, block), "handle_headers failed")
-		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = sid}, rst)
+		testing.expect(t, handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = sid}, rst[:]), "a frame the case builds on was refused")
 	}
 	testing.expect_value(t, len(c.streams), MAX_CONCURRENT)
 	testing.expect_value(t, c.closed_held, MAX_CONCURRENT)
@@ -2721,7 +2693,7 @@ test_reset_streams_free_their_slot_for_the_peer :: proc(t: ^testing.T) {
 	for _ in 0 ..< MAX_CONCURRENT {
 		sid := id
 		testing.expect(t, open(c, &id, block), "handle_headers failed")
-		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = sid}, rst)
+		testing.expect(t, handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = sid}, rst[:]), "a frame the case builds on was refused")
 	}
 	testing.expect_value(t, len(c.streams), MAX_HELD_STREAMS)
 	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a client within the limit by its own count was refused")
@@ -2765,17 +2737,17 @@ test_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	frame := make([]u8, 257, context.temp_allocator)
 	frame[0] = 255
 	spent := 0
-	send :: proc(c: ^Conn, frame: []u8, spent: ^int) {
-		handle_data(c, Frame_Header{length = len(frame), type = .Data, flags = FLAG_PADDED, stream_id = 1}, frame)
+	send :: proc(t: ^testing.T, c: ^Conn, frame: []u8, spent: ^int) {
+		testing.expect(t, handle_data(c, Frame_Header{length = len(frame), type = .Data, flags = FLAG_PADDED, stream_id = 1}, frame), "a frame the case builds on was refused")
 		spent^ += len(frame)
 	}
 	for spent <= MAX_BODY {
-		send(c, frame, &spent)
+		send(t, c, frame, &spent)
 	}
 	_, open := c.streams[1]
 	testing.expectf(t, open, "a %d-byte body padded past MAX_BODY was refused", spent / len(frame))
 	for spent <= RECV_WINDOW / 2 {
-		send(c, frame, &spent)
+		send(t, c, frame, &spent)
 	}
 	_, open = c.streams[1]
 	testing.expectf(t, !open, "a stream that spent %d bytes of its window was left open", spent)
@@ -3060,7 +3032,7 @@ test_headers_reach_the_connection_allocator_only_for_kept_fields :: proc(t: ^tes
 	}
 
 	conn_unref(c)
-	expect_no_leaks(t, &track, "kept header fields")
+	testkit.expect_no_leaks(t, &track, "kept header fields")
 }
 
 // ---------------------------------------------------------------------------
@@ -3101,9 +3073,9 @@ test_trailers_end_a_parked_request :: proc(t: ^testing.T) {
 			log: Request_Log
 			c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, counting_handler, &log, allocator)
 			block := request_block()
-			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+			testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 			if len(body) > 0 {
-				handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, transmute([]u8)body)
+				testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, transmute([]u8)body), "a frame the case builds on was refused")
 			}
 			testing.expect_value(t, log.dispatched, 0)
 
@@ -3120,7 +3092,7 @@ test_trailers_end_a_parked_request :: proc(t: ^testing.T) {
 			testing.expectf(t, found && s.state == .Half_Closed_Remote, "split=%v body=%q: the stream is not half-closed (remote)", split, body)
 
 			// The connection carries on: the next request is served.
-			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, block)
+			testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, block), "a frame the case builds on was refused")
 			testing.expectf(t, log.dispatched == 2, "split=%v body=%q: the next stream was not served", split, body)
 
 			conn_done(t, c, &track, "trailers on a parked request")
@@ -3157,13 +3129,14 @@ test_malformed_trailers_are_a_stream_error :: proc(t: ^testing.T) {
 			log: Request_Log
 			c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, counting_handler, &log, allocator)
 			block := request_block()
-			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+			testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block), "a frame the case builds on was refused")
 			body := []u8{'x'}
-			handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+			testing.expect(t, handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body), "a frame the case builds on was refused")
 
 			trailer := make([dynamic]u8, 0, 32, context.temp_allocator)
-			append(&trailer, ..TRAILER[:])
-			put_field(&trailer, tc.field.name, tc.field.value)
+			one := TRAILER
+			append(&trailer, ..one[:])
+			encode_header(&trailer, tc.field.name, tc.field.value)
 			ok := send_block(c, 1, trailer[:], tc.flags, split)
 			testing.expectf(t, ok && !log.goaway, "%s split=%v: malformed trailers dropped the connection", tc.what, split)
 			testing.expectf(t, log.rsts == 1 && log.rst_code == .Protocol_Error, "%s split=%v: %d RST_STREAM, last %v; want one PROTOCOL_ERROR", tc.what, split, log.rsts, log.rst_code)
@@ -3198,7 +3171,7 @@ test_headers_after_end_stream_is_a_stream_error :: proc(t: ^testing.T) {
 		// Takes the request and never answers: the stream stays its to retire.
 		c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, destroying_handler, &log, allocator)
 		block := request_block()
-		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+		testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block), "a frame the case builds on was refused")
 		s := c.streams[1]
 
 		trailer := TRAILER
@@ -3254,7 +3227,7 @@ test_repeated_headers_on_a_held_stream_are_budgeted :: proc(t: ^testing.T) {
 	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, destroying_handler, &log, context.allocator)
 	defer conn_unref(c)
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+	testing.expect(t, handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block), "a frame the case builds on was refused")
 	repeat := Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}
 	testing.expect(t, handle_headers(c, repeat, []u8{0x82}), "the first block past taking one dropped the connection")
 	testing.expect_value(t, log.rsts, 1)
@@ -3320,7 +3293,7 @@ test_an_expected_continue_is_sent_before_the_body :: proc(t: ^testing.T) {
 		block := make([dynamic]u8, 0, 64, context.temp_allocator)
 		append(&block, ..request_block())
 		if row.expect != "" {
-			put_field(&block, "expect", row.expect)
+			encode_header(&block, "expect", row.expect)
 		}
 		ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | row.flags, stream_id = 1}, block[:])
 		testing.expectf(t, ok, "%s: the connection was dropped", row.what)

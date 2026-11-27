@@ -20,15 +20,10 @@ goaway_payload :: proc(last: u32, code := Error_Code.No_Error) -> []u8 {
 @(private = "file")
 ping_acks :: proc(written: []u8) -> int {
 	n, pos := 0, 0
-	for pos + FRAME_HEADER_SIZE <= len(written) {
-		h, ok := parse_frame_header(written[pos:])
-		if !ok {
-			break
-		}
+	for h in next_frame(written, &pos) {
 		if h.type == .Ping && h.flags & FLAG_ACK != 0 {
 			n += 1
 		}
-		pos += FRAME_HEADER_SIZE + h.length
 	}
 	return n
 }
@@ -284,6 +279,7 @@ test_a_goaway_with_an_error_code_ends_the_connection_at_once :: proc(t: ^testing
 		reading := client_handle_frame(c, Frame_Header{length = len(payload), type = .Goaway}, payload)
 		testing.expect(t, !reading, "the client kept reading after a GOAWAY with an error code")
 		testing.expect(t, !client_going_away(c), "a GOAWAY with an error code was taken for a drain")
+		testing.expect(t, saw_frame(&log, .Goaway) && log.goaway_code == .No_Error, "the client did not answer the GOAWAY")
 		delete_key(&c.streams, 1)
 		client_stream_destroy(c, s)
 		client_done(t, c, &track, "client, error goaway", &log)
@@ -301,7 +297,8 @@ test_a_stream_past_this_ends_goaway_is_not_dispatched :: proc(t: ^testing.T) {
 	allocator := track_allocations(&track)
 	log: Request_Log
 	c := make_conn(IO{read = no_read, write = discard_write}, counting_handler, &log, allocator)
-	// As `goaway_claim_locked` leaves it, naming stream 1.
+	// As a drain naming stream 1 leaves it once its GOAWAY is written
+	// (`goaway_claim_locked`, then `goaway_write`).
 	loop.lock(&c.mu)
 	_, claimed := goaway_claim_locked(c, .No_Error)
 	c.goaway_last = 1
@@ -310,8 +307,13 @@ test_a_stream_past_this_ends_goaway_is_not_dispatched :: proc(t: ^testing.T) {
 	testing.expect(t, claimed, "the premise: the GOAWAY was claimed")
 
 	block := request_block()
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, block)
-	testing.expect_value(t, log.dispatched, 0)
+	// A stream at the last id named is still acted on, though the reader stops.
+	reading := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+	testing.expect(t, !reading, "the reader went on after this end's GOAWAY")
+	testing.expect_value(t, log.dispatched, 1)
+	reading = handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, block)
+	testing.expect(t, !reading, "the reader went on past this end's GOAWAY")
+	testing.expect_value(t, log.dispatched, 1)
 	_, kept := c.streams[3]
 	testing.expect(t, !kept, "the refused stream was left in the table")
 	conn_done(t, c, &track, "stream past goaway")

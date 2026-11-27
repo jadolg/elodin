@@ -12,7 +12,7 @@ nothing else - the rcode speaks for the end of the chain. Anything else there is
 the header contradicting the section beneath it, and the way it arises is an
 attacker rewriting the low nibble of byte 3 of a genuine answer: the records and
 their signatures are untouched, so a validator that reads only the records finds
-nothing wrong. `src/dnssec` refuses that shape outright now; this is the same
+nothing wrong. `src/dnssec` refuses that shape outright; this is the same
 shape stopped one layer out, which is the layer that decides whether one packet
 takes a name down for every client or only for the one that asked.
 
@@ -43,23 +43,7 @@ nx_with_answer :: proc(
 		id        = 0x3333,
 		question  = []dns.Question{{name = name, type = qtype, class = .IN}},
 		answer    = []dns.Record{{name = name, type = type, class = .IN, ttl = 300, data = data}},
-		authority = []dns.Record {
-			{
-				name = "example.com.",
-				type = .SOA,
-				class = .IN,
-				ttl = 3600,
-				data = dns.Rdata_SOA {
-					ns = "ns.example.com.",
-					mbox = "hostmaster.example.com.",
-					serial = 1,
-					refresh = 7200,
-					retry = 3600,
-					expire = 1209600,
-					minimum = 600,
-				},
-			},
-		},
+		authority = nx_target_soa("example.com."),
 	}
 	m.flags.qr = true
 	m.flags.ra = true
@@ -152,17 +136,9 @@ test_nxdomain_after_a_cname_is_cached_for_an_rrsig_question :: proc(t: ^testing.
 		data  = dns.Rdata_Name{name = "target.example.net."},
 	}
 	// What matters is a record of type RRSIG sitting at the name that was
-	// asked about. Its expiration, at offset 8, is read too - an entry is not
-	// kept past it - so it is set a day ahead.
-	sig := make([]u8, 24, context.temp_allocator)
-	dns.write_ttl_at(sig, 8, u32(time.time_to_unix(time.now())) + 86400)
-	answer[1] = dns.Record {
-		name  = "www.example.com.",
-		type  = .RRSIG,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_Raw{data = sig},
-	}
+	// asked about. Its expiration is read too - an entry is not kept past it -
+	// so it is set a day ahead.
+	answer[1] = rrsig_record("www.example.com.", .CNAME, u32(time.time_to_unix(time.now())) + 86400, 300) // lint:allow wall-clock: an RRSIG's expiration is an instant on it
 	m := dns.Message {
 		id       = 0x3334,
 		question  = []dns.Question{{name = "www.example.com.", type = .RRSIG, class = .IN}},
@@ -260,17 +236,3 @@ test_nxdomain_over_a_cname_in_another_class_is_not_cached :: proc(t: ^testing.T)
 	free_all(context.temp_allocator)
 }
 
-// The SOA of the zone a redirection led into, which is what a real name error
-// at the end of the chain carries (RFC 2308 section 2.1) and what the cache
-// reads its lifetime from.
-nx_target_soa :: proc(zone: string) -> []dns.Record {
-	soa := make([]dns.Record, 1, context.temp_allocator)
-	soa[0] = dns.Record {
-		name = zone,
-		type = .SOA,
-		class = .IN,
-		ttl = 3600,
-		data = dns.Rdata_SOA{ns = "ns.example.net.", mbox = "hostmaster.example.net.", serial = 1, minimum = 600},
-	}
-	return soa
-}
