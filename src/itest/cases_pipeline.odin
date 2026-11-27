@@ -5,9 +5,9 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:sys/posix"
-import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:netx"
 import "elodin:server"
 
 /*
@@ -255,23 +255,9 @@ process_cpu_ticks :: proc(pid: int) -> (ticks: int, ok: bool) {
 	if len(fields) < 13 {
 		return
 	}
-	utime := parse_decimal(fields[11]) or_return
-	stime := parse_decimal(fields[12]) or_return
-	return utime + stime, true
-}
-
-@(private = "file")
-parse_decimal :: proc(s: string) -> (n: int, ok: bool) {
-	if len(s) == 0 || len(s) > 18 {
-		return
-	}
-	for c in transmute([]u8)s {
-		if c < '0' || c > '9' {
-			return
-		}
-		n = n * 10 + int(c - '0')
-	}
-	return n, true
+	utime := netx.parse_decimal(fields[11], u64(max(i64) / 2)) or_return
+	stime := netx.parse_decimal(fields[12], u64(max(i64) / 2)) or_return
+	return int(utime + stime), true
 }
 
 @(private = "file")
@@ -336,37 +322,9 @@ pipeline_config :: proc(r: ^Runner, udp_port, tcp_port, dot_port, upstream_port:
 		upstream_extra = "  attempts: 1",
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
 		cache = "{ enabled: true }",
-		listeners_extra = fmt.tprintf(
-			`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}`,
-			dot_port,
-			r.cert_file,
-			r.key_file,
-		),
+		listeners_extra = dot_listener(r, dot_port),
 		extra = fmt.tprintf("server:\n  client_timeout: %s\n%s", PIPELINE_CLIENT_TIMEOUT, extra),
 	)
-}
-
-// `queries`, each behind its length prefix, in one buffer for one write.
-@(private = "file")
-frame_all :: proc(queries: [][]u8) -> []u8 {
-	out := make([dynamic]u8, 0, 64 * len(queries), context.temp_allocator)
-	for q in queries {
-		append(&out, u8(len(q) >> 8), u8(len(q)))
-		append(&out, ..q)
-	}
-	return out[:]
-}
-
-// Wait until the mock holds `want` replies, true when it did within `HOLD_WAIT`.
-@(private = "file")
-wait_held :: proc(mock: ^Mock, want: int) -> bool {
-	return mock_wait_until(mock, proc(m: ^Mock, want: int) -> bool {return sync.atomic_load(&m.held) >= want}, want, HOLD_WAIT)
-}
-
-// Queries the mock has received over any transport; under `m.mu`.
-@(private = "file")
-asked_more_than :: proc(m: ^Mock, count: int) -> bool {
-	return m.udp_queries + m.tcp_queries + m.tls_queries > count
 }
 
 /*
@@ -402,7 +360,7 @@ hit_before_miss :: proc(r: ^Runner, c: ^Test_Conn, mock: ^Mock, udp_port: int, t
 	check_eq_int(r, int(parse_header(r, first.wire).id), HIT_ID, "id of the first answer (the hit)")
 	// The premise: the miss went upstream and is held there, so it was in flight
 	// beside the hit rather than answered from somewhere else.
-	if !check(r, wait_held(mock, held + 1), "the miss never reached the upstream: %s", mock_hold_report(mock)) {
+	if !check(r, wait_held(mock, HOLD_WAIT, held + 1), "the miss never reached the upstream: %s", mock_hold_report(mock)) {
 		return
 	}
 	if !release_hold(r, udp_port, tag) {
@@ -436,7 +394,7 @@ hit_waits_past_the_bound :: proc(r: ^Runner, c: ^Test_Conn, mock: ^Mock, udp_por
 		return
 	}
 	// The premise: every place the connection has is in flight at once.
-	if !check(r, wait_held(mock, held + BOUND), "the misses were not all in flight at once: %s", mock_hold_report(mock)) {
+	if !check(r, wait_held(mock, HOLD_WAIT, held + BOUND), "the misses were not all in flight at once: %s", mock_hold_report(mock)) {
 		return
 	}
 	if !release_hold(r, udp_port, "bound") {
@@ -522,7 +480,7 @@ run_pipeline_pending_cases :: proc(r: ^Runner) {
 		return
 	}
 	// The premise: both misses are in flight, the second in the one counted place.
-	if !check(r, wait_held(mock, held + 2), "the two misses were not in flight at once: %s", mock_hold_report(mock)) {
+	if !check(r, wait_held(mock, HOLD_WAIT, held + 2), "the two misses were not in flight at once: %s", mock_hold_report(mock)) {
 		return
 	}
 	// Released over a connection of its own, whose own place is free: a datagram

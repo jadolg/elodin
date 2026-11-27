@@ -1,9 +1,11 @@
 package itest
 
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
+import "elodin:server"
 
 /*
 Parity: does elodin hand the client what its upstream handed elodin?
@@ -35,7 +37,8 @@ put behind a bare `mise run`:
 */
 
 // The datagram ceiling the parity configuration pins, kept next to the
-// comparison that depends on it rather than only in the yaml that sets it.
+// comparison that depends on it rather than only in the yaml that sets it. A
+// literal, so a change to the shipped default does not move the parity run.
 PARITY_MAX_UDP_RESPONSE :: 1232
 
 Parity_Options :: struct {
@@ -488,8 +491,7 @@ upstream_also_says :: proc(
 	forwarded.rd = true
 	forwarded.ad = false
 	forwarded.edns = true
-	// `server.UPSTREAM_UDP_SIZE`, which is not this package's to import.
-	forwarded.udp_size = 1232
+	forwarded.udp_size = server.UPSTREAM_UDP_SIZE
 	forwarded.version = 0
 	if policy.dnssec_validation {
 		forwarded.cd = true
@@ -587,17 +589,7 @@ parity_same_options :: proc(x, y: Pw_Msg) -> bool {
 			if a.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(ad) >= 2 && len(bd) >= 2 {
 				ad, bd = ad[:2], bd[:2]
 			}
-			if len(ad) != len(bd) {
-				continue
-			}
-			same := true
-			for k in 0 ..< len(ad) {
-				if ad[k] != bd[k] {
-					same = false
-					break
-				}
-			}
-			if same {
+			if slice.equal(ad, bd) {
 				taken[i], matched = true, true
 				break
 			}
@@ -681,8 +673,7 @@ The shape is the one the run found: a DNSKEY question the mock answers with
 three keys, one NS in the authority section and its A and AAAA glue in the
 additional one. That comes to 632 bytes against a client that can take 512, and
 elodin writes 511 of them - the answer whole, the authority whole, the A glue,
-the OPT record, and no AAAA. (626 in the issue, which was written before the
-mock's OPT record carried a six-byte keepalive.)
+the OPT record, and no AAAA.
 
 Every part of that shape is checked before the comparison is asked about it. A
 case whose fixture stopped holding a record to drop would otherwise agree with
@@ -884,7 +875,7 @@ parity_fixed_query :: proc(name: string, qtype: u16, udp_size: u16) -> Parity_Qu
 		transport = .UDP,
 		desc      = name,
 	}
-	q.wire = build_query(name, qtype, q.id, q.qclass, udp_size)
+	q.wire = build_query(name, qtype, id = q.id, class = q.qclass, edns_size = udp_size)
 	// The question as sent, which is what the echo is compared against. Read
 	// back out of the bytes rather than encoded a second time here.
 	m := pw_parse(q.wire, context.temp_allocator)
@@ -960,7 +951,7 @@ parity_race_drain_case :: proc(r: ^Runner) {
 	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on a whole reply from before the reset")
 
 	// Whole replies since the reset, from every member, to another question.
-	other := parity_fixed_query(PARITY_286_NAME, 1, PARITY_286_CEILING)
+	other := parity_fixed_query(PARITY_286_NAME, u16(dns.Type.A), PARITY_286_CEILING)
 	if !check(r, query_tcp(mock_port, other.wire, context.temp_allocator).ok, "the mock did not answer the other question") ||
 	   !check(r, query_tcp(winner_port, other.wire, context.temp_allocator).ok, "the winner did not answer the other question") {
 		return

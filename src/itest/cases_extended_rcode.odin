@@ -198,37 +198,34 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 				res := query_udp(udp_port, build_query(DANE_NAME, u16(dns.Type.TLSA), edns_size = 1232))
 				check(r, res.ok, "no response")
 			}
-			if check(r, wait_http(metrics_port, "/metrics"), "the metrics endpoint never answered") {
-				res := http_request(metrics_port, "GET", "/metrics", context.temp_allocator)
-				if check(r, res.status == 200, "a scrape returned %d", res.status) {
-					page := string(res.body)
-					// Per upstream, because "which member of the group is
-					// doing this" is what the operator is left asking once the
-					// one warn line has scrolled away.
-					check_eq_int(
-						r,
-						metric_value(page, "elodin_upstream_unreadable_rcode_total{upstream=\"badvers\"}"),
-						3,
-						"elodin_upstream_unreadable_rcode_total",
-					)
-					// And the same server is not called failing for it, which
-					// is why the series above has to exist.
-					check_eq_int(
-						r,
-						metric_value(page, "elodin_upstream_failures_total{upstream=\"badvers\"}"),
-						0,
-						"upstream failures",
-					)
-					// The same queries are SERVFAILs like any other, so the
-					// counter above is a subset of this rather than a figure
-					// beside it.
-					check_eq_int(
-						r,
-						metric_value(page, "elodin_answers_total{outcome=\"failed\"}"),
-						3,
-						"failed answers",
-					)
-				}
+			page := metrics_page(metrics_port)
+			if check(r, page != "", "the metrics endpoint never answered") {
+				// Per upstream, because "which member of the group is
+				// doing this" is what the operator is left asking once the
+				// one warn line has scrolled away.
+				check_eq_int(
+					r,
+					metric_value(page, "elodin_upstream_unreadable_rcode_total{upstream=\"badvers\"}"),
+					3,
+					"elodin_upstream_unreadable_rcode_total",
+				)
+				// And the same server is not called failing for it, which
+				// is why the series above has to exist.
+				check_eq_int(
+					r,
+					metric_value(page, "elodin_upstream_failures_total{upstream=\"badvers\"}"),
+					0,
+					"upstream failures",
+				)
+				// The same queries are SERVFAILs like any other, so the
+				// counter above is a subset of this rather than a figure
+				// beside it.
+				check_eq_int(
+					r,
+					metric_value(page, "elodin_answers_total{outcome=\"failed\"}"),
+					3,
+					"failed answers",
+				)
 			}
 		}
 		end_case(r)

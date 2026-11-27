@@ -3,11 +3,11 @@ package itest
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
-import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
+import "elodin:netx"
 
 /*
 The log the binary actually writes, read back as logfmt.
@@ -51,8 +51,8 @@ run_logfmt_cases :: proc(r: ^Runner) {
 	unquoted it would close `qname=` early and everything after it would parse as
 	fields this server never wrote.
 	*/
-	_ = query_udp(udp_port, build_query(`we"ird.example.`, u16(dns.Type.A)))
-	_ = query_udp(udp_port, build_query("plain.example.", u16(dns.Type.A)))
+	check(r, query_udp(udp_port, build_query(`we"ird.example.`, u16(dns.Type.A))).ok, "the name with a quote in it was not answered")
+	check(r, query_udp(udp_port, build_query("plain.example.", u16(dns.Type.A))).ok, "the plain name was not answered")
 
 	start_case(r, "logfmt: every line is key=value, with a timestamp and a level")
 	{
@@ -172,7 +172,7 @@ log_file_case :: proc(r: ^Runner, upstream_port: int) {
 	defer stop_server(&srv)
 
 	for i in 0 ..< QUERIES {
-		_ = query_udp(udp_port, build_query(fmt.tprintf("sync-%d.example.", i), u16(dns.Type.A)), context.temp_allocator)
+		check(r, query_udp(udp_port, build_query(fmt.tprintf("sync-%d.example.", i), u16(dns.Type.A)), context.temp_allocator).ok, "%s: query %d was not answered", NAME, i)
 	}
 	// strace's own child is the server. Stopped through it rather than through
 	// strace, so the server takes its own shutdown path while traced.
@@ -180,7 +180,7 @@ log_file_case :: proc(r: ^Runner, upstream_port: int) {
 		fmt.tprintf("/proc/%d/task/%d/children", srv.process.pid, srv.process.pid),
 		context.temp_allocator,
 	)
-	child, cok := strconv.parse_int(strings.trim_space(string(children)), 10)
+	child, cok := netx.parse_decimal(strings.trim_space(string(children)), u64(max(i32)))
 	if !cok {
 		fail(r, "%s: cannot find the server under strace pid %d: %q", NAME, srv.process.pid, string(children))
 		return
@@ -221,20 +221,14 @@ runs_ok :: proc(r: ^Runner, command: []string) -> bool {
 /*
 The `port` field of a query line, as a number.
 
-0 for anything `strconv.parse_int` rejects, an empty field among them, so a
-caller asking for a real port asks `> 0` and a line
-that lost the field fails the check rather than passing it by accident.
+0 for anything but digits that fit a port, an empty field and a sign among them,
+so a caller asking for a real port asks `> 0` and a line that lost the field, or
+wrote it as `+80`, fails the check rather than passing it by accident.
 */
 @(private = "file")
 port_of :: proc(text: string) -> int {
-	if text == "" {
-		return 0
-	}
-	value, ok := strconv.parse_int(text, 10)
-	if !ok {
-		return 0
-	}
-	return value
+	value, ok := netx.parse_decimal(text, 65535)
+	return int(value) if ok else 0
 }
 
 @(private = "file")

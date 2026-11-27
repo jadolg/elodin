@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:time"
 import "elodin:dns"
+import "elodin:upstream"
 
 /*
 An upstream named by hostname holds the address its bootstrap lookup gave for
@@ -11,8 +12,8 @@ and the bootstrap servers are asked again once it is past.
 */
 run_bootstrap_cases :: proc(r: ^Runner) {
 	GROUP :: "bootstrap"
-	// `upstream.BOOTSTRAP_MIN_TTL`, which a TTL of one is raised to.
-	FLOOR :: 10 * time.Second
+	// What a TTL of one is raised to.
+	FLOOR :: upstream.BOOTSTRAP_MIN_TTL
 	f := fixture("a")
 
 	boot_port := next_port(r)

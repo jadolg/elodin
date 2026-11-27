@@ -35,6 +35,9 @@ Doh2_Mock :: struct {
 	mu:        sync.Mutex,
 	h2_hits:   int,
 	h1_hits:   int,
+	// Connections accepted, so a case can tell one connection carrying every
+	// query from one per query.
+	accepts:   int,
 
 	// Answer from the parity check's synthetic zone rather than with
 	// `payload`, and keep the last reply for it to compare against - the same
@@ -143,6 +146,13 @@ doh2_mock_counts :: proc(m: ^Doh2_Mock) -> (h2_hits, h1_hits: int) {
 	return m.h2_hits, m.h1_hits
 }
 
+// Connections the mock has accepted.
+doh2_mock_accepts :: proc(m: ^Doh2_Mock) -> int {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	return m.accepts
+}
+
 @(private = "file")
 doh2_mock_loop :: proc(m: ^Doh2_Mock) {
 	for !sync.atomic_load(&m.stop) {
@@ -150,6 +160,9 @@ doh2_mock_loop :: proc(m: ^Doh2_Mock) {
 		if err != nil {
 			continue
 		}
+		sync.mutex_lock(&m.mu)
+		m.accepts += 1
+		sync.mutex_unlock(&m.mu)
 		// The handshake is bounded by this as a whole, not per read - see
 		// `HANDSHAKE_TIMEOUT`.
 		_ = net.set_option(client, .Receive_Timeout, HANDSHAKE_TIMEOUT)

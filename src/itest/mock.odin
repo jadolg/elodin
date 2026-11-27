@@ -295,6 +295,17 @@ mock_counts :: proc(m: ^Mock) -> (udp, tcp, tls: int) {
 	return m.udp_queries, m.tcp_queries, m.tls_queries
 }
 
+// Wait until `m` holds `want` replies, true when it did within `timeout`.
+wait_held :: proc(m: ^Mock, timeout: time.Duration, want: int) -> bool {
+	return mock_wait_until(m, proc(m: ^Mock, want: int) -> bool {return sync.atomic_load(&m.held) >= want}, want, timeout)
+}
+
+// Whether `m` has received more than `count` queries over any transport; for
+// `mock_wait_until`, under `m.mu`.
+asked_more_than :: proc(m: ^Mock, count: int) -> bool {
+	return m.udp_queries + m.tcp_queries + m.tls_queries > count
+}
+
 mock_total :: proc(m: ^Mock) -> int {
 	u, t, s := mock_counts(m)
 	return u + t + s
@@ -1078,10 +1089,7 @@ mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 			continue
 		}
 
-		framed := make([]u8, 2 + len(reply), context.temp_allocator)
-		framed[0] = u8(len(reply) >> 8)
-		framed[1] = u8(len(reply))
-		copy(framed[2:], reply)
+		framed := frame_all({reply})
 
 		if tls_conn != nil {
 			if _, err := tlsx.write(tls_conn, framed); err != .None {

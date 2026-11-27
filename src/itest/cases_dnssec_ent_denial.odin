@@ -1,8 +1,5 @@
 package itest
 
-import "elodin:dns"
-import "elodin:server"
-
 /*
 Issue #684: a covering NSEC whose next name lies below the question shows the
 question is an empty non-terminal, a name that exists (RFC 4592 section
@@ -208,46 +205,19 @@ EX_FIXTURES := []Fixture{
 }
 
 run_dnssec_ent_denial_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("dnssec-ent-denial", upstream_port)
-	for f in EX_FIXTURES {
-		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
-	}
-	if !mock_start_or_skip(r, mock, "dnssec: empty non-terminal denials") {
-		return
-	}
-	defer mock_stop(mock)
-
-	udp_port := next_port(r)
-	config := dnssec_config(udp_port, upstream_port, []string{EX_ANCHOR}, log = "{ level: info }")
-	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	mock := signed_mock(r, "dnssec-ent-denial", EX_FIXTURES)
+	srv, udp_port, ok := start_signed_pair(r, mock, EX_ANCHOR, "dnssec: empty non-terminal denials")
 	if !ok {
 		return
 	}
+	defer mock_stop(mock)
 	defer stop_server(&srv)
 
-	cases := []struct {
-		name:  string,
-		qname: string,
-		rcode: dns.Rcode,
-	} {
+	check_signed_verdicts(r, udp_port, {
 		{"dnssec: a genuine wildcard answer validates", "x.enxtest.", .No_Error},
 		{"dnssec: an empty non-terminal's NODATA replayed as NXDOMAIN is bogus", "b.enxtest.", .Serv_Fail},
 		{"dnssec: a wildcard answer below an empty non-terminal is bogus", "x.b.enxtest.", .Serv_Fail},
 		{"dnssec: an empty non-terminal wildcard's NODATA validates", "nx.exwild.", .No_Error},
 		{"dnssec: an NXDOMAIN under an empty non-terminal wildcard is bogus", "ny.exwild.", .Serv_Fail},
-	}
-	for c in cases {
-		start_case(r, c.name)
-		res := query_udp(udp_port, build_query(c.qname, u16(dns.Type.A), edns_size = 1232, dnssec_ok = true))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
-			check_eq_int(r, h.rcode, int(c.rcode), "rcode")
-			check(r, h.ad == (c.rcode == .No_Error), "AD is %v", h.ad)
-			if c.rcode == .Serv_Fail {
-				check_eq_int(r, extended_error(r, res.wire), server.EDE_DNSSEC_BOGUS, "extended DNS error")
-			}
-		}
-		end_case(r)
-	}
+	})
 }

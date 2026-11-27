@@ -427,7 +427,8 @@ Each section a case varies is a parameter rather than text appended after, since
 the loader refuses a key given twice. `servers` is the `upstream.servers` value
 (`upstream_at` for one loopback mock); `listeners_extra` and `upstream_extra` are
 more keys inside those sections, indented two spaces; `extra` is more top-level
-sections. An empty `timeout` leaves the key out.
+sections. An empty `timeout` leaves the key out, and a zero `readers` leaves
+`listeners.udp.readers` at its default.
 */
 base_config :: proc(
 	udp_port: int,
@@ -440,9 +441,11 @@ base_config :: proc(
 	cache := "{ enabled: false }",
 	blocking := "{ enabled: false }",
 	extra := "",
+	readers := 0,
 ) -> string {
 	b := strings.builder_make(context.temp_allocator)
-	fmt.sbprintf(&b, "log: %s\nlisteners:\n  udp: {{ enabled: true, address: \"127.0.0.1\", port: %d }}\n  tcp: %s\n", log, udp_port, tcp)
+	udp_readers := fmt.tprintf(", readers: %d", readers) if readers > 0 else ""
+	fmt.sbprintf(&b, "log: %s\nlisteners:\n  udp: {{ enabled: true, address: \"127.0.0.1\", port: %d%s }}\n  tcp: %s\n", log, udp_port, udp_readers, tcp)
 	write_lines(&b, listeners_extra)
 	strings.write_string(&b, "upstream:\n")
 	if timeout != "" {
@@ -464,6 +467,33 @@ write_lines :: proc(b: ^strings.Builder, text: string) {
 	if !strings.has_suffix(text, "\n") {
 		strings.write_byte(b, '\n')
 	}
+}
+
+/*
+The DoH listener on loopback at `port`, serving `/dns-query` with `cert` and
+`key` (the run's own when left empty), as a `listeners_extra` line for
+`base_config`; `extra` is more keys inside the braces (", http2: false", say).
+*/
+doh_listener :: proc(r: ^Runner, port: int, extra := "", cert := "", key := "") -> string {
+	return fmt.tprintf(
+		`  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s%s }}`,
+		port,
+		cert if cert != "" else r.cert_file,
+		key if key != "" else r.key_file,
+		extra,
+	)
+}
+
+// The DoT listener on loopback at `port`, as a `listeners_extra` line for
+// `base_config`; `extra`, `cert` and `key` as for `doh_listener`.
+dot_listener :: proc(r: ^Runner, port: int, extra := "", cert := "", key := "") -> string {
+	return fmt.tprintf(
+		`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s%s }}`,
+		port,
+		cert if cert != "" else r.cert_file,
+		key if key != "" else r.key_file,
+		extra,
+	)
 }
 
 // One loopback upstream, as a `servers` value for `base_config`.
@@ -770,15 +800,40 @@ before this server has done anything. So it takes `log_count` before acting and
 waits for one more than that.
 */
 wait_for_log_count :: proc(srv: ^Server, needle: string, want: int, timeout: time.Duration) -> bool {
+	return wait_file_count(srv.log_path, needle, want, timeout)
+}
+
+// Whether the file at `path` holds `needle` at least `want` times before
+// `timeout` is over; a file that cannot be read yet holds it no times.
+wait_file_count :: proc(path, needle: string, want: int, timeout: time.Duration) -> bool {
 	deadline := time.tick_add(time.tick_now(), timeout)
 	for time.tick_diff(time.tick_now(), deadline) > 0 {
-		if log_count(srv, needle) >= want {
+		if data, err := os.read_entire_file(path, context.temp_allocator); err == nil && strings.count(string(data), needle) >= want {
 			return true
 		}
-		time.sleep(20 * time.Millisecond)
+		time.sleep(20 * time.Millisecond) // lint:allow a poll of another process's file, bounded by the deadline above
 	}
 	return false
 }
+
+/*
+That `srv`, started on a configuration it must refuse, exits non-zero within
+`REFUSED_START_WAIT` and logs `needle`. The process is reaped here, so the
+caller's deferred `stop_server` has nothing left to stop.
+*/
+expect_refused_start :: proc(r: ^Runner, srv: ^Server, needle: string) -> bool {
+	state, werr := os.process_wait(srv.process, REFUSED_START_WAIT)
+	if !check(r, werr == nil && state.exited, "the server kept running on a configuration it must refuse") {
+		return false
+	}
+	srv.running = false
+	exited := check(r, state.exit_code != 0, "the refusal exited 0")
+	logged := check(r, log_contains(srv, needle), "the refusal does not say %q:\n%s", needle, read_log(srv))
+	return exited && logged
+}
+
+// How long a server refusing its configuration has to exit.
+REFUSED_START_WAIT :: 10 * time.Second
 
 /*
 End a case's server.

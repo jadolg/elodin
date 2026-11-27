@@ -301,17 +301,11 @@ run_dnssec_cname_denial_cases :: proc(r: ^Runner) {
 		}
 		mock_reply(mock, f.qname, f.qtype, wire)
 	}
-	if !mock_start_or_skip(r, mock, "dnssec: denial after a cname") {
-		return
-	}
-	defer mock_stop(mock)
-
-	udp_port := next_port(r)
-	config := dnssec_config(udp_port, mock.port, []string{CD_ANCHOR}, log = "{ level: info }", cache = "{ enabled: true }")
-	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	srv, udp_port, ok := start_signed_pair(r, mock, CD_ANCHOR, "dnssec: denial after a cname", cache = true)
 	if !ok {
 		return
 	}
+	defer mock_stop(mock)
 	defer stop_server(&srv)
 
 	cases := []struct {
@@ -321,18 +315,20 @@ run_dnssec_cname_denial_cases :: proc(r: ^Runner) {
 		rcode:     dns.Rcode,
 		// The proof's records, with their signatures, that must reach the client.
 		authority: int,
+		// Asked before, so it has to be the cache's copy.
+		cached:    bool,
 	} {
-		{"dnssec: a nodata after a cname is validated at the target and keeps its proof", "www.cdsrc.", .AAAA, .No_Error, 4},
-		{"dnssec: the cached copy of that nodata keeps AD and its proof", "www.cdsrc.", .AAAA, .No_Error, 4},
-		{"dnssec: an nxdomain after a cname is validated at the target and keeps its proof", "gone.cdsrc.", .A, .NX_Domain, 6},
-		{"dnssec: a denial after a cname that the target's zone does not sign is refused", "swap.cdsrc.", .AAAA, .Serv_Fail, 0},
-		{"dnssec: an unsigned record appended does not excuse an unproven denial after a cname", CD_PADDED, .AAAA, .Serv_Fail, 0},
+		{"dnssec: a nodata after a cname is validated at the target and keeps its proof", "www.cdsrc.", .AAAA, .No_Error, 4, false},
+		{"dnssec: the cached copy of that nodata keeps AD and its proof", "www.cdsrc.", .AAAA, .No_Error, 4, true},
+		{"dnssec: an nxdomain after a cname is validated at the target and keeps its proof", "gone.cdsrc.", .A, .NX_Domain, 6, false},
+		{"dnssec: a denial after a cname that the target's zone does not sign is refused", "swap.cdsrc.", .AAAA, .Serv_Fail, 0, false},
+		{"dnssec: an unsigned record appended does not excuse an unproven denial after a cname", CD_PADDED, .AAAA, .Serv_Fail, 0, false},
 	}
-	for c, i in cases {
+	for c in cases {
 		start_case(r, c.name)
 		asked := mock_total(mock)
 		res := query_udp(udp_port, build_query(c.qname, u16(c.qtype), edns_size = 1232, dnssec_ok = true))
-		if i == 1 {
+		if c.cached {
 			check(r, mock_total(mock) == asked, "the repeated question went upstream rather than to the cache")
 		}
 		if check(r, res.ok, "no response") {

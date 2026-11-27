@@ -92,10 +92,10 @@ run_rrsig_expiry_cases :: proc(r: ^Runner) {
 		// second having passed. Bounded on the tick clock, so a wall clock
 		// stepped back fails the case rather than hanging the run.
 		deadline := time.tick_add(time.tick_now(), 10 * time.Second)
-		for u32(time.time_to_unix(time.now())) <= expiration && time.tick_diff(time.tick_now(), deadline) > 0 {
+		for u32(time.time_to_unix(time.now())) <= expiration && time.tick_diff(time.tick_now(), deadline) > 0 { // lint:allow wall-clock: an RRSIG expiration is an instant on it
 			time.sleep(100 * time.Millisecond)
 		}
-		if !check(r, u32(time.time_to_unix(time.now())) > expiration, "the wall clock never passed the rrsig's expiration") {
+		if !check(r, u32(time.time_to_unix(time.now())) > expiration, "the wall clock never passed the rrsig's expiration") { // lint:allow wall-clock: an RRSIG expiration is an instant on it
 			end_case(r)
 			return
 		}

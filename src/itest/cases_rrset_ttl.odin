@@ -26,18 +26,7 @@ a_answer :: proc(qname: string, ttls: []u32, allocator := context.allocator) -> 
 	for ttl, i in ttls {
 		answer[i] = {name = qname, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{addr = {192, 0, 2, 34 + u8(i)}}}
 	}
-	m := dns.Message {
-		question = []dns.Question{{name = qname, type = .A, class = .IN}},
-		answer   = answer,
-	}
-	m.flags.qr = true
-	m.flags.rd = true
-	m.flags.ra = true
-	wire, _, err := dns.encode_message(m, allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(qname, .A, dns.Message{answer = answer}, allocator)
 }
 
 /*
@@ -50,7 +39,8 @@ run_rrset_ttl_cases :: proc(r: ^Runner) {
 	payload := mixed_ttl_answer()
 	defer delete(payload)
 	if payload == nil {
-		skip_case(r, GROUP, "cannot build the mixed-TTL answer")
+		// The codec's failure or the fixture's, not a busy port: failed.
+		fail(r, "%s: cannot build the mixed-TTL answer", GROUP)
 		return
 	}
 	upstream_port := next_port(r)
@@ -96,7 +86,8 @@ run_highbit_ttl_cases :: proc(r: ^Runner) {
 	payload := a_answer(HIGHBIT_QNAME, []u32{HIGHBIT_TTL})
 	defer delete(payload)
 	if payload == nil {
-		skip_case(r, GROUP, "cannot build the high-bit answer")
+		// The codec's failure or the fixture's, not a busy port: failed.
+		fail(r, "%s: cannot build the high-bit answer", GROUP)
 		return
 	}
 	upstream_port := next_port(r)

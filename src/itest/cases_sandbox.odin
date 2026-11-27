@@ -307,7 +307,7 @@ sandbox_certbot_renewal_case :: proc(r: ^Runner) {
 	start_case(r, NAME)
 	defer end_case(r)
 	udp_port, dot_port := next_port(r), next_port(r)
-	dot := fmt.tprintf(`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}`, dot_port, cert, key)
+	dot := dot_listener(r, dot_port, cert = cert, key = key)
 	srv, ok := start_server(r, Server_Options{config = base_config(udp_port, upstream_at(next_port(r)), listeners_extra = dot), udp_port = udp_port, dot_port = dot_port})
 	if !ok {
 		return
@@ -356,20 +356,7 @@ sandbox_log_rotation_case :: proc(r: ^Runner) {
 		return
 	}
 	check(r, signal_reload(&srv), "could not deliver SIGHUP")
-	check(r, file_comes_to_hold(path, "SIGHUP received", 5 * time.Second), "the log was not made again at %s:\n%s", path, read_log(&srv))
-}
-
-// Whether `path` holds `needle` before `within` is over.
-@(private = "file")
-file_comes_to_hold :: proc(path, needle: string, within: time.Duration) -> bool {
-	deadline := time.tick_add(time.tick_now(), within)
-	for time.tick_diff(time.tick_now(), deadline) > 0 {
-		if data, err := os.read_entire_file(path, context.temp_allocator); err == nil && strings.contains(string(data), needle) {
-			return true
-		}
-		time.sleep(20 * time.Millisecond) // lint:allow a poll of another process's file, bounded by the deadline above
-	}
-	return false
+	check(r, wait_file_count(path, "SIGHUP received", 1, 5 * time.Second), "the log was not made again at %s:\n%s", path, read_log(&srv))
 }
 
 /*
@@ -409,7 +396,7 @@ sandbox_cache_turned_on_case :: proc(r: ^Runner) {
 		return
 	}
 	cached := fmt.tprintf("%s/sandbox-list.list", cache)
-	check(r, file_comes_to_hold(cached, "sandboxed.test", 5 * time.Second), "the list was not kept at %s:\n%s", cached, read_log(&srv))
+	check(r, wait_file_count(cached, "sandboxed.test", 1, 5 * time.Second), "the list was not kept at %s:\n%s", cached, read_log(&srv))
 	check(r, !log_contains(&srv, "is not writable"), "the cache was refused:\n%s", read_log(&srv))
 }
 

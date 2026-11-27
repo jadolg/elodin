@@ -20,16 +20,7 @@ ddr_config :: proc(r: ^Runner, udp_port, dot_port, doh_port: int, name: string) 
 		// The shipped level, and the shipped upstream timeout.
 		log = "{ level: info }",
 		timeout = "",
-		listeners_extra = fmt.tprintf(
-			`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}`,
-			dot_port,
-			r.cert_file,
-			r.key_file,
-			doh_port,
-			r.cert_file,
-			r.key_file,
-		),
+		listeners_extra = fmt.tprintf("%s\n%s", dot_listener(r, dot_port), doh_listener(r, doh_port)),
 		extra = fmt.tprintf("ddr:\n  name: %s\nrewrites:\n  - domain: %s\n    answers: [127.0.0.1]", name, name),
 	)
 }

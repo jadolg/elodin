@@ -78,9 +78,7 @@ run_prefetch_cases :: proc(r: ^Runner) {
 			check(r, waited < 300 * time.Millisecond, "the hit near expiry waited %v", waited)
 			// The refresh is behind the client, so it is waited for - up to the
 			// old expiry, after which a miss would put the same count on the wire.
-			for mock_total(mock) < 2 && time.tick_since(filled) < 5 * time.Second {
-				time.sleep(10 * time.Millisecond)
-			}
+			check(r, mock_wait_until(mock, asked_more_than, 1, 5 * time.Second - time.tick_since(filled)), "the prefetch never reached the upstream")
 			check_eq_int(r, mock_total(mock), 2, "upstream queries once the prefetch has run")
 
 			// Past the first entry's expiry: only the renewed one can answer.

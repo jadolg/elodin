@@ -5,6 +5,7 @@ import "core:slice"
 import "core:strconv"
 import "core:time"
 import "elodin:config"
+import "elodin:dns"
 import "elodin:loop"
 
 /*
@@ -20,22 +21,13 @@ pinned: a thread allowed exactly one CPU, on a run allowed more, is a loop.
 // Without `pin`, the file does not name `pin_loops`, so the default is what runs.
 @(private = "file")
 config_pinning :: proc(udp_port, upstream_port, readers: int, pin: bool) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-%s
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d, readers: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-		"server: { pin_loops: true }" if pin else "",
+	return base_config(
 		udp_port,
-		readers,
-		upstream_port,
+		upstream_at(upstream_port),
+		log = "{ level: info }",
+		timeout = "3s",
+		extra = "server: { pin_loops: true }" if pin else "",
+		readers = readers,
 	)
 }
 
@@ -58,14 +50,14 @@ pinned_thread_cpus :: proc(pid: int) -> (cpus: []int, ok: bool) {
 	return found[:], true
 }
 
+@(private = "file")
+PIN_WAIT :: 5 * time.Second
+
 /*
 The pinned threads' CPUs once they equal `want`, or as they last stood when
 `PIN_WAIT` ran out. Each loop pins itself on its own thread, and the server
 answering is not ordered after every loop has done so.
 */
-@(private = "file")
-PIN_WAIT :: 5 * time.Second
-
 @(private = "file")
 wait_pinned :: proc(pid: int, want: []int) -> (cpus: []int, ok: bool) {
 	start := time.tick_now()
@@ -96,7 +88,7 @@ run_pinning_cases :: proc(r: ^Runner) {
 		srv, ok := start_server(r, Server_Options{config = config_pinning(udp_port, upstream_port, 2, true), udp_port = udp_port})
 		if ok {
 			defer stop_server(&srv)
-			check(r, query_udp(udp_port, build_query("pin.example.", 1, id = 0x610, allocator = context.temp_allocator), context.temp_allocator).ok, "a query was not answered")
+			check(r, query_udp(udp_port, build_query("pin.example.", u16(dns.Type.A), id = 0x610, allocator = context.temp_allocator), context.temp_allocator).ok, "a query was not answered")
 			cpus, read := wait_pinned(srv.process.pid, allowed[:2])
 			if check(r, read, "the server's threads could not be listed") {
 				check(r, slice.equal(cpus, allowed[:2]), "pinned threads are on CPUs %v, not one loop on each of %v", cpus, allowed[:2])
@@ -119,7 +111,7 @@ run_pinning_cases :: proc(r: ^Runner) {
 		srv, ok := start_server(r, Server_Options{config = config_pinning(udp_port, upstream_port, len(allowed) + 1, true), udp_port = udp_port})
 		if ok {
 			defer stop_server(&srv)
-			check(r, query_udp(udp_port, build_query("pin.example.", 1, id = 0x611, allocator = context.temp_allocator), context.temp_allocator).ok, "a query was not answered")
+			check(r, query_udp(udp_port, build_query("pin.example.", u16(dns.Type.A), id = 0x611, allocator = context.temp_allocator), context.temp_allocator).ok, "a query was not answered")
 			cpus, read := pinned_thread_cpus(srv.process.pid)
 			if check(r, read, "the server's threads could not be listed") {
 				check(r, len(cpus) == 0, "threads are pinned to CPUs %v with more loops than CPUs", cpus)

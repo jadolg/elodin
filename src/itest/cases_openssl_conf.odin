@@ -1,8 +1,6 @@
 package itest
 
 import "core:fmt"
-import "core:os"
-import "core:time"
 import "elodin:dns"
 import "elodin:tlsx"
 
@@ -87,12 +85,7 @@ openssl_conf_config :: proc(r: ^Runner, udp_port, dot_port: int) -> string {
 		udp_port,
 		upstream_at(next_port(r)),
 		log = "{ level: info }",
-		listeners_extra = fmt.tprintf(
-			`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}`,
-			dot_port,
-			r.cert_file,
-			r.key_file,
-		),
+		listeners_extra = dot_listener(r, dot_port),
 		extra = "rewrites:\n  - domain: conf.test\n    answers: [192.0.2.7]",
 	)
 }
@@ -208,12 +201,7 @@ run_openssl_conf_cases :: proc(r: ^Runner) {
 				srv, started := start_server_raw(r, openssl_conf_config(r, udp_port, dot_port), udp_port, env = env[:])
 				if check(r, started, "cannot start the binary") {
 					defer stop_server(&srv)
-					state, werr := os.process_wait(srv.process, 10 * time.Second)
-					if check(r, werr == nil && state.exited, "the server started with no TLS it could speak") {
-						srv.running = false
-						check(r, state.exit_code != 0, "the refusal exited 0")
-						check(r, log_contains(&srv, "No_Suite"), "the refusal does not say why:\n%s", read_log(&srv))
-					}
+					expect_refused_start(r, &srv, "No_Suite")
 				}
 			}
 			end_case(r)

@@ -474,6 +474,13 @@ h2_stream :: proc(c: ^H2_Client, stream_id: u32) -> (r: ^H2_Stream_Result, ok: b
 	return res, found
 }
 
+// The result of `stream_id`, failing the case when the client holds none for it:
+// a stream `h2_collect` did not finish is not one to read a status from.
+h2_finished :: proc(r: ^Runner, c: ^H2_Client, stream_id: u32) -> (res: ^H2_Stream_Result, ok: bool) {
+	res, ok = c.results[stream_id]
+	return res, check(r, ok, "stream %d has no result", stream_id)
+}
+
 h2_header_value :: proc(r: ^H2_Stream_Result, name: string) -> string {
 	if r == nil {
 		return ""

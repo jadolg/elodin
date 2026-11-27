@@ -39,16 +39,7 @@ config_all_transports :: proc(r: ^Runner, udp_port, dot_port, doh_port, upstream
 		log = "{ level: debug, queries: true }",
 		timeout = "3s",
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
-		listeners_extra = fmt.tprintf(
-			`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}`,
-			dot_port,
-			r.cert_file,
-			r.key_file,
-			doh_port,
-			r.cert_file,
-			r.key_file,
-		),
+		listeners_extra = fmt.tprintf("%s\n%s", dot_listener(r, dot_port), doh_listener(r, doh_port)),
 		extra = `server:
   # Named rather than left at the shipped default, because the keepalive cases
   # below read it back off the wire: what a client is told has to be the idle
@@ -155,9 +146,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	*/
 	start_case(r, "dot, doh: a client resumes its session by ticket, TLS 1.2 and 1.3 (#262)")
 	{
-		framed := make([]u8, 2 + len(query), context.temp_allocator)
-		framed[0], framed[1] = u8(len(query) >> 8), u8(len(query))
-		copy(framed[2:], query)
+		framed := frame_all({query})
 		post := build_http_request("POST", "/dns-query", "application/dns-message", query)
 		for version in ([]int{tlsx.TLS1_2_VERSION, tlsx.TLS1_3_VERSION}) {
 			dot_reused, dot_ok := tls_resumes(dot_port, version, nil, framed)

@@ -2,7 +2,6 @@ package itest
 
 import "core:fmt"
 import "core:net"
-import "core:strings"
 import "core:time"
 import "elodin:dns"
 
@@ -40,42 +39,16 @@ config_running :: proc(
 	servers := "",
 	cache := "{ enabled: false }",
 ) -> string {
-	// On lines of their own, as `base_config` takes them.
-	upstream_extra := upstream_extra
-	if upstream_extra != "" && !strings.has_suffix(upstream_extra, "\n") {
-		upstream_extra = fmt.tprintf("%s\n", upstream_extra)
-	}
-	doh := "doh: { enabled: false }"
-	if doh_port > 0 {
-		doh = fmt.tprintf(
-			`doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}`,
-			doh_port,
-			r.cert_file,
-			r.key_file,
-		)
-	}
-	return fmt.tprintf(
-		`log: {{ level: info }}
-server:
-%s
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d, readers: %d }}
-  tcp: {{ enabled: false }}
-  %s
-upstream:
-  timeout: 5s
-  attempts: 1
-%s  servers: %s
-cache: %s
-blocking: {{ enabled: false }}
-`,
-		server,
+	return base_config(
 		udp_port,
-		readers,
-		doh,
-		upstream_extra,
 		servers if servers != "" else upstream_at(upstream_port),
-		cache,
+		log = "{ level: info }",
+		timeout = "5s",
+		upstream_extra = fmt.tprintf("  attempts: 1\n%s", upstream_extra),
+		listeners_extra = doh_listener(r, doh_port) if doh_port > 0 else "",
+		cache = cache,
+		extra = fmt.tprintf("server:\n%s", server),
+		readers = readers,
 	)
 }
 
@@ -105,10 +78,14 @@ udp_burst :: proc(udp_port: int, queries: [][]u8) -> (answered: int, elapsed: ti
 		}
 		sockets[i] = s
 		opened[i] = true
-		_, _ = net.send_udp(s, q, endpoint)
+		if _, serr := net.send_udp(s, q, endpoint); serr != nil {
+			// Never sent, so never answered: counted as unanswered, not waited on.
+			opened[i] = false
+			net.close(s)
+		}
 	}
 	deadline := time.tick_add(start, CLIENT_TIMEOUT)
-	buf := make([]u8, 65535, context.temp_allocator)
+	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
 	for s, i in sockets {
 		if !opened[i] {
 			continue
@@ -117,7 +94,10 @@ udp_burst :: proc(udp_port: int, queries: [][]u8) -> (answered: int, elapsed: ti
 		if left <= 0 {
 			break
 		}
-		_ = net.set_option(s, .Receive_Timeout, left)
+		// A read that cannot be bounded would outlast the deadline: unanswered.
+		if net.set_option(s, .Receive_Timeout, left) != nil {
+			continue
+		}
 		n, _, rerr := net.recv_udp(s, buf)
 		if rerr == nil && n >= dns.HEADER_SIZE {
 			answered += 1
@@ -375,15 +355,15 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 			if check(r, err == nil, "cannot open a client socket") {
 				defer net.close(s)
 				to := net.Endpoint{address = net.IP4_Loopback, port = burst_mock.port}
+				unsent := 0
 				for q in burst_queries("held", 500, 0x5700) {
-					_, _ = net.send_udp(s, q, to)
+					if _, serr := net.send_udp(s, q, to); serr != nil {
+						unsent += 1
+					}
 				}
-				deadline := time.tick_add(time.tick_now(), CLIENT_TIMEOUT)
-				for mock_held(burst_mock) < 500 && time.tick_diff(time.tick_now(), deadline) > 0 {
-					time.sleep(time.Millisecond)
-				}
+				check_eq_int(r, unsent, 0, "burst queries the client could not send")
 				// Only on a failure: the report reads `/proc/net/udp`.
-				if mock_held(burst_mock) < 500 {
+				if !wait_held(burst_mock, CLIENT_TIMEOUT, 500) {
 					fail(r, "the hold of 500 was not reached: %s", mock_hold_report(burst_mock))
 				}
 			}

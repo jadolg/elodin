@@ -1,6 +1,5 @@
 package itest
 
-import "core:fmt"
 import "core:time"
 import "elodin:dns"
 import "elodin:h2"
@@ -17,12 +16,7 @@ run_http_date_cases :: proc(r: ^Runner) {
 	config := base_config(
 		udp_port,
 		upstream_at(next_port(r)),
-		listeners_extra = fmt.tprintf(
-			`  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}`,
-			doh_port,
-			r.cert_file,
-			r.key_file,
-		),
+		listeners_extra = doh_listener(r, doh_port),
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, doh_port = doh_port})
 	if !ok {

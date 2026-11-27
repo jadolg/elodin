@@ -4,7 +4,10 @@ import "core:fmt"
 import "core:net"
 import "core:slice"
 import "core:time"
+import "elodin:config"
 import "elodin:dns"
+import "elodin:server"
+import "elodin:upstream"
 
 /*
 DNS cookies on the client-facing path (RFC 7873, RFC 9018).
@@ -50,13 +53,17 @@ priming_query :: proc(cookie: []u8, id: u16 = 0x5151) -> []u8 {
 		code = u16(dns.EDNS_Option_Code.Cookie),
 		data = cookie,
 	}
-	opt := dns.make_opt(1232, false)
+	opt := dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, false)
 	opt.data = dns.Rdata_OPT{options = options}
 	additional := make([]dns.Record, 1, context.temp_allocator)
 	additional[0] = opt
 	m := dns.Message{id = id, additional = additional}
 	m.flags.rd = true
-	wire, _, _ := dns.encode_message(m, context.temp_allocator)
+	wire, _, err := dns.encode_message(m, context.temp_allocator)
+	if err != .None {
+		// Nil fails the caller's query, and the case with it, not the run.
+		return nil
+	}
 	return wire
 }
 
@@ -76,7 +83,7 @@ check_primed :: proc(r: ^Runner, res: Query_Result, rcode: dns.Rcode) -> (issued
 	check_eq_int(r, int(dns.rcode_of(msg)), int(rcode), "rcode")
 	check_eq_int(r, len(msg.question) + len(msg.answer) + len(msg.authority), 0, "question, answer and authority records")
 	got, found := dns.find_edns_option(msg, .Cookie)
-	if !check(r, found, "the priming answer carries no COOKIE option") || !check_eq_int(r, len(got), 24, "cookie length") {
+	if !check(r, found, "the priming answer carries no COOKIE option") || !check_eq_int(r, len(got), server.COOKIE_REPLY_LEN, "cookie length") {
 		return nil
 	}
 	check(r, slice.equal(got[:8], CLIENT_COOKIE), "the client cookie was not echoed")
@@ -107,7 +114,7 @@ run_cookie_cases :: proc(r: ^Runner) {
 		if check(r, res.ok, "no response") {
 			got, found := find_cookie(r, res.wire)
 			if check(r, found, "the answer carries no COOKIE option") {
-				check_eq_int(r, len(got), 24, "cookie length")
+				check_eq_int(r, len(got), server.COOKIE_REPLY_LEN, "cookie length")
 				check(r, slice.equal(got[:8], CLIENT_COOKIE), "the client cookie was not echoed")
 			}
 		}
@@ -206,7 +213,7 @@ run_cookie_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	run_cookie_require_cases(r, mock, upstream_port)
+	run_cookie_require_cases(r, upstream_port)
 	run_cookie_rate_limit_cases(r, upstream_port)
 }
 
@@ -260,10 +267,17 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 				return
 			}
 			defer net.close(probe)
-			_ = net.set_option(probe, .Receive_Timeout, 400 * time.Millisecond)
+			if !check(r, net.set_option(probe, .Receive_Timeout, 400 * time.Millisecond) == nil, "cannot bound the probe's wait") {
+				end_case(r)
+				return
+			}
 			to := net.Endpoint{address = net.IP4_Loopback, port = udp_port}
-			_, _ = net.send_udp(probe, build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232), to)
-			_, _ = net.send_udp(probe, build_query(f.qname, f.qtype, id = 0x4246, edns_size = 1232, cookie = issued), to)
+			_, plain_err := net.send_udp(probe, build_query(f.qname, f.qtype, id = 0x4245, edns_size = config.DEFAULT_MAX_UDP_RESPONSE), to)
+			_, cookie_err := net.send_udp(probe, build_query(f.qname, f.qtype, id = 0x4246, edns_size = config.DEFAULT_MAX_UDP_RESPONSE, cookie = issued), to)
+			if !check(r, plain_err == nil && cookie_err == nil, "cannot send the probes: %v, %v", plain_err, cookie_err) {
+				end_case(r)
+				return
+			}
 
 			// Until the cookie query is answered and the socket has gone quiet
 			// after it, so a plain answer arriving either side of it is seen.
@@ -381,7 +395,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 				sent, found := find_cookie(r, mock_last_query(mock))
 				if check(r, found, "the upstream saw no cookie") {
 					// Nothing learned yet, so this is a client cookie alone.
-					check_eq_int(r, len(sent), 8, "cookie length on the first query")
+					check_eq_int(r, len(sent), upstream.COOKIE_CLIENT_LEN, "cookie length on the first query")
 				}
 
 				// The second query should carry what the first one learned.
@@ -389,7 +403,8 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 				if check(r, second.ok, "no response to the second query") {
 					again, had := find_cookie(r, mock_last_query(mock))
 					if check(r, had, "the second query carried no cookie") {
-						check_eq_int(r, len(again), 16, "cookie length on the second query")
+						// The client's own and the mock's eight-byte server cookie.
+						check_eq_int(r, len(again), upstream.COOKIE_CLIENT_LEN + 8, "cookie length on the second query")
 						check(r, slice.equal(again[:8], sent), "the client cookie changed between queries")
 					}
 				}
@@ -594,7 +609,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 }
 
 @(private = "file")
-run_cookie_require_cases :: proc(r: ^Runner, mock: ^Mock, upstream_port: int) {
+run_cookie_require_cases :: proc(r: ^Runner, upstream_port: int) {
 	udp_port := next_port(r)
 	srv, ok := start_server(r, Server_Options{config = config_cookies(udp_port, upstream_port, true), udp_port = udp_port, tcp_port = udp_port})
 	if !ok {

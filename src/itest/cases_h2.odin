@@ -24,13 +24,21 @@ config_h2 :: proc(r: ^Runner, udp_port, doh_port, upstream_port: int, upstream_s
 		fmt.tprintf(`["%s127.0.0.1:%d"]`, upstream_scheme, upstream_port),
 		log = "{ level: debug, queries: true }",
 		timeout = "5s",
-		listeners_extra = fmt.tprintf(
-			"  doh: {{ enabled: true, address: \"127.0.0.1\", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}",
-			doh_port,
-			r.cert_file,
-			r.key_file,
-		),
+		listeners_extra = doh_listener(r, doh_port),
 	)
+}
+
+/*
+The result of stream `id`, which `h2_collect` has reported finished; when the
+client holds none, the case fails (`h2_finished`) and an empty result is
+returned, so the reads after it fail their own checks rather than crash.
+*/
+@(private = "file")
+stream_result :: proc(r: ^Runner, c: ^H2_Client, id: u32) -> ^H2_Stream_Result {
+	if res, ok := h2_finished(r, c, id); ok {
+		return res
+	}
+	return new(H2_Stream_Result, context.temp_allocator)
 }
 
 // A name the upstream answers after `GOAWAY_DELAY`, for the GOAWAY case.
@@ -106,7 +114,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "POST", "/dns-query", query), "cannot send the request")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status")
 				check_eq_str(r, h2_header_value(res, "content-type"), "application/dns-message", "content type")
 				check(r, h2_header_value(res, "cache-control") != "", "no cache-control header")
@@ -144,7 +152,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_get(c, 1, "/dns-query", query), "cannot send the request")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status")
 				h := parse_header(r, res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
@@ -167,7 +175,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "GET", "/apple-doh.mobileconfig", nil), "cannot send the request")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status")
 				check_eq_str(
 					r,
@@ -195,7 +203,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, huffman = true), "cannot send")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status")
 			}
 		}
@@ -211,7 +219,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			}
 			check(r, h2_send_request(hc, 1, "POST", "/dns-query", query, content_type = c.content_type), "cannot send")
 			if check(r, h2_collect(hc, []u32{1}), "%q: stream 1 never completed", c.content_type) {
-				res, _ := h2_stream(hc, 1)
+				res := stream_result(r, hc, 1)
 				check_eq_int(r, res.status, c.status, c.content_type)
 			}
 			h2_close(hc)
@@ -226,7 +234,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, split_headers = true), "cannot send")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status")
 			}
 		}
@@ -248,9 +256,9 @@ run_h2_cases :: proc(r: ^Runner) {
 			served:     bool,
 		}
 		rows := []Trailer_Row {
-			{"h2: a request that ends with trailers is served", {{"x-t", "1"}}, true, true},
-			{"h2: trailers without END_STREAM reset the request", {{"x-t", "1"}}, false, false},
-			{"h2: a pseudo-header in trailers resets the request", {{":path", "/"}}, true, false},
+			{what = "h2: a request that ends with trailers is served", trailers = {{"x-t", "1"}}, end_stream = true, served = true},
+			{what = "h2: trailers without END_STREAM reset the request", trailers = {{"x-t", "1"}}, end_stream = false, served = false},
+			{what = "h2: a pseudo-header in trailers resets the request", trailers = {{":path", "/"}}, end_stream = true, served = false},
 		}
 		for row in rows {
 			start_case(r, row.what)
@@ -258,7 +266,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			if check(r, cok, "cannot open an h2 connection") {
 				check(r, h2_send_request(c, 1, "POST", "/dns-query", query, trailers = row.trailers, trailers_end_stream = row.end_stream), "cannot send")
 				if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-					res, _ := h2_stream(c, 1)
+					res := stream_result(r, c, 1)
 					if row.served {
 						check_eq_int(r, res.status, 200, "status")
 						check(r, !res.reset, "stream 1 was reset")
@@ -268,7 +276,7 @@ run_h2_cases :: proc(r: ^Runner) {
 				}
 				check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3")
 				if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after the trailers") {
-					res, _ := h2_stream(c, 3)
+					res := stream_result(r, c, 3)
 					check_eq_int(r, res.status, 200, "stream 3 status")
 				}
 				check(r, !c.goaway, "GOAWAY %v for the trailers", c.goaway_code)
@@ -316,7 +324,7 @@ run_h2_cases :: proc(r: ^Runner) {
 				check(r, h2_send_request(c, 1, "POST", "/dns-query", query), "cannot send")
 				// A reset counts as completed too, and is not being served.
 				if check(r, h2_collect(c, []u32{1}, 3 * time.Second), "stream 1 never completed") {
-					res, _ := h2_stream(c, 1)
+					res := stream_result(r, c, 1)
 					check_eq_int(r, res.status, 200, "status of stream 1 before the frame")
 				}
 			}
@@ -335,7 +343,7 @@ run_h2_cases :: proc(r: ^Runner) {
 				check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3")
 				if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after the frame") {
 					// A reset counts as completed too, and is not being served.
-					res, _ := h2_stream(c, 3)
+					res := stream_result(r, c, 3)
 					check_eq_int(r, res.status, 200, "status of stream 3 after the frame")
 				}
 				check(r, !c.goaway, "GOAWAY (%v) for a frame the server must accept", c.goaway_code)
@@ -358,9 +366,9 @@ run_h2_cases :: proc(r: ^Runner) {
 		c, cok := h2_connect(doh_port)
 		if check(r, cok, "cannot open an h2 connection") {
 			defer h2_close(c)
-			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, table_update = 4096), "cannot send")
+			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, table_update = h2.DEFAULT_HEADER_TABLE_SIZE), "cannot send")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status")
 			}
 		}
@@ -372,10 +380,10 @@ run_h2_cases :: proc(r: ^Runner) {
 		c, cok := h2_connect(doh_port)
 		if check(r, cok, "cannot open an h2 connection") {
 			defer h2_close(c)
-			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, table_update = 8192), "cannot send")
+			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, table_update = 2 * h2.DEFAULT_HEADER_TABLE_SIZE), "cannot send")
 			// The connection ends, so this returns as soon as the read fails
 			// rather than waiting out the timeout.
-			_ = h2_collect(c, []u32{1}, 3 * time.Second)
+			_ = h2_collect(c, []u32{1}, 3 * time.Second) // lint:allow the stream is meant not to finish; `answered` below is the outcome
 			res, found := h2_stream(c, 1)
 			answered := found && res.done && res.status == 200
 			check(r, !answered, "a table twice the advertised size was accepted and the request served")
@@ -421,7 +429,7 @@ run_h2_cases :: proc(r: ^Runner) {
 					if check(r, h2_collect(c, ids), "not every stream completed") {
 						elapsed := time.tick_since(started)
 						for id in ids {
-							res, _ := h2_stream(c, id)
+							res := stream_result(r, c, id)
 							check(r, res.status == 200, "stream %d status %d", id, res.status)
 						}
 						// Four 300ms queries: serial would be about 1.2s.
@@ -476,11 +484,11 @@ run_h2_cases :: proc(r: ^Runner) {
 			}
 			check(r, stalled, "the server never sent a frame constrained by the 8-byte window")
 
-			check(r, h2_send_window_update(c, 1, 65535), "cannot send a stream window update")
-			check(r, h2_send_window_update(c, 0, 65535), "cannot send a connection window update")
+			check(r, h2_send_window_update(c, 1, h2.DEFAULT_WINDOW), "cannot send a stream window update")
+			check(r, h2_send_window_update(c, 0, h2.DEFAULT_WINDOW), "cannot send a connection window update")
 
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status")
 				if check(r, len(res.body) >= dns.HEADER_SIZE, "body too short: %d", len(res.body)) {
 					h := parse_header(r, res.body)
@@ -520,7 +528,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			check(r, h2_send_ping(c, {1, 2, 3, 4, 5, 6, 7, 8}), "cannot send a ping")
 			// Pump alongside a real request so there is something to wait for.
 			check(r, h2_send_request(c, 1, "POST", "/dns-query", query), "cannot send")
-			h2_collect(c, []u32{1})
+			check(r, h2_collect(c, []u32{1}), "the request beside the ping never completed")
 			check(r, c.pings >= 1, "no PING ACK was received")
 		}
 	}
@@ -537,7 +545,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			// The connection must still serve a later stream.
 			check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3")
 			if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after a reset") {
-				res, _ := h2_stream(c, 3)
+				res := stream_result(r, c, 3)
 				check_eq_int(r, res.status, 200, "status on the stream after a reset")
 			}
 		}
@@ -580,7 +588,7 @@ run_h2_cases :: proc(r: ^Runner) {
 				tc.what,
 			)
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never ended for %s", tc.what) {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check(r, res.reset, "%s was answered instead of reset", tc.what)
 				check_eq_int(
 					r,
@@ -596,7 +604,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			check(r, !c.goaway, "a malformed request took the whole connection down for %s", tc.what)
 			check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3 after %s", tc.what)
 			if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after %s", tc.what) {
-				res, _ := h2_stream(c, 3)
+				res := stream_result(r, c, 3)
 				check_eq_int(r, res.status, 200, fmt.tprintf("status on the stream after %s", tc.what))
 			}
 		}
@@ -693,7 +701,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "POST", "/nope", query), "cannot send")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 404, "status")
 			}
 		}
@@ -710,14 +718,14 @@ run_h2_cases :: proc(r: ^Runner) {
 			check(r, h2_send_request(c, 5, "HEAD", "/dns-query", nil), "cannot send")
 			if check(r, h2_collect(c, []u32{1, 3, 5}), "a stream never completed") {
 				// RFC 9110 15.5.6: a 405 MUST carry Allow.
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 405, "status")
 				check_eq_str(r, h2_header_value(res, "allow"), "GET, POST", "allow")
-				res, _ = h2_stream(c, 3)
+				res = stream_result(r, c, 3)
 				check_eq_int(r, res.status, 405, "profile status")
 				check_eq_str(r, h2_header_value(res, "allow"), "GET", "profile allow")
 				// RFC 9110 9.3.2: a reply to HEAD carries no content.
-				res, _ = h2_stream(c, 5)
+				res = stream_result(r, c, 5)
 				check_eq_int(r, res.status, 405, "HEAD status")
 				check_eq_int(r, res.data_frames, 0, "DATA frames on the HEAD reply")
 				// RFC 9110 8.6: no content-length unless it is what GET would send.
@@ -735,7 +743,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, content_type = "text/plain"), "cannot send")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 415, "status")
 			}
 		}
@@ -788,7 +796,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_get(c, 1, "/dns-query", query), "cannot send the request")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status before the reload")
 			}
 			narrowed := strings.concatenate(
@@ -807,7 +815,9 @@ run_h2_cases :: proc(r: ^Runner) {
 				}
 				check(r, h2_send_request(c, 3, "POST", "/dns-query", query, then = pings[:]), "cannot send the request")
 				check(r, wait_for_log_count(&srv, NEEDLE, before + 1, 5 * time.Second), "the refusal was never logged")
-				for !c.goaway && h2_pump(c) {}
+				// Each pump is bounded by the read timeout; the deadline bounds them all.
+				pump_until := time.tick_add(time.tick_now(), 5 * time.Second)
+				for !c.goaway && time.tick_diff(time.tick_now(), pump_until) > 0 && h2_pump(c) {}
 				res, found := h2_stream(c, 3)
 				if check(r, found, "stream 3 was never answered") {
 					check_eq_int(r, res.status, 403, "status after the reload")
@@ -815,12 +825,13 @@ run_h2_cases :: proc(r: ^Runner) {
 				check(r, c.goaway, "the refused connection was not sent GOAWAY")
 				check(r, c.goaway_code == .No_Error, "GOAWAY code %v, want NO_ERROR", c.goaway_code)
 				end := tlsx.Error.None
-				for end == .None {
+				read_until := time.tick_add(time.tick_now(), 5 * time.Second)
+				for end == .None && time.tick_diff(time.tick_now(), read_until) > 0 {
 					rest: [4096]u8
 					n, err := tlsx.read(c.conn.tls, rest[:])
 					end = .Closed if err == .None && n == 0 else err
 				}
-				check(r, end == .Closed, "the refused connection ended with %v, not a close", end)
+				check(r, end == .Closed, "the refused connection ended with %v, not a close, within the deadline", end)
 				// Past the close_notify the socket holds the FIN or the RST, whichever
 				// the close sent; the socket is non-blocking under TLS, hence the poll.
 				fd := posix.FD(c.conn.socket)
@@ -876,9 +887,9 @@ run_h2_large_response_case :: proc(r: ^Runner) {
 			q := build_query("big.test.", u16(dns.Type.TXT), id = 0x33, edns_size = 4096)
 			check(r, h2_send_request(c, 1, "POST", "/dns-query", q), "cannot send")
 			if check(r, h2_collect(c, []u32{1}, 20 * time.Second), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
+				res := stream_result(r, c, 1)
 				check_eq_int(r, res.status, 200, "status")
-				check(r, len(res.body) > 16384, "response is only %d bytes, too small to split", len(res.body))
+				check(r, len(res.body) > h2.DEFAULT_MAX_FRAME, "response is only %d bytes, too small to split", len(res.body))
 				check(r, res.data_frames > 1, "a %d-byte body arrived in one DATA frame", len(res.body))
 				check_eq_int(r, len(res.body), len(big), "reassembled length")
 				h := parse_header(r, res.body)

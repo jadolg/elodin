@@ -49,14 +49,18 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 				start_case(r, "upstream: DoH/h2 connection is multiplexed across queries, not reopened")
 				{
 					before_h2, _ := doh2_mock_counts(mock)
+					before_accepts := doh2_mock_accepts(mock)
 					for i in 0 ..< 5 {
 						res := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = u16(500 + i)))
 						check(r, res.ok, "no response on query %d", i)
 					}
 					after_h2, _ := doh2_mock_counts(mock)
-					// Every query answered over h2, but on the one shared connection:
-					// hits (streams) go up while the mock only ever accepts once.
+					// Every query answered over h2, but on one shared connection: the
+					// streams go up by five while the mock accepts at most once - the
+					// connection the case before opened, or one if that one was let go.
 					check_eq_int(r, after_h2 - before_h2, 5, "streams answered over h2")
+					accepted := doh2_mock_accepts(mock) - before_accepts
+					check(r, accepted <= 1, "five queries opened %d connections", accepted)
 				}
 				end_case(r)
 				stop_server(&srv)
@@ -450,12 +454,18 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 			{what = "upstream: an http/1.1 DoH reply's Age is taken off its TTLs, forwarded and cached", alpn = {"http/1.1"}},
 		}
 		for tc, i in age_cases {
+			if age_payload == nil {
+				start_case(r, tc.what)
+				fail(r, "the aged reply does not encode")
+				end_case(r)
+				continue
+			}
 			upstream_port := next_port(r)
 			mock := doh2_mock_make(upstream_port, "/dns-query", age_payload)
 			// A literal: the mock's threads read it after `end_case` frees the
 			// temporary allocator.
 			mock.age = AGE_HEADER
-			if age_payload == nil || !doh2_mock_start(mock, r.cert_file, r.key_file, tc.alpn) {
+			if !doh2_mock_start(mock, r.cert_file, r.key_file, tc.alpn) {
 				skip_case(r, tc.what, "cannot start the mock")
 				doh2_mock_stop(mock)
 				continue
@@ -559,16 +569,6 @@ AGE_HEADER :: "250"
 // An answer to `AGE_QNAME` A at TTL `AGE_TTL`.
 @(private = "file")
 age_answer :: proc() -> []u8 {
-	m := dns.Message {
-		question = []dns.Question{{name = AGE_QNAME, type = .A, class = .IN}},
-		answer   = []dns.Record{{name = AGE_QNAME, type = .A, class = .IN, ttl = AGE_TTL, data = dns.Rdata_A{addr = {10, 9, 9, 9}}}},
-	}
-	m.flags.qr = true
-	m.flags.rd = true
-	m.flags.ra = true
-	wire, _, err := dns.encode_message(m, context.allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	answer := []dns.Record{{name = AGE_QNAME, type = .A, class = .IN, ttl = AGE_TTL, data = dns.Rdata_A{addr = {10, 9, 9, 9}}}}
+	return encode_reply(AGE_QNAME, .A, dns.Message{answer = answer})
 }
