@@ -153,6 +153,10 @@ do_init :: proc() {
 	if OPENSSL_init_ssl(INIT_FLAGS, nil) != 1 {
 		// The first error is the cause; the rest are the layers that reported it.
 		init_problem_len = copy(init_problem_buf[:], last_error(context.temp_allocator))
+		// An empty copy would read as success: the start-up failed either way.
+		if init_problem_len == 0 {
+			init_problem_len = copy(init_problem_buf[:], "OpenSSL did not start, and no room was left to say why")
+		}
 		ERR_clear_error()
 	}
 	alpn_ex_index = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil, nil, nil, alpn_ex_free)

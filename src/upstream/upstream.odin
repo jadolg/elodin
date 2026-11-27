@@ -303,10 +303,19 @@ make_upstream :: proc(
 	err: Error,
 ) {
 	u = new(Upstream, allocator)
+	if u == nil {
+		return nil, .Out_Of_Memory
+	}
 	u.spec = clone_spec(spec, allocator)
 	u.allocator = allocator
 	if spec.kind == .HTTPS {
 		u.authority = doh_authority(u.spec.hostname, u.spec.url, allocator)
+		// Empty only when the formatting found no room: a DoH upstream with no
+		// authority would send an empty Host or `:authority` until a reload.
+		if u.authority == "" {
+			destroy(u)
+			return nil, .Out_Of_Memory
+		}
 	}
 	u.max_idle = max(max_idle, 0)
 	u.idle_timeout = idle_timeout
