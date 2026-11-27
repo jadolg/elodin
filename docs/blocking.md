@@ -62,6 +62,15 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.
+- A cached copy, its fingerprint and its temporary file are written only under
+  names spelt whole. With no memory to spell them, the copy is not saved and
+  the one before is kept (`list NAME: there is no memory to name the cached
+  copy; it is not saved`), and a copy an earlier build cached under a url with
+  its query moves to the list's name at the next load instead (`blocking:
+  there is no memory to name the cached copies; those named by a url's query
+  move at the next load`). A load with no memory to check which lists would
+  share a cache file is refused (`blocking: there is no memory to check the
+  lists' cache files`).
 - If a list that loaded before has neither a download nor a cached copy at a
   refresh, the refresh is dropped and every rule already in effect is kept
   (`list NAME: loaded before and unavailable now; keeping the rules already in

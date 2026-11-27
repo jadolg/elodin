@@ -1855,3 +1855,256 @@ test_a_list_with_no_copy_to_read_again_is_downloaded_again :: proc(t: ^testing.T
 	}
 	testing.expect(t, kept > 0, "no build left the file list out")
 }
+
+// The names of the entries in `dir`, which the test fails on when it cannot list.
+@(private = "file")
+entries_of :: proc(t: ^testing.T, dir: string, loc := #caller_location) -> (names: [dynamic]string, ok: bool) {
+	infos, err := os.read_directory_by_path(dir, -1, context.temp_allocator)
+	if !testing.expectf(t, err == nil, "cannot list %s: %v", dir, err, loc = loc) {
+		return
+	}
+	names = make([dynamic]string, 0, len(infos), context.temp_allocator)
+	for fi in infos {
+		append(&names, fi.name)
+	}
+	return names, true
+}
+
+// Whether every entry of `dir` is one of `allowed`; the test fails on any other.
+@(private = "file")
+expect_only_entries :: proc(t: ^testing.T, dir: string, allowed: []string, what: string, loc := #caller_location) {
+	names, ok := entries_of(t, dir, loc)
+	if !ok {
+		return
+	}
+	outer: for name in names {
+		for a in allowed {
+			if name == a {
+				continue outer
+			}
+		}
+		testing.expectf(t, false, "%s: a stray %q in %s", what, name, dir, loc = loc)
+	}
+}
+
+/*
+A copy named by a query moves only under names spelt whole (#780). Whichever
+allocation of the temp allocator spelling them is refused, a list's own copy
+stays where it is and lands under no other list's name, and a copy that moves is
+read back as its own url's. With memory to spare, the move is made.
+*/
+@(test)
+test_a_move_without_memory_moves_nothing_it_cannot_name :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg, dir := list_test_dir(t, "move-no-memory")
+	defer os.remove(dir)
+	// `kept` is named by its url, so its own copy has the name `other`'s url
+	// gave its copy before #487.
+	kept := config.Block_List{name = "http://192.0.2.1/c?key=SECRET", url = "http://192.0.2.1/c?key=SECRET", format = .Hosts, enabled = true, named = true}
+	other := config.Block_List{name = "http://192.0.2.1/c", url = "http://192.0.2.1/c?key=SECRET", format = .Hosts, enabled = true}
+	moved := config.Block_List{name = "http://192.0.2.1/a", url = "http://192.0.2.1/a?key=SECRET", format = .Hosts, enabled = true}
+	cfg.blocking.lists = []config.Block_List{kept, other, moved}
+	KEPT :: "0.0.0.0 kept.example\n"
+	MOVED :: "0.0.0.0 moved.example\n"
+	kept_own := list_cache_path(&cfg, kept)
+	other_path := list_cache_path(&cfg, other)
+	moved_old := strings.concatenate({dir, "/", config.list_cache_name(moved.url)}, context.temp_allocator)
+	moved_path := list_cache_path(&cfg, moved)
+	all := []string{kept_own, other_path, moved_old, moved_path}
+	files := []string{filepath_base(kept_own), filepath_base(moved_old), filepath_base(moved_path), filepath_base(source_path(moved_path))}
+	defer for f in all {
+		os.remove(f)
+		os.remove(source_path(f))
+	}
+
+	refused := 0
+	for fail_at := 1; ; fail_at += 1 {
+		os.remove(moved_path)
+		os.remove(source_path(moved_path))
+		if !testing.expect(t, os.write_entire_file(kept_own, KEPT) == nil && os.write_entire_file(moved_old, MOVED) == nil, "cannot plant the copies") {
+			return
+		}
+		f := testkit.Fail_Nth{fail_at = fail_at, fail_for = 1}
+		{
+			context.temp_allocator = testkit.fail_nth(&f)
+			move_query_named_caches(&cfg)
+		}
+		text, load := cached_copy(&cfg, kept, .Stale)
+		testing.expectf(t, load == .Stale && text == KEPT, "run %d: the named list's own copy reads as %v %q", fail_at, load, text)
+		delete(text)
+		testing.expectf(t, !os.exists(other_path), "run %d: a copy was moved to another list's name", fail_at)
+		expect_only_entries(t, dir, files, fmt.tprintf("run %d", fail_at))
+		if os.exists(moved_old) {
+			testing.expectf(t, !os.exists(moved_path), "run %d: a copy left under its url beside one moved", fail_at)
+		} else {
+			text, load = cached_copy(&cfg, moved, .Stale)
+			testing.expectf(t, load == .Stale && text == MOVED, "run %d: the moved copy reads as %v %q", fail_at, load, text)
+			delete(text)
+		}
+		if f.seen < fail_at {
+			testing.expectf(t, !os.exists(moved_old), "with every allocation granted, the copy named by its query did not move")
+			break
+		}
+		refused += 1
+	}
+	testing.expect(t, refused > 0, "no allocation was refused")
+}
+
+// The last element of `path`.
+@(private = "file")
+filepath_base :: proc(path: string) -> string {
+	return path[strings.last_index_byte(path, '/') + 1:]
+}
+
+/*
+A copy saved while the temp allocator refuses one request is read back as the
+list's own, new or the one before, and nothing is written but the copy and its
+fingerprint, beside each other in `cache_dir` (#780): a name spelt short is
+another list's file, or one outside the cache, and is never written. The cache
+directory, made by the save, is made where it is named and nowhere else.
+*/
+@(test)
+test_a_copy_saved_without_memory_is_its_own :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg, dir := list_test_dir(t, "save-no-memory")
+	defer os.remove(dir)
+	SUB :: "cache"
+	cfg.blocking.cache_dir = strings.concatenate({dir, "/", SUB}, context.temp_allocator)
+	defer os.remove(cfg.blocking.cache_dir)
+	// A query, so the copy is read only beside its fingerprint.
+	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt?key=k", format = .Hosts, enabled = true}
+	OLD :: "0.0.0.0 old.example\n"
+	NEW :: "0.0.0.0 new.example\n"
+	path := list_cache_path(&cfg, list)
+	files := []string{filepath_base(path), filepath_base(source_path(path))}
+	clear_copies :: proc(path: string) {
+		os.remove(path)
+		os.remove(source_path(path))
+	}
+	defer clear_copies(path)
+	// A fingerprint spelt short is ".src", and a temporary file ".tmp", in the
+	// working directory; a ".tmp" there is removed to make way for it.
+	if !testing.expect(t, !os.exists(".src") && !os.exists(".tmp"), "the premise: no .src or .tmp in the working directory") {
+		return
+	}
+	SENTINEL :: "not the cache's"
+	if !testing.expect(t, os.write_entire_file(".tmp", SENTINEL) == nil, "cannot plant .tmp") {
+		return
+	}
+	defer os.remove(".tmp")
+
+	for with_old in ([]bool{false, true}) {
+		refused := 0
+		for fail_at := 1; ; fail_at += 1 {
+			clear_copies(path)
+			os.remove(cfg.blocking.cache_dir)
+			if with_old {
+				save_cached_copy(&cfg, list, OLD)
+				text, load := cached_copy(&cfg, list, .Stale)
+				ok := testing.expectf(t, load == .Stale && text == OLD, "the premise: the old copy reads as %v %q", load, text)
+				delete(text)
+				if !ok {
+					return
+				}
+			}
+			f := testkit.Fail_Nth{fail_at = fail_at, fail_for = 1}
+			{
+				context.temp_allocator = testkit.fail_nth(&f)
+				save_cached_copy(&cfg, list, NEW)
+			}
+			text, load := cached_copy(&cfg, list, .Stale)
+			if with_old {
+				testing.expectf(t, load == .Stale && (text == NEW || text == OLD), "old, run %d: read back as %v %q", fail_at, load, text)
+			} else {
+				testing.expectf(t, (load == .Stale && text == NEW) || load == .Unavailable, "run %d: read back as %v %q", fail_at, load, text)
+			}
+			delete(text)
+			expect_only_entries(t, dir, {SUB}, fmt.tprintf("old %v, run %d", with_old, fail_at))
+			if os.exists(cfg.blocking.cache_dir) {
+				expect_only_entries(t, cfg.blocking.cache_dir, files, fmt.tprintf("old %v, run %d", with_old, fail_at))
+			}
+			testing.expectf(t, !os.exists(".src"), "old %v, run %d: a fingerprint written to the working directory", with_old, fail_at)
+			os.remove(".src")
+			sentinel, rerr := os.read_entire_file(".tmp", context.temp_allocator)
+			testing.expectf(t, rerr == nil && string(sentinel) == SENTINEL, "old %v, run %d: the working directory's .tmp was replaced (%v)", with_old, fail_at, rerr)
+			if string(sentinel) != SENTINEL && !testing.expect(t, os.write_entire_file(".tmp", SENTINEL) == nil, "cannot plant .tmp again") {
+				return
+			}
+			if f.seen < fail_at {
+				testing.expectf(t, load == .Stale && text == NEW, "old %v: with every allocation granted, read back as %v", with_old, load)
+				break
+			}
+			refused += 1
+		}
+		testing.expectf(t, refused > 0, "old %v: no allocation was refused", with_old)
+	}
+}
+
+/*
+A list whose cache name is spelt short for want of memory is not taken as fresh
+on another list's copy (#780): `ab` spelt short is `b`, whose copy is fresh, so
+a refused allocation would keep `ab` from being downloaded for the rest of the
+refresh window. The download goes to a port nothing listens on.
+*/
+@(test)
+test_a_name_spelt_short_is_not_fresh :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg, dir := list_test_dir(t, "fresh-no-memory")
+	defer os.remove(dir)
+	b := config.Block_List{name = "b", url = "http://127.0.0.1:1/b", format = .Hosts, enabled = true}
+	ab := config.Block_List{name = "ab", url = "http://127.0.0.1:1/ab", format = .Hosts, enabled = true}
+	cfg.blocking.lists = []config.Block_List{b, ab}
+	b_path := list_cache_path(&cfg, b)
+	if !testing.expect(t, os.write_entire_file(b_path, "0.0.0.0 b.example\n") == nil, "cannot write b's copy") {
+		return
+	}
+	defer os.remove(b_path)
+	// The premise: b's copy is fresh for b.
+	_, fetch := fetch_list(&cfg, b)
+	testing.expect_value(t, fetch, Fetch.Cache_Is_Fresh)
+
+	refused := 0
+	for fail_at := 1; ; fail_at += 1 {
+		f := testkit.Fail_Nth{fail_at = fail_at, fail_for = 1}
+		text: string
+		{
+			context.temp_allocator = testkit.fail_nth(&f)
+			text, fetch = fetch_list(&cfg, ab)
+		}
+		delete(text)
+		testing.expectf(t, fetch != .Cache_Is_Fresh, "run %d: ab was taken as fresh with no copy of its own", fail_at)
+		if f.seen < fail_at {
+			testing.expect_value(t, fetch, Fetch.Failed)
+			break
+		}
+		refused += 1
+	}
+	testing.expect(t, refused > 0, "no allocation was refused")
+}
+
+/*
+The cache directory and those above it are made with a temp allocator that
+refuses every request (#780): each is a prefix of the path, so none is made
+short, at a path the operator never named.
+*/
+@(test)
+test_cache_directories_need_no_memory :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	_, dir := list_test_dir(t, "mkdirs-no-memory")
+	defer os.remove(dir)
+	top := strings.concatenate({dir, "/a"}, context.temp_allocator)
+	path := strings.concatenate({top, "//b/"}, context.temp_allocator)
+	defer os.remove(top)
+	defer os.remove(path)
+	f := testkit.Fail_Nth{fail_at = 1, fail_for = max(int)}
+	{
+		context.temp_allocator = testkit.fail_nth(&f)
+		// The premise: every request is refused.
+		_, aerr := mem.alloc(1, allocator = context.temp_allocator)
+		if !testing.expect_value(t, aerr, mem.Allocator_Error.Out_Of_Memory) {
+			return
+		}
+		make_directories(path)
+	}
+	testing.expect(t, os.is_dir(path), "the cache directory was not made")
+}
