@@ -1,6 +1,7 @@
 package upstream
 
 import "core:c"
+import "core:mem"
 import "core:net"
 import "core:sys/linux"
 import "core:sys/posix"
@@ -82,24 +83,13 @@ dial_tcp_timeout :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (soc
 	return net.TCP_Socket(fd), .None
 }
 
+// `endpoint` as a socket address for `posix.connect`, built by `loop.sock_addr`.
 @(private)
 fill_sockaddr :: proc(endpoint: net.Endpoint, storage: ^posix.sockaddr_in6, out_len: ^posix.socklen_t) {
-	switch a in endpoint.address {
-	case net.IP4_Address:
-		v4 := cast(^posix.sockaddr_in)storage
-		v4^ = {}
-		v4.sin_family = .INET
-		v4.sin_port = posix.in_port_t(u16be(u16(endpoint.port)))
-		bytes := a
-		v4.sin_addr = transmute(posix.in_addr)bytes
-		out_len^ = posix.socklen_t(size_of(posix.sockaddr_in))
-	case net.IP6_Address:
-		storage^ = {}
-		storage.sin6_family = .INET6
-		storage.sin6_port = posix.in_port_t(u16be(u16(endpoint.port)))
-		storage.sin6_addr = transmute(posix.in6_addr)a
-		out_len^ = posix.socklen_t(size_of(posix.sockaddr_in6))
-	}
+	addr, size, _ := loop.sock_addr(endpoint) // lint:allow callers pass only an IPv4 or IPv6 endpoint
+	storage^ = {}
+	mem.copy(storage, &addr, int(size))
+	out_len^ = posix.socklen_t(size)
 }
 
 /*

@@ -235,10 +235,6 @@ run :: proc(l: ^Loop) {
 			timeout = 0
 		} else if len(l.timers) > 0 {
 			left := time.tick_diff(l.clock(), timer_due(l.timers[0]))
-			// Rounded up, so a timer due in 0.4 ms is not polled for in a loop of
-			// zero-length waits until it is due.
-			// Held to what `epoll_wait` takes: a deadline weeks away would
-			// otherwise wrap to a negative figure, which is no timeout at all.
 			timeout = ms_ceil(left, max(i32))
 		}
 		// Wake to trim, if there is anything to trim; see `trim_window`. The lock
@@ -258,7 +254,11 @@ run :: proc(l: ^Loop) {
 		if l.trim_owed > 0 {
 			timeout = 0
 		}
-		n, err := epoll_wait(l.epfd, events[:], timeout)
+		// `epoll_pwait` with no mask, not `core:sys/linux`'s `epoll_wait`, which
+		// on arm64 hands `epoll_pwait` a `timespec` pointer where it takes
+		// milliseconds, so a 20 ms wait lasted hours; arm64 has no plain
+		// `epoll_wait`.
+		n, err := linux.epoll_pwait(l.epfd, raw_data(events[:]), i32(len(events)), timeout, nil)
 		if err != .NONE && err != .EINTR {
 			// Nothing the loop can do about a broken epoll descriptor but say so;
 			// spinning on it would be worse.
@@ -277,30 +277,6 @@ run :: proc(l: ^Loop) {
 			trim_some(l)
 		}
 	}
-}
-
-/*
-`epoll_pwait` with no signal mask, which is `epoll_wait`.
-
-Not `core:sys/linux`'s `epoll_wait`, which on arm64 passes a pointer to a
-`timespec` where `epoll_pwait` takes its timeout as milliseconds in an `int`: the
-kernel reads the pointer as the timeout and a wait that should end in 20 ms ends
-in hours. arm64 has no plain `epoll_wait` system call, so the same call serves
-both architectures.
-*/
-@(private)
-epoll_wait :: proc(epfd: linux.Fd, events: []linux.EPoll_Event, timeout_ms: i32) -> (i32, linux.Errno) {
-	ret := intrinsics.syscall(
-		linux.SYS_epoll_pwait,
-		uintptr(epfd),
-		uintptr(raw_data(events)),
-		uintptr(len(events)),
-		uintptr(int(timeout_ms)),
-		0,
-		0,
-	)
-	n, err := syscall_result(ret)
-	return i32(n), err
 }
 
 @(private)

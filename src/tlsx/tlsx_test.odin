@@ -25,6 +25,19 @@ more than one thread at a time, and a mock would define that away.
 @(private = "file")
 SSL_CTRL_SESS_NUMBER :: 20
 
+SSL_OP_NO_TICKET :: u64(1) << 14
+SSL_SESS_CACHE_SERVER :: 0x0002
+
+// Bindings only the tests read; the server never asks OpenSSL for these.
+foreign import test_ssl "system:ssl"
+
+@(default_calling_convention = "c")
+foreign test_ssl {
+	SSL_CTX_get_timeout :: proc(ctx: ^SSL_CTX) -> c.long ---
+	SSL_CTX_get_options :: proc(ctx: ^SSL_CTX) -> u64 ---
+	SSL_SESSION_get0_ticket :: proc(s: ^SSL_SESSION, tick: ^[^]u8, len: ^c.size_t) ---
+}
+
 // The mode bits of one connection; `SSL_get_mode` is a macro for this.
 @(private = "file")
 ssl_get_mode :: proc(ssl: ^SSL) -> c.long {

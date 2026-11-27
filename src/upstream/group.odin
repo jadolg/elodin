@@ -387,14 +387,9 @@ resolve_insisting :: proc(
 
 	On the tick clock, for the reason `resolve_sequential` gives.
 	*/
-	budget := query_budget(g)
-	if deadline != nil && deadline^ != {} {
-		left := time.tick_diff(loop.tick_now(), deadline^)
-		if left <= 0 {
-			logx.debugf("this query's upstream deadline has passed, not asking the group again for it")
-			return nil, nil, .Deadline
-		}
-		budget = min(budget, left)
+	budget, open := insisting_budget(g, deadline)
+	if !open {
+		return nil, nil, .Deadline
 	}
 
 	// Scratch, in the request's own, which the caller resets - and only ever as
@@ -569,118 +564,189 @@ resolve_insisting :: proc(
 	expiry one query pays for it again, which is the arrangement every other
 	part of this file already makes.
 	*/
-	budget = min(g.timeout, budget - loop.tick_since(started))
+	sw := Sweep {
+		g           = g,
+		query       = query,
+		acceptable  = acceptable,
+		proves      = proves,
+		data        = data,
+		allocator   = allocator,
+		response    = response,
+		winner      = winner,
+		in_hand     = in_hand,
+		unreachable = unreachable[:],
+		// The member that gave the first reply, which `winner` stops naming once a
+		// later reply takes its place in hand.
+		first       = winner,
+	}
+	sweep_rest(&sw, min(g.timeout, budget - loop.tick_since(started)), started)
+	// Nobody could answer, or prove. The best reply stands, rcode and all: the
+	// caller reads it and decides, and turning one verdict into another is not
+	// this procedure's business.
+	return sw.response, sw.winner, .None
+}
+
+/*
+The lesser of `g`'s `query_budget` and what is left of the question's `deadline`
+(zero, or nil, is none); `open` false when nothing is left.
+*/
+@(private)
+insisting_budget :: proc(g: ^Group, deadline: ^time.Tick) -> (budget: time.Duration, open: bool) {
+	budget = query_budget(g)
+	if deadline != nil && deadline^ != {} {
+		left := time.tick_diff(loop.tick_now(), deadline^)
+		if left <= 0 {
+			logx.debugf("this query's upstream deadline has passed, not asking the group again for it")
+			return 0, false
+		}
+		budget = min(budget, left)
+	}
+	return budget, true
+}
+
+// A sweep in progress over the rest of a group: what the caller will take, the
+// reply in hand and who gave it, and the members this call could not reach.
+@(private)
+Sweep :: struct {
+	g:           ^Group,
+	query:       []u8,
+	acceptable:  proc(response: []u8) -> bool,
+	proves:      proc(response: []u8, data: rawptr) -> bool,
+	data:        rawptr,
+	allocator:   mem.Allocator,
+	response:    []u8,
+	winner:      ^Upstream,
+	in_hand:     bool,
+	unreachable: []^Upstream,
+	first:       ^Upstream,
+}
+
+// Ask the rest of `sw.g` in order until a reply takes the place of the one in
+// hand for good, or the waiting reaches `budget`.
+@(private)
+sweep_rest :: proc(sw: ^Sweep, budget: time.Duration, started: time.Tick) {
 	spent: time.Duration
-	// The member that gave the first reply, which `winner` stops naming once a
-	// later reply takes its place in hand.
-	first := winner
-	for u in g.servers {
+	for u in sw.g.servers {
 		if spent >= budget {
 			logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unswept", loop.tick_since(started))
 			break
 		}
-		if u == first {
-			continue
-		}
-		/*
-		And a server this very call already failed to reach is skipped too,
-		which the cooldown above does not cover: three consecutive failures is
-		what parks a server, so the first two cost `g.timeout` each and leave it
-		`healthy`. Without this, a group of one unreachable member and one that
-		answers REFUSED pays that timeout twice for one question - once in
-		`resolve`, once more here - to be handed the same REFUSED, which is a
-		second `timeout` added to a query that took one before the sweep existed
-		(issue #309).
-
-		Only what this call proved. A failure from a minute ago is somebody
-		else's news and the member goes on being asked, because a group whose
-		second member is reached only when the first breaks would otherwise
-		carry a stale failure for as long as the first one holds.
-
-		Under `strategy: race` this list is empty for a group of two or more, so
-		the saving is the sequential strategies'. `resolve` says why: the race
-		is over before a dead member has finished not answering.
-		*/
-		if slice.contains(unreachable[:], u) {
-			logx.debugf("upstream %s did not answer this query, not asked again for it", u.spec.name)
-			continue
-		}
-		if !healthy(u) {
-			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
-			continue
-		}
-		/*
-		And with a usable reply already in hand, only a member known to be
-		answering is asked for the proof. The caller holds out for it to get a
-		better answer, not to get one at all, so the wait on a dead member that
-		has not yet parked - a failover spare nobody asks, a fresh start, the
-		two timeouts before the third - is spent on a client that was already
-		answered. For a routed private zone under a public parent that is every
-		query: each member answers NXDOMAIN and none holds a proof, so one dead
-		spare would put `g.timeout` in front of every cache miss, past a
-		validating stub's patience - issue #227's failure, arriving through the
-		sweep meant to prevent its cousin.
-
-		What it costs is the proof held only by a member that is not known to
-		be answering, which is the reply the caller had before it held out: a
-		failover spare is asked for nothing else and so is never swept for the
-		proof. A group whose members disagree under `race` or `round_robin`,
-		where issue #245's flap lives, asks every member and so knows which
-		ones answer.
-		*/
-		if in_hand && !answering(u) {
-			logx.debugf("upstream %s is not known to be answering, not held out for", u.spec.name)
+		if sweep_passes_over(sw, u) {
 			continue
 		}
 		// No room for the copy is this server's memory and not the member's:
 		// the sweep stops, and the reply in hand stands.
-		asked, copied := sweep_query(query)
+		asked, copied := sweep_query(sw.query)
 		if !copied {
 			break
 		}
 		before := loop.tick_now()
-		resp, xerr := exchange(u, asked, g.timeout, allocator)
+		resp, xerr := exchange(u, asked, sw.g.timeout, sw.allocator)
 		// Charged whatever the exchange did, because what is being bounded is
 		// the client's wait and an upstream can spend the time either way: a
 		// member that recurses for most of the timeout and then says SERVFAIL
 		// has cost this query exactly what a member that said nothing did.
 		spent += loop.tick_since(before)
 		// A failed exchange is left to `exchange`, which says why.
-		if xerr != .None {
-			continue
+		if xerr == .None && sweep_takes(sw, u, resp) {
+			return
 		}
-		taken := takes(acceptable, resp)
-		if taken && (proves == nil || proves(resp, data)) {
-			if in_hand {
-				logx.debugf("upstream %s's reply was not the one this question holds out for, swept past it to %s", winner.spec.name, u.spec.name)
-			} else {
-				report_swept(winner, response, u)
-			}
-			// The reply in hand is superseded. It came from the caller's
-			// allocator, which is an arena per request on the query path,
-			// where this is a no-op; it matters where one is not.
-			_ = delete(response, allocator)
-			return resp, u, .None
-		}
-		/*
-		Only where `proves` holds out for more than `acceptable`: a reply the
-		caller can use, though not the one it is holding out for, replaces one
-		it cannot - so a group where nobody proves anything still leaves the
-		caller what `resolve_answerable` would have, and not the first reply.
-		*/
-		if taken && !in_hand {
-			report_swept(winner, response, u)
-			_ = delete(response, allocator)
-			response, winner, in_hand = resp, u, true
-			continue
-		}
-		_ = delete(resp, allocator)
 	}
+}
 
-	// Nobody could answer, or prove. The best reply stands, rcode and all: the
-	// caller reads it and decides, and turning one verdict into another is not
-	// this procedure's business.
-	return response, winner, .None
+// Whether the sweep leaves `u` alone: the member that already spoke, one this
+// call could not reach, one in its cooldown, or one not known to be answering
+// while a usable reply is in hand.
+@(private)
+sweep_passes_over :: proc(sw: ^Sweep, u: ^Upstream) -> bool {
+	if u == sw.first {
+		return true
+	}
+	/*
+	And a server this very call already failed to reach is skipped too,
+	which the cooldown check below does not cover: three consecutive failures is
+	what parks a server, so the first two cost `g.timeout` each and leave it
+	`healthy`. Without this, a group of one unreachable member and one that
+	answers REFUSED pays that timeout twice for one question - once in
+	`resolve`, once more here - to be handed the same REFUSED, which is a
+	second `timeout` added to a query that took one before the sweep existed
+	(issue #309).
+
+	Only what this call proved. A failure from a minute ago is somebody
+	else's news and the member goes on being asked, because a group whose
+	second member is reached only when the first breaks would otherwise
+	carry a stale failure for as long as the first one holds.
+
+	Under `strategy: race` this list is empty for a group of two or more, so
+	the saving is the sequential strategies'. `resolve` says why: the race
+	is over before a dead member has finished not answering.
+	*/
+	if slice.contains(sw.unreachable, u) {
+		logx.debugf("upstream %s did not answer this query, not asked again for it", u.spec.name)
+		return true
+	}
+	if !healthy(u) {
+		logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
+		return true
+	}
+	/*
+	And with a usable reply already in hand, only a member known to be
+	answering is asked for the proof. The caller holds out for it to get a
+	better answer, not to get one at all, so the wait on a dead member that
+	has not yet parked - a failover spare nobody asks, a fresh start, the
+	two timeouts before the third - is spent on a client that was already
+	answered. For a routed private zone under a public parent that is every
+	query: each member answers NXDOMAIN and none holds a proof, so one dead
+	spare would put `g.timeout` in front of every cache miss, past a
+	validating stub's patience - issue #227's failure, arriving through the
+	sweep meant to prevent its cousin.
+
+	What it costs is the proof held only by a member that is not known to
+	be answering, which is the reply the caller had before it held out: a
+	failover spare is asked for nothing else and so is never swept for the
+	proof. A group whose members disagree under `race` or `round_robin`,
+	where issue #245's flap lives, asks every member and so knows which
+	ones answer.
+	*/
+	if sw.in_hand && !answering(u) {
+		logx.debugf("upstream %s is not known to be answering, not held out for", u.spec.name)
+		return true
+	}
+	return false
+}
+
+// Weigh `u`'s reply `resp` against the one in hand: true when it ends the sweep
+// as the answer, else it takes the hand's place or is let go.
+@(private)
+sweep_takes :: proc(sw: ^Sweep, u: ^Upstream, resp: []u8) -> bool {
+	taken := takes(sw.acceptable, resp)
+	if taken && (sw.proves == nil || sw.proves(resp, sw.data)) {
+		if sw.in_hand {
+			logx.debugf("upstream %s's reply was not the one this question holds out for, swept past it to %s", sw.winner.spec.name, u.spec.name)
+		} else {
+			report_swept(sw.winner, sw.response, u)
+		}
+		// The reply in hand is superseded. It came from the caller's
+		// allocator, which is an arena per request on the query path,
+		// where this is a no-op; it matters where one is not.
+		_ = delete(sw.response, sw.allocator)
+		sw.response, sw.winner = resp, u
+		return true
+	}
+	/*
+	Only where `proves` holds out for more than `acceptable`: a reply the
+	caller can use, though not the one it is holding out for, replaces one
+	it cannot - so a group where nobody proves anything still leaves the
+	caller what `resolve_answerable` would have, and not the first reply.
+	*/
+	if taken && !sw.in_hand {
+		report_swept(sw.winner, sw.response, u)
+		_ = delete(sw.response, sw.allocator)
+		sw.response, sw.winner, sw.in_hand = resp, u, true
+		return false
+	}
+	_ = delete(resp, sw.allocator)
+	return false
 }
 
 // What the sweep took in place of `response`, a reply its caller could not use.

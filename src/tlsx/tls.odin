@@ -152,11 +152,10 @@ init_problem_len: int
 do_init :: proc() {
 	if OPENSSL_init_ssl(INIT_FLAGS, nil) != 1 {
 		// The first error is the cause; the rest are the layers that reported it.
-		if code := ERR_get_error(); code != 0 {
-			ERR_error_string_n(code, raw_data(init_problem_buf[:]), len(init_problem_buf))
-			init_problem_len = len(cstring(raw_data(init_problem_buf[:])))
-		} else {
-			init_problem_len = copy(init_problem_buf[:], "no OpenSSL error recorded")
+		init_problem_len = copy(init_problem_buf[:], last_error(context.temp_allocator))
+		// An empty copy would read as success: the start-up failed either way.
+		if init_problem_len == 0 {
+			init_problem_len = copy(init_problem_buf[:], "OpenSSL did not start, and no room was left to say why")
 		}
 		ERR_clear_error()
 	}
@@ -467,16 +466,8 @@ client_context :: proc(
 
 /*
 A fresh `SSL_CTX` for either end, held to `hold_to_floor`, or the reason there
-is none. A server picks the suite by its own order, and neither end renegotiates.
-
-Idle connections hand their record buffers back. Without the mode OpenSSL keeps
-its record buffers, ~17 KB each, for the connection's whole life; with it a
-buffer is freed once empty and reallocated when the next record arrives or is
-sent. Measured on 1,000 idle DoT and DoH/2 connections it saves ~20 KB each
-(#595). Per-query CPU is unchanged on TCP, UDP, DoT and DoH/1.1; DoH/2 reads
-1 µs slower (17 to 18), the bench's resolution, in every round. dnsdist (its
-`releaseBuffers` default), nginx and HAProxy set it too; Unbound does not.
-Pooled upstream connections sit idle too, so the client sets it as well.
+is none. A server picks the suite by its own order, neither end renegotiates,
+and an idle connection hands its record buffers back.
 */
 @(private)
 new_ssl_ctx :: proc(server: bool) -> (^SSL_CTX, Error) {
@@ -507,6 +498,16 @@ new_ssl_ctx :: proc(server: bool) -> (^SSL_CTX, Error) {
 		// does, keeps it.
 		SSL_CTX_set_options(ptr, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_PRIORITIZE_CHACHA)
 	}
+	/*
+	Without the mode OpenSSL keeps its record buffers, ~17 KB each, for the
+	connection's whole life; with it a buffer is freed once empty and
+	reallocated when the next record arrives or is sent. Measured on 1,000 idle
+	DoT and DoH/2 connections it saves ~20 KB each (#595). Per-query CPU is
+	unchanged on TCP, UDP, DoT and DoH/1.1; DoH/2 reads 1 µs slower (17 to 18),
+	the bench's resolution, in every round. dnsdist (its `releaseBuffers`
+	default), nginx and HAProxy set it too; Unbound does not. Pooled upstream
+	connections sit idle too, so the client sets it as well.
+	*/
 	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
 	return ptr, .None
 }
@@ -534,14 +535,10 @@ hold_to_floor :: proc(ptr: ^SSL_CTX) -> Error {
 	n := 0
 	names := TLS12_CIPHERS
 	for name in strings.split_iterator(&names, ":") {
-		if !cipher_listed(allowed, name) {
-			continue
+		// `kept` holds every name of `TLS12_CIPHERS` and its NUL, so this fits.
+		if cipher_listed(allowed, name) && !join_name(kept[:], &n, name) {
+			return .Context_Failed
 		}
-		if n > 0 {
-			kept[n] = ':'
-			n += 1
-		}
-		n += copy(kept[n:], name)
 	}
 	// 0 is no ceiling.
 	ceiling := ssl_ctx_get_max_proto_version(ptr)
@@ -566,7 +563,7 @@ lists_tls13 :: proc(stack: ^OPENSSL_STACK) -> bool {
 		return false
 	}
 	for i in 0 ..< OPENSSL_sk_num(stack) {
-		if is_tls13_name(string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(stack, i))))) {
+		if is_tls13_name(cipher_name(stack, i)) {
 			return true
 		}
 	}
@@ -593,30 +590,19 @@ order_tls13 :: proc(ptr: ^SSL_CTX) -> Error {
 	// Room for every TLS 1.3 suite OpenSSL has and its separators.
 	order: [256]u8
 	n := 0
-	put := proc(order: []u8, n: ^int, name: string) -> bool {
-		if n^ + len(name) + 1 >= len(order) {
-			return false
-		}
-		if n^ > 0 {
-			order[n^] = ':'
-			n^ += 1
-		}
-		n^ += copy(order[n^:], name)
-		return true
-	}
 	names := TLS13_FIRST
 	for name in strings.split_iterator(&names, ":") {
-		if cipher_listed(allowed, name) && !put(order[:], &n, name) {
+		if cipher_listed(allowed, name) && !join_name(order[:], &n, name) {
 			return .Context_Failed
 		}
 	}
 	if allowed != nil {
 		for i in 0 ..< OPENSSL_sk_num(allowed) {
-			name := string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(allowed, i))))
+			name := cipher_name(allowed, i)
 			if !is_tls13_name(name) || strings.contains(TLS13_FIRST, name) {
 				continue
 			}
-			if !put(order[:], &n, name) {
+			if !join_name(order[:], &n, name) {
 				return .Context_Failed
 			}
 		}
@@ -634,11 +620,35 @@ cipher_listed :: proc(stack: ^OPENSSL_STACK, name: string) -> bool {
 		return false
 	}
 	for i in 0 ..< OPENSSL_sk_num(stack) {
-		if string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(stack, i)))) == name {
+		if cipher_name(stack, i) == name {
 			return true
 		}
 	}
 	return false
+}
+
+// The name of the `i`th suite in `stack`, a context's cipher list.
+@(private = "file")
+cipher_name :: proc(stack: ^OPENSSL_STACK, i: c.int) -> string {
+	return string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(stack, i))))
+}
+
+/*
+Append `name` to the colon-separated list in `buf[:n^]`, leaving a zero byte
+after it for OpenSSL to read the list as a C string; false, with nothing
+written, when that would not fit.
+*/
+@(private = "file")
+join_name :: proc(buf: []u8, n: ^int, name: string) -> bool {
+	if n^ + len(name) + 1 >= len(buf) {
+		return false
+	}
+	if n^ > 0 {
+		buf[n^] = ':'
+		n^ += 1
+	}
+	n^ += copy(buf[n^:], name)
+	return true
 }
 
 // The TLS 1.3 suites first in a context's order; see `order_tls13`.
@@ -1165,7 +1175,7 @@ Wait for the socket, with the connection's lock released. A zero timeout waits
 indefinitely, as a blocking socket with no SO_RCVTIMEO would.
 
 On a loop this parks the fiber on the loop's epoll, and the loop runs other
-connections meanwhile; off one - the blocklist downloads, a test - it is `poll`.
+connections meanwhile; off one - the blocklist downloads, a test - it is `ppoll`.
 Either way the deadline is the one the caller took at the start of the transfer,
 so a wait woken early and found not ready resumes against what is left of it
 rather than starting over. A cancelled fiber's wait ends as a timeout does.

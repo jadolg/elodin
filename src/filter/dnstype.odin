@@ -4,6 +4,7 @@ import "core:reflect"
 import "core:slice"
 import "core:strings"
 import "elodin:dns"
+import "elodin:netx"
 
 /*
 `$dnstype`: a rule narrowed to some query types (#406).
@@ -121,14 +122,8 @@ parse_type_name :: proc(s: string) -> (t: u16, ok: bool) {
 	}
 	name := string(buf[:len(s)])
 	if len(name) > 4 && name[:4] == "TYPE" {
-		n := 0
-		for c in transmute([]u8)name[4:] {
-			if c < '0' || c > '9' || n > 0xffff {
-				return
-			}
-			n = n * 10 + int(c - '0')
-		}
-		return u16(n), n > 0 && n <= 0xffff
+		n, digits := netx.parse_decimal(name[4:], 0xffff)
+		return u16(n), digits && n > 0
 	}
 	// `None` is spelt so that no upper-cased name finds it; it is type 0, which
 	// urlfilter refuses too.

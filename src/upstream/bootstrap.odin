@@ -303,27 +303,9 @@ bootstrap_query :: proc(
 		endpoint.port = 53
 	}
 
-	name, canonical := dns.name_canonical(hostname, context.temp_allocator)
-	if !canonical {
-		return nil, 0, false, .Out_Of_Memory
-	}
-	query := dns.Message {
-		// From the entropy source rather than from the clock: the low bits of a
-		// timestamp carry only as much unpredictability as the platform's clock
-		// resolution puts there, and what this query's answer decides - the
-		// address every later query to this upstream is sent to, up to
-		// BOOTSTRAP_TTL - is worth more than that.
-		id       = dns.random_id(),
-		question = []dns.Question{{name = name, type = qtype, class = .IN}},
-	}
-	query.flags.rd = true
-
-	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
-	if enc_err == .Out_Of_Memory {
-		return nil, 0, false, .Out_Of_Memory
-	}
-	if enc_err != .None {
-		return nil, 0, false, .Not_Resolved
+	wire, name, werr := bootstrap_wire(hostname, qtype)
+	if werr != .None {
+		return nil, 0, false, werr
 	}
 	// Taken before the query is sent, as `exchange_udp` takes its own.
 	buf, built := dns.alloc_slice([]u8, 4096, context.temp_allocator)
@@ -341,17 +323,35 @@ bootstrap_query :: proc(
 		return nil, 0, false, .Not_Resolved
 	}
 
-	/*
-	Same checks the main exchange path applies in `exchange_udp`: the datagram
-	has to come from the server that was asked and answer the question that was
-	sent. The ID on its own is 16 bits an off-path attacker can guess inside the
-	receive window, and what it would land in is cached for up to BOOTSTRAP_TTL and
-	consulted for blocklist hosts as well as upstream addresses.
+	n := bootstrap_receive(socket, buf, wire, endpoint, deadline)
+	if n == 0 {
+		return nil, 0, false, .Not_Resolved
+	}
+	msg, dec_err := dns.decode_message(buf[:n], context.temp_allocator)
+	if dec_err == .Out_Of_Memory {
+		return nil, 0, false, .Out_Of_Memory
+	}
+	if dec_err != .None {
+		return nil, 0, false, .Not_Resolved
+	}
+	return bootstrap_answer(msg, name, qtype, keep)
+}
 
-	A datagram that fails them is dropped and the wait resumes, so a forgery
-	arriving first does not deny the real answer the rest of the window.
-	*/
+/*
+The length of the first datagram in `buf` that answers `wire` from `endpoint`
+before `deadline`; 0 when none does.
 
+Same checks the main exchange path applies in `exchange_udp`: the datagram
+has to come from the server that was asked and answer the question that was
+sent. The ID on its own is 16 bits an off-path attacker can guess inside the
+receive window, and what it would land in is cached for up to BOOTSTRAP_TTL and
+consulted for blocklist hosts as well as upstream addresses.
+
+A datagram that fails them is dropped and the wait resumes, so a forgery
+arriving first does not deny the real answer the rest of the window.
+*/
+@(private)
+bootstrap_receive :: proc(socket: net.UDP_Socket, buf, wire: []u8, endpoint: net.Endpoint, deadline: time.Tick) -> int {
 	// As in `exchange_udp`: datagrams passed over back to back never park, and
 	// `loop.recv_udp_until` yields between them.
 	for time.tick_diff(loop.tick_now(), deadline) > 0 {
@@ -366,107 +366,138 @@ bootstrap_query :: proc(
 		server's share of the timeout.
 		*/
 		if recv_err == .Would_Block {
-			return nil, 0, false, .Not_Resolved
+			return 0
 		}
-		if recv_err != nil {
+		if recv_err != nil || n < dns.HEADER_SIZE || !came_from(remote, endpoint) || !response_matches(wire, buf[:n]) {
 			continue
 		}
-		if n < dns.HEADER_SIZE {
-			continue
-		}
-		if !came_from(remote, endpoint) {
-			continue
-		}
-		if !response_matches(wire, buf[:n]) {
-			continue
-		}
+		return n
+	}
+	return 0
+}
 
-		msg, dec_err := dns.decode_message(buf[:n], context.temp_allocator)
-		if dec_err == .Out_Of_Memory {
-			return nil, 0, false, .Out_Of_Memory
+// The query `bootstrap_query` sends for `hostname`'s `qtype`, and the name it
+// asks in canonical form, all in the temp arena.
+@(private)
+bootstrap_wire :: proc(hostname: string, qtype: dns.Type) -> (wire: []u8, name: string, err: Error) {
+	canonical: bool
+	name, canonical = dns.name_canonical(hostname, context.temp_allocator)
+	if !canonical {
+		return nil, "", .Out_Of_Memory
+	}
+	query := dns.Message {
+		// From the entropy source rather than from the clock: the low bits of a
+		// timestamp carry only as much unpredictability as the platform's clock
+		// resolution puts there, and what this query's answer decides - the
+		// address every later query to this upstream is sent to, up to
+		// BOOTSTRAP_TTL - is worth more than that.
+		id       = dns.random_id(),
+		question = []dns.Question{{name = name, type = qtype, class = .IN}},
+	}
+	query.flags.rd = true
+
+	enc_err: dns.Encode_Error
+	wire, _, enc_err = dns.encode_message(query, context.temp_allocator)
+	if enc_err == .Out_Of_Memory {
+		return nil, "", .Out_Of_Memory
+	}
+	if enc_err != .None {
+		return nil, "", .Not_Resolved
+	}
+	return wire, name, .None
+}
+
+/*
+What a bootstrap server's accepted answer `msg` to `name`'s `qtype` gives:
+the address, how long it holds, and, with `Not_Resolved`, whether the answer
+says the name has none of that family.
+*/
+@(private)
+bootstrap_answer :: proc(msg: dns.Message, name: string, qtype: dns.Type, keep: net.Address) -> (addr: net.Address, ttl: time.Duration, empty: bool, err: Error) {
+	/*
+	`keep` while the answer gives it, so a server that rotates the order
+	of an RRset, or gives a different part of it each time, does not look
+	like a move on every refresh; else the first address of the type asked,
+	so instances spread over the RRset as the server orders it. Owned by
+	the name asked or by a CNAME followed from it; a record off that chain
+	is not about this name. Held for the shortest TTL on the chain: it is
+	only as good as its first record to expire.
+	*/
+	first: []u8
+	kept := false
+	keep_raw, keep_len := address_raw(keep)
+	owner, shortest := chain_owner(msg, name)
+	// What would make an answer with no address on the chain less than
+	// "the name has none of this type": a CNAME left unfollowed, or an
+	// address of the type under some other owner.
+	unsure := false
+	for &rec in msg.answer {
+		if rec.type == .CNAME && dns.name_equal_fold(rec.name, owner) {
+			unsure = true
 		}
-		if dec_err != .None {
-			return nil, 0, false, .Not_Resolved
-		}
-		/*
-		`keep` while the answer gives it, so a server that rotates the order
-		of an RRset, or gives a different part of it each time, does not look
-		like a move on every refresh; else the first address of the type asked,
-		so instances spread over the RRset as the server orders it. Owned by
-		the name asked or by a CNAME followed from it; a record off that chain
-		is not about this name. Held for the shortest TTL on the chain: it is
-		only as good as its first record to expire.
-		*/
-		first: []u8
-		shortest := dns.TTL_MAX
-		kept := false
-		keep_raw, keep_len := address_raw(keep)
-		// The chain first, in whatever order its CNAMEs came, one hop per
-		// record at most so a loop ends.
-		owner := name
-		// What would make an answer with no address on the chain less than
-		// "the name has none of this type": a CNAME left unfollowed, or an
-		// address of the type under some other owner.
-		unsure := false
-		for _ in msg.answer {
-			next, found := "", false
-			for &rec in msg.answer {
-				if d, is_name := rec.data.(dns.Rdata_Name); is_name && rec.type == .CNAME && dns.name_equal_fold(rec.name, owner) {
-					next, found = d.name, true
-					shortest = min(shortest, dns.sane_ttl(rec.ttl))
-					break
-				}
-			}
-			if !found {
-				break
-			}
-			owner = next
-		}
-		for &rec in msg.answer {
-			if rec.type == .CNAME && dns.name_equal_fold(rec.name, owner) {
+		if !dns.name_equal_fold(rec.name, owner) {
+			if (rec.type == .A && qtype == .A) || (rec.type == .AAAA && qtype == .AAAA) {
 				unsure = true
 			}
-			if !dns.name_equal_fold(rec.name, owner) {
-				if (rec.type == .A && qtype == .A) || (rec.type == .AAAA && qtype == .AAAA) {
-					unsure = true
-				}
-				continue
+			continue
+		}
+		raw: []u8
+		#partial switch &d in rec.data {
+		case dns.Rdata_A:
+			if qtype == .A {
+				raw = d.addr[:]
 			}
-			raw: []u8
-			#partial switch &d in rec.data {
-			case dns.Rdata_A:
-				if qtype == .A {
-					raw = d.addr[:]
-				}
-			case dns.Rdata_AAAA:
-				if qtype == .AAAA {
-					raw = d.addr[:]
-				}
-			}
-			if raw == nil {
-				continue
-			}
-			shortest = min(shortest, dns.sane_ttl(rec.ttl))
-			if len(raw) == keep_len && mem.compare(raw, keep_raw[:keep_len]) == 0 {
-				kept = true
-			}
-			if first == nil {
-				first = raw
+		case dns.Rdata_AAAA:
+			if qtype == .AAAA {
+				raw = d.addr[:]
 			}
 		}
-		if kept {
-			return keep, bootstrap_ttl(shortest), false, .None
+		if raw == nil {
+			continue
 		}
-		switch len(first) {
-		case 4:
-			return net.IP4_Address{first[0], first[1], first[2], first[3]}, bootstrap_ttl(shortest), false, .None
-		case 16:
-			return netx.ip6_from_bytes((^[16]u8)(raw_data(first))^), bootstrap_ttl(shortest), false, .None
+		shortest = min(shortest, dns.sane_ttl(rec.ttl))
+		if len(raw) == keep_len && mem.compare(raw, keep_raw[:keep_len]) == 0 {
+			kept = true
 		}
-		// A truncated reply says nothing about what the name lacks.
-		return nil, 0, dns.rcode_of(msg) == .No_Error && !msg.flags.tc && !unsure, .Not_Resolved
+		if first == nil {
+			first = raw
+		}
 	}
-	return nil, 0, false, .Not_Resolved
+	if kept {
+		return keep, bootstrap_ttl(shortest), false, .None
+	}
+	switch len(first) {
+	case 4:
+		return net.IP4_Address{first[0], first[1], first[2], first[3]}, bootstrap_ttl(shortest), false, .None
+	case 16:
+		return netx.ip6_from_bytes((^[16]u8)(raw_data(first))^), bootstrap_ttl(shortest), false, .None
+	}
+	// A truncated reply says nothing about what the name lacks.
+	return nil, 0, dns.rcode_of(msg) == .No_Error && !msg.flags.tc && !unsure, .Not_Resolved
+}
+
+// The name `name`'s CNAME chain in `msg` ends at, and the shortest TTL on the
+// way. The chain first, in whatever order its CNAMEs came, one hop per record
+// at most so a loop ends.
+@(private)
+chain_owner :: proc(msg: dns.Message, name: string) -> (owner: string, shortest: u32) {
+	owner = name
+	shortest = dns.TTL_MAX
+	for _ in msg.answer {
+		next, found := "", false
+		for &rec in msg.answer {
+			if d, is_name := rec.data.(dns.Rdata_Name); is_name && rec.type == .CNAME && dns.name_equal_fold(rec.name, owner) {
+				next, found = d.name, true
+				shortest = min(shortest, dns.sane_ttl(rec.ttl))
+				break
+			}
+		}
+		if !found {
+			break
+		}
+		owner = next
+	}
+	return
 }
 
 /*

@@ -276,7 +276,7 @@ Conn :: struct {
 }
 
 // A connection on `io` for `serve` to run, or nil where `allocator` has no room
-// for one.
+// for the connection itself; its tables are grown as they are used.
 make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.allocator) -> ^Conn {
 	c := new(Conn, allocator)
 	if c == nil {
@@ -290,9 +290,10 @@ make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.a
 	c.peer_max_frame = DEFAULT_MAX_FRAME
 	c.peer_initial_window = DEFAULT_WINDOW
 	c.send_window = DEFAULT_WINDOW
-	c.streams = make(map[u32]^Stream, 16, allocator)
 	c.closed_stream_rst_budget = MAX_CLOSED_STREAM_RST
 	c.write_timeout = DEFAULT_WRITE_TIMEOUT
+	// Sized here and grown where they are used, as in `client_make`.
+	c.streams = make(map[u32]^Stream, 16, allocator)
 	dynamic_table_init(&c.decoder, DEFAULT_HEADER_TABLE_SIZE, allocator)
 	return c
 }
@@ -470,10 +471,6 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return handle_data(c, h, payload)
 
 	case .Rst_Stream:
-		if h.stream_id == 0 || len(payload) != 4 {
-			goaway(c, .Protocol_Error if h.stream_id == 0 else .Frame_Size_Error)
-			return false
-		}
 		loop.lock(&c.mu)
 		if stream_is_idle(c, h.stream_id) {
 			loop.unlock(&c.mu)
@@ -845,122 +842,150 @@ what a request is.
 */
 @(private)
 request_is_malformed :: proc(headers: []Header_Field) -> bool {
-	method, scheme, path, authority: string
-	have_method, have_scheme, have_path, have_authority: bool
-	// Set by the first ordinary field, which is where the pseudo-headers end.
-	seen_regular: bool
-	have_content_type: bool
-	have_content_length: bool
-	host: string
-	have_host: bool
-
+	shape: Request_Shape
 	for f in headers {
 		if len(f.name) == 0 {
 			return true
 		}
-
 		if f.name[0] == ':' {
-			// An ordinary field's value is `field_is_malformed`'s to check.
-			if !field_value_is_valid(f.value) {
-				return true
-			}
-			// 8.3: every pseudo-header comes before the ordinary fields.
-			if seen_regular {
-				return true
-			}
-			/*
-			A repeat is malformed, and it is worth being explicit about why the
-			check is here rather than left to `take`. That procedure keeps the
-			first value and frees the rest, which is right for memory and wrong
-			for the protocol: two `:path` fields would be answered from the
-			first, and a hop that resolved the same request the other way round
-			would answer from the second.
-			*/
-			switch f.name {
-			case ":method":
-				if have_method {
-					return true
-				}
-				have_method, method = true, f.value
-			case ":scheme":
-				if have_scheme {
-					return true
-				}
-				have_scheme, scheme = true, f.value
-			case ":path":
-				if have_path {
-					return true
-				}
-				have_path, path = true, f.value
-			case ":authority":
-				if have_authority {
-					return true
-				}
-				have_authority, authority = true, f.value
-			case:
-				// 8.3 again: a request has those four and no others. `:protocol`
-				// lands here too, which is the answer this end wants - extended
-				// CONNECT is not implemented.
+			if take_pseudo(&shape, f) {
 				return true
 			}
 			continue
 		}
-
-		seen_regular = true
-		if field_is_malformed(f) {
+		shape.seen_regular = true
+		if take_field(&shape, f) {
 			return true
 		}
-		switch f.name {
-		case "host":
-			// 8.3.1 lets a request carry `Host` in place of `:authority`, and an
-			// h2-to-h1 hop writes it out as the one it gets: the same rule (#438).
-			// Once only, as on HTTP/1.1, and checked against `:authority` below.
-			if have_host || !authority_is_valid(f.value) {
-				return true
-			}
-			have_host, host = true, f.value
-		case "content-type":
-			/*
-			RFC 9110 5.3: a singleton field, and a recipient may treat a repeat
-			as an error. The `:path` argument above applies: `take` keeps the
-			first non-empty value, a hop in front may have judged another, and
-			the media type is what decides whether the body is taken for a DNS
-			message. Counted here, so an empty first one is a repeat too.
-			*/
-			if have_content_type {
-				return true
-			}
-			have_content_type = true
-		case "content-length":
-			/*
-			RFC 9113 8.1.1 frames the content by DATA, and holds this field to
-			it; RFC 9110 8.6 makes it digits alone. A repeat, even an equal
-			one, or a value that is not a length is malformed, as on HTTP/1.1:
-			a hop in front may have framed the body by whichever it read.
-			*/
-			if have_content_length {
-				return true
-			}
-			have_content_length = true
-			if _, ok := parse_content_length(f.value, MAX_BODY); !ok {
-				return true
-			}
+	}
+	return shape_is_malformed(shape)
+}
+
+// What `request_is_malformed` gathers of a request's header section on its way
+// through it.
+@(private = "file")
+Request_Shape :: struct {
+	method, scheme, path, authority: string,
+	have_method, have_scheme, have_path, have_authority: bool,
+	// Set by the first ordinary field, which is where the pseudo-headers end.
+	seen_regular: bool,
+	have_content_type: bool,
+	have_content_length: bool,
+	host: string,
+	have_host: bool,
+}
+
+// One pseudo-header taken into `r`; true where it makes the request malformed.
+@(private = "file")
+take_pseudo :: proc(r: ^Request_Shape, f: Header_Field) -> bool {
+	// An ordinary field's value is `field_is_malformed`'s to check.
+	if !field_value_is_valid(f.value) {
+		return true
+	}
+	// 8.3: every pseudo-header comes before the ordinary fields.
+	if r.seen_regular {
+		return true
+	}
+	/*
+	A repeat is malformed, and it is worth being explicit about why the
+	check is here rather than left to `take`. That procedure keeps the
+	first value and frees the rest, which is right for memory and wrong
+	for the protocol: two `:path` fields would be answered from the
+	first, and a hop that resolved the same request the other way round
+	would answer from the second.
+	*/
+	switch f.name {
+	case ":method":
+		if r.have_method {
+			return true
+		}
+		r.have_method, r.method = true, f.value
+	case ":scheme":
+		if r.have_scheme {
+			return true
+		}
+		r.have_scheme, r.scheme = true, f.value
+	case ":path":
+		if r.have_path {
+			return true
+		}
+		r.have_path, r.path = true, f.value
+	case ":authority":
+		if r.have_authority {
+			return true
+		}
+		r.have_authority, r.authority = true, f.value
+	case:
+		// 8.3 again: a request has those four and no others. `:protocol`
+		// lands here too, which is the answer this end wants - extended
+		// CONNECT is not implemented.
+		return true
+	}
+	return false
+}
+
+// One ordinary field taken into `r`; true where it makes the request malformed.
+@(private = "file")
+take_field :: proc(r: ^Request_Shape, f: Header_Field) -> bool {
+	if field_is_malformed(f) {
+		return true
+	}
+	switch f.name {
+	case "host":
+		// 8.3.1 lets a request carry `Host` in place of `:authority`, and an
+		// h2-to-h1 hop writes it out as the one it gets: the same rule (#438).
+		// Once only, as on HTTP/1.1, and checked against `:authority` in
+		// `shape_is_malformed`.
+		if r.have_host || !authority_is_valid(f.value) {
+			return true
+		}
+		r.have_host, r.host = true, f.value
+	case "content-type":
+		/*
+		RFC 9110 5.3: a singleton field, and a recipient may treat a repeat
+		as an error. The `:path` argument in `take_pseudo` applies: `take`
+		keeps the first non-empty value, a hop in front may have judged
+		another, and the media type is what decides whether the body is taken
+		for a DNS message. Counted here, so an empty first one is a repeat too.
+		*/
+		if r.have_content_type {
+			return true
+		}
+		r.have_content_type = true
+	case "content-length":
+		/*
+		RFC 9113 8.1.1 frames the content by DATA, and holds this field to
+		it; RFC 9110 8.6 makes it digits alone. A repeat, even an equal
+		one, or a value that is not a length is malformed, as on HTTP/1.1:
+		a hop in front may have framed the body by whichever it read.
+		*/
+		if r.have_content_length {
+			return true
+		}
+		r.have_content_length = true
+		if _, ok := parse_content_length(f.value, MAX_BODY); !ok {
+			return true
 		}
 	}
+	return false
+}
 
+// Whether the request `r` describes, read whole, is malformed.
+@(private = "file")
+shape_is_malformed :: proc(r: Request_Shape) -> bool {
 	/*
 	`:authority` is the target of CONNECT's request line and the `Host` of every
 	other request's, so it is held to what a host may hold, for the reason
 	given for `:path` below (#438) - see `authority_is_valid`.
 	*/
-	if !authority_is_valid(authority) {
+	if !authority_is_valid(r.authority) {
 		return true
 	}
 	// 8.3.1: a Host naming another entity than `:authority` is malformed. This
 	// end routes by `:authority`, a hop behind it may route by `host`. ASCII
 	// case is the only normalising done, so `a:443` and `a` are refused as two
 	// entities: stricter than the RFC asks, and nothing sends both that way.
-	if have_host && have_authority && !dns.name_equal_fold(host, authority) {
+	if r.have_host && r.have_authority && !dns.name_equal_fold(r.host, r.authority) {
 		return true
 	}
 	/*
@@ -970,12 +995,12 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	under the name of malformed. It carries no `:path`, so what the handler
 	matches it against is the empty one and what it answers is a 404.
 	*/
-	if method == "CONNECT" {
-		return !have_authority || have_scheme || have_path
+	if r.method == "CONNECT" {
+		return !r.have_authority || r.have_scheme || r.have_path
 	}
 
 	// 8.3.1: the three every other request must carry.
-	if !have_method || !have_scheme || !have_path {
+	if !r.have_method || !r.have_scheme || !r.have_path {
 		return true
 	}
 	/*
@@ -991,7 +1016,7 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	The HTTP/1.1 side refuses the same methods. `:path` is held to what a
 	request target may hold for the same reason.
 	*/
-	if !is_token(method) || len(scheme) == 0 || !target_is_valid(path) {
+	if !is_token(r.method) || len(r.scheme) == 0 || !target_is_valid(r.path) {
 		return true
 	}
 	/*
@@ -1018,14 +1043,14 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	folded in ASCII only: `strings.equal_fold` folds Unicode, where the long s
 	(U+017F) is an `s`, so `http\u017f` read as https (#432).
 	*/
-	if !netx.is_scheme(scheme) {
+	if !netx.is_scheme(r.scheme) {
 		return true
 	}
-	if dns.name_equal_fold(scheme, "http") || dns.name_equal_fold(scheme, "https") {
-		if path == "*" {
-			return method != "OPTIONS"
+	if dns.name_equal_fold(r.scheme, "http") || dns.name_equal_fold(r.scheme, "https") {
+		if r.path == "*" {
+			return r.method != "OPTIONS"
 		}
-		if len(path) == 0 || path[0] != '/' {
+		if len(r.path) == 0 || r.path[0] != '/' {
 			return true
 		}
 	}
@@ -1334,35 +1359,10 @@ ignored.
 	already_ended := found && (s.state == .Half_Closed_Remote || s.state == .Closed)
 	need_rst := already_ended && mark_stream_closed(c, s)
 	if found && !already_ended {
-		// Checked before appending, so an oversized body is refused rather than
-		// buffered first. Over the connection's share rather than the stream's,
-		// nothing of it reached a handler, so the client may retry it (RFC 9113
-		// 8.7).
-		//
-		// Charged by capacity, not length: left to `append`, a 64 KiB body in
-		// 16 KiB frames grows a 116 KiB buffer. Grown here instead, doubling but
-		// never past MAX_BODY, so what is charged is what is allocated.
-		need := len(s.body) + len(data)
-		s.received += len(payload)
-		// The second bound is on the window, not the body: see RECV_WINDOW.
-		oversized := need > MAX_BODY || s.received > RECV_WINDOW / 2
-		// Past its own `content-length`: malformed already (RFC 9113 8.1.1),
-		// so refused now rather than buffered to its end.
-		past := s.has_length && need > s.declared
-		grow := 0
-		if need > cap(s.body) {
-			grow = min(max(need, 2 * cap(s.body)), MAX_BODY) - cap(s.body)
-		}
-		refused := c.request_bytes + grow > MAX_CONN_REQUEST
-		// A body there is no room for is refused as one over the budget is.
-		if !oversized && !past && !refused && grow > 0 {
-			refused = reserve(&s.body, cap(s.body) + grow) != nil
-		}
-		if oversized || past || refused {
+		if code, refused := store_data(c, s, data, len(payload)); refused {
 			loop.unlock(&c.mu)
 			// No handler behind this reset either, so it is budgeted like a refused
 			// HEADERS: see stream_error.
-			code: Error_Code = .Protocol_Error if past else .Enhance_Your_Calm if oversized else .Refused_Stream
 			sent := stream_error(c, h.stream_id, code)
 			// The stream is over. Without this it would hold its body, its parked
 			// request and one of MAX_HELD_STREAMS slots until the connection went.
@@ -1376,25 +1376,16 @@ ignored.
 			*/
 			return sent && give_connection_credit(c, len(payload))
 		}
-		append(&s.body, ..data)
-		s.charged += grow
-		c.request_bytes += grow
 	}
 	loop.unlock(&c.mu)
 
 	if already_ended {
-		sent := true
-		if need_rst {
-			// Budgeted: the stream was just marked closed above, so the peer may open
-			// a replacement at once and repeat this for a reset per HEADERS.
-			sent = stream_error(c, h.stream_id, .Stream_Closed)
-		}
-		return sent && give_connection_credit(c, len(payload))
+		// Budgeted: the stream was just marked closed above, so the peer may open
+		// a replacement at once and repeat this for a reset per HEADERS.
+		return (!need_rst || stream_error(c, h.stream_id, .Stream_Closed)) && give_connection_credit(c, len(payload))
 	}
-
 	if send_closed_rst {
-		sent := rst_stream(c, h.stream_id, .Stream_Closed)
-		return sent && give_connection_credit(c, len(payload))
+		return rst_stream(c, h.stream_id, .Stream_Closed) && give_connection_credit(c, len(payload))
 	}
 
 	// Give the credit back; we buffer whole requests anyway. The stream's own
@@ -1406,17 +1397,65 @@ ignored.
 	if !found || h.flags & FLAG_END_STREAM == 0 {
 		return true
 	}
+	return end_data(c, h.stream_id)
+}
 
+/*
+Take an open stream's DATA (`data`, of a frame `frame_len` long with its
+padding) into its body, charged to the connection; or refuse it, with the code
+its RST_STREAM carries: past `MAX_BODY` or the receive window, past its own
+`content-length`, or past the connection's request budget or its room. The
+caller holds `c.mu`.
+*/
+@(private = "file")
+store_data :: proc(c: ^Conn, s: ^Stream, data: []u8, frame_len: int) -> (code: Error_Code, refused: bool) {
+	// Checked before appending, so an oversized body is refused rather than
+	// buffered first. Over the connection's share rather than the stream's,
+	// nothing of it reached a handler, so the client may retry it (RFC 9113
+	// 8.7).
+	//
+	// Charged by capacity, not length: left to `append`, a 64 KiB body in
+	// 16 KiB frames grows a 116 KiB buffer. Grown here instead, doubling but
+	// never past MAX_BODY, so what is charged is what is allocated.
+	need := len(s.body) + len(data)
+	s.received += frame_len
+	// The second bound is on the window, not the body: see RECV_WINDOW.
+	oversized := need > MAX_BODY || s.received > RECV_WINDOW / 2
+	// Past its own `content-length`: malformed already (RFC 9113 8.1.1),
+	// so refused now rather than buffered to its end.
+	past := s.has_length && need > s.declared
+	grow := 0
+	if need > cap(s.body) {
+		grow = min(max(need, 2 * cap(s.body)), MAX_BODY) - cap(s.body)
+	}
+	refused = c.request_bytes + grow > MAX_CONN_REQUEST
+	// A body there is no room for is refused as one over the budget is.
+	if !oversized && !past && !refused && grow > 0 {
+		refused = reserve(&s.body, cap(s.body) + grow) != nil
+	}
+	if oversized || past || refused {
+		return .Protocol_Error if past else .Enhance_Your_Calm if oversized else .Refused_Stream, true
+	}
+	append(&s.body, ..data)
+	s.charged += grow
+	c.request_bytes += grow
+	return .No_Error, false
+}
+
+// A stream's END_STREAM: its parked request dispatched, or the connection
+// failed where none was parked.
+@(private = "file")
+end_data :: proc(c: ^Conn, stream_id: u32) -> bool {
 	/*
-	Looked up again rather than reusing the pointer from the top of this
-	procedure. The lock was released in between, and a handler answering this
+	Looked up again rather than reusing the pointer from the top of
+	`handle_data`. The lock was released in between, and a handler answering this
 	stream retires it through `close_stream`, which frees it - so the earlier
 	pointer may by now refer to memory that is gone. A peer is free to send
 	DATA on a stream it has already ended, which is all it takes to be here at
 	the same moment as the handler.
 	*/
 	loop.lock(&c.mu)
-	live, still_open := c.streams[h.stream_id]
+	live, still_open := c.streams[stream_id]
 	if !still_open {
 		loop.unlock(&c.mu)
 		return true

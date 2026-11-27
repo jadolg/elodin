@@ -113,7 +113,7 @@ exchange_doh_h2 :: proc(
 			h2.Client_Request {
 				method = "POST",
 				scheme = "https",
-				authority = doh_authority(u.spec.hostname, u.spec.url),
+				authority = u.authority,
 				path = u.spec.path,
 				content_type = "application/dns-message",
 				accept = "application/dns-message",
@@ -213,44 +213,14 @@ exchange_doh_h1 :: proc(
 		if remaining <= 0 {
 			return nil, .Timeout
 		}
-		conn: Idle_Conn
-		reused := false
-		if attempt == 0 {
-			conn, reused = take_idle(u)
-		}
-		stream: Stream
-		if reused {
-			stream = conn.stream
-			// The timeouts it carries are whatever the query that dialled it
-			// had; `http_exchange` replaces them with this query's deadline
-			// before every write and read.
-		} else {
-			s, oerr := open_stream(endpoint, u.tls_ctx, u.spec.hostname, remaining, u, epoch = epoch)
-			if oerr != .None {
-				return nil, oerr
-			}
-			stream = s
-			/*
-			A server that now picks h2 - another address after a move, or the
-			same one changed - would read HTTP/1.1 as a broken h2 preface. The
-			protocol is to be learned again; `exchange_doh` asks once more
-			through `get_h2_conn`.
-			*/
-			if stream.tls != nil && tlsx.alpn_protocol(stream.tls) == "h2" {
-				stream_close(&stream)
-				sync.mutex_lock(&u.mu)
-				u.proto = .Unknown
-				sync.mutex_unlock(&u.mu)
-				return nil, .Peer_Closed
-			}
-		}
+		stream, reused := doh_h1_stream(u, attempt, endpoint, epoch, remaining) or_return
 
 		resp, herr := http_exchange(
 			&stream,
 			Http_Request {
 				method = "POST",
 				path = u.spec.path,
-				host = doh_authority(u.spec.hostname, u.spec.url),
+				host = u.authority,
 				body = body,
 				content_type = "application/dns-message",
 				accept = "application/dns-message",
@@ -262,86 +232,145 @@ exchange_doh_h1 :: proc(
 			// be, which every query in flight could hold twice over (#525).
 			max_body = dns.MAX_MESSAGE,
 		)
-
-		if herr == .None && resp.status == 200 && len(resp.body) >= dns.HEADER_SIZE {
-			if !doh_reply_matches(query, resp.body) {
-				delete(resp.body, allocator)
-				stream_close(&stream)
-				return nil, .Bad_Response
-			}
-			if resp.keep_alive {
-				put_idle(u, stream)
-			} else {
-				stream_close(&stream)
-			}
-			// RFC 8484 section 5.1: "DoH clients MUST account for the Age response
-			// header field's value [RFC7234] when calculating the DNS TTL".
-			dns.age_ttls(resp.body, resp.age)
-			return resp.body, .None
-		}
-
-		// Whatever the status, the body came from `allocator`, which on the race
-		// path is the heap; the HTTP/2 twin above frees it the same way.
-		if len(resp.body) > 0 {
-			delete(resp.body, allocator)
-		}
-		stream_close(&stream)
-		// A 429 or 503 whose head arrived whole and whose body was then lost -
-		// broken off, stalled, framed wrongly, or with no room here to hold it -
-		// is still the server asking to be left alone, as on HTTP/2 where the
-		// connection fails after the head: it is not asked again on a fresh
-		// dial, and its `Retry-After` is kept. Not a head `http_exchange` refused,
-		// which is no response, nor one cut off partway, whose `Retry-After` may
-		// not have come yet.
-		if resp.whole_head && herr != .None && h2.status_asks_to_wait(resp.status) {
-			return nil, doh_refusal(u, resp.status, resp.retry_after)
-		}
-		// A non-200 is the server's answer whatever the size of its body, which
-		// nobody reads: a 408 is still retried, and an error page is still what
-		// `doh_refusal` makes of its status, as on HTTP/2.
-		if herr == .None || (herr == .Too_Large && resp.status != 200) {
-			/*
-			A 408 on a pooled connection is the server closing one it found
-			idle, written before this request arrived; the client may repeat
-			the request (RFC 9110 15.5.9), and a fresh dial is what it gets.
-			The connection `get_h2_conn` dialled to learn the server speaks
-			HTTP/1.1 is pooled too, so at worst a server answering 408 to
-			everything costs one more dial inside the same deadline.
-			*/
-			if resp.status == 408 && reused {
-				continue
-			}
-			// Any other whole reply that is not a usable 200 - another status, or
-			// a body too short to be a DNS message - is the server's answer, so
-			// it is not retried; and it is the kind the HTTP/2 twin reports, so
-			// health does not depend on what ALPN chose.
-			return nil, doh_refusal(u, resp.status, resp.retry_after)
-		}
-		/*
-		A hang-up is retried whether this query found the connection or dialled
-		it, which is the shape `exchange_pipelined` settled on. Excluding the
-		dial rested on a fresh connection failing meaning the server is broken,
-		and a peer that limits how often a source may connect refuses one just
-		as readily - leaving the query that paid for the dial as the only one
-		with no second chance. Everything else is still reported on the spot:
-		a pooled connection is retried because it may simply be stale, and a
-		fresh one failing any other way has said what it has to say.
-		*/
-		/*
-		A timeout is the deadline spent - `http_exchange` holds every read and
-		write to it - so it is not retried. Said here rather than left to the
-		`remaining <= 0` check above, which a socket timeout firing a hair early
-		would slip past, dialling the upstream with a sliver it cannot use.
-
-		Nor is a reply past the size of a DNS message: that is what the server
-		sent, not a stale connection.
-		*/
-		if attempt == 1 || herr == .Timeout || herr == .Too_Large || (!reused && herr != .Peer_Closed) {
-			return nil, herr
+		if out, done, derr := doh_h1_settle(u, query, &stream, resp, herr, reused, attempt, allocator); done {
+			return out, derr
 		}
 	}
 	// Unreachable: the second attempt always returns above.
 	return nil, .IO_Error
+}
+
+/*
+The stream the `attempt`th try of `exchange_doh_h1` sends on: a pooled one on
+the first, else a fresh dial. `reused` says which. A dial that finds the server
+now speaks h2 is closed and refused.
+*/
+@(private)
+doh_h1_stream :: proc(u: ^Upstream, attempt: int, endpoint: net.Endpoint, epoch: int, remaining: time.Duration) -> (stream: Stream, reused: bool, err: Error) {
+	conn: Idle_Conn
+	if attempt == 0 {
+		conn, reused = take_idle(u)
+	}
+	if reused {
+		// The timeouts it carries are whatever the query that dialled it
+		// had; `http_exchange` replaces them with this query's deadline
+		// before every write and read.
+		return conn.stream, true, .None
+	}
+	stream = open_stream(endpoint, u.tls_ctx, u.spec.hostname, remaining, u, epoch = epoch) or_return
+	/*
+	A server that now picks h2 - another address after a move, or the
+	same one changed - would read HTTP/1.1 as a broken h2 preface. The
+	protocol is to be learned again; `exchange_doh` asks once more
+	through `get_h2_conn`.
+	*/
+	if stream.tls != nil && tlsx.alpn_protocol(stream.tls) == "h2" {
+		stream_close(&stream)
+		sync.mutex_lock(&u.mu)
+		u.proto = .Unknown
+		sync.mutex_unlock(&u.mu)
+		return {}, false, .Peer_Closed
+	}
+	return stream, false, .None
+}
+
+/*
+What one try of `exchange_doh_h1` comes to: `done` with the answer or the
+error to report, or not done for a try worth one more. The stream is pooled or
+closed either way.
+*/
+@(private)
+doh_h1_settle :: proc(
+	u: ^Upstream,
+	query: []u8,
+	stream: ^Stream,
+	resp: Http_Response,
+	herr: Error,
+	reused: bool,
+	attempt: int,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	done: bool,
+	err: Error,
+) {
+	if herr == .None && resp.status == 200 && len(resp.body) >= dns.HEADER_SIZE {
+		if !doh_reply_matches(query, resp.body) {
+			delete(resp.body, allocator)
+			stream_close(stream)
+			return nil, true, .Bad_Response
+		}
+		if resp.keep_alive {
+			put_idle(u, stream^)
+		} else {
+			stream_close(stream)
+		}
+		// RFC 8484 section 5.1: "DoH clients MUST account for the Age response
+		// header field's value [RFC7234] when calculating the DNS TTL".
+		dns.age_ttls(resp.body, resp.age)
+		return resp.body, true, .None
+	}
+
+	// Whatever the status, the body came from `allocator`, which on the race
+	// path is the heap; the HTTP/2 twin above frees it the same way.
+	if len(resp.body) > 0 {
+		delete(resp.body, allocator)
+	}
+	stream_close(stream)
+	// A 429 or 503 whose head arrived whole and whose body was then lost -
+	// broken off, stalled, framed wrongly, or with no room here to hold it -
+	// is still the server asking to be left alone, as on HTTP/2 where the
+	// connection fails after the head: it is not asked again on a fresh
+	// dial, and its `Retry-After` is kept. Not a head `http_exchange` refused,
+	// which is no response, nor one cut off partway, whose `Retry-After` may
+	// not have come yet.
+	if resp.whole_head && herr != .None && h2.status_asks_to_wait(resp.status) {
+		return nil, true, doh_refusal(u, resp.status, resp.retry_after)
+	}
+	// A non-200 is the server's answer whatever the size of its body, which
+	// nobody reads: a 408 is still retried, and an error page is still what
+	// `doh_refusal` makes of its status, as on HTTP/2.
+	if herr == .None || (herr == .Too_Large && resp.status != 200) {
+		/*
+		A 408 on a pooled connection is the server closing one it found
+		idle, written before this request arrived; the client may repeat
+		the request (RFC 9110 15.5.9), and a fresh dial is what it gets.
+		The connection `get_h2_conn` dialled to learn the server speaks
+		HTTP/1.1 is pooled too, so at worst a server answering 408 to
+		everything costs one more dial inside the same deadline.
+		*/
+		if resp.status == 408 && reused {
+			return nil, false, .None
+		}
+		// Any other whole reply that is not a usable 200 - another status, or
+		// a body too short to be a DNS message - is the server's answer, so
+		// it is not retried; and it is the kind the HTTP/2 twin reports, so
+		// health does not depend on what ALPN chose.
+		return nil, true, doh_refusal(u, resp.status, resp.retry_after)
+	}
+	/*
+	A hang-up is retried whether this query found the connection or dialled
+	it, which is the shape `exchange_pipelined` settled on. Excluding the
+	dial rested on a fresh connection failing meaning the server is broken,
+	and a peer that limits how often a source may connect refuses one just
+	as readily - leaving the query that paid for the dial as the only one
+	with no second chance. Everything else is still reported on the spot:
+	a pooled connection is retried because it may simply be stale, and a
+	fresh one failing any other way has said what it has to say.
+	*/
+	/*
+	A timeout is the deadline spent - `http_exchange` holds every read and
+	write to it - so it is not retried. Said here rather than left to the
+	`remaining <= 0` check in `exchange_doh_h1`, which a socket timeout firing a hair early
+	would slip past, dialling the upstream with a sliver it cannot use.
+
+	Nor is a reply past the size of a DNS message: that is what the server
+	sent, not a stale connection.
+	*/
+	if attempt == 1 || herr == .Timeout || herr == .Too_Large || (!reused && herr != .Peer_Closed) {
+		return nil, true, herr
+	}
+	return nil, false, .None
 }
 
 /*
@@ -506,20 +535,25 @@ RFC 3986 3.2.2: an IPv6 literal goes in brackets in the authority, or a server
 reading `host:port` takes `2606` for the host. The TLS name check takes it bare,
 so `spec.hostname` is kept without them. RFC 9110 7.2: the port goes with it
 unless it is https's own, and it is the url's: `port:` is where to dial, which
-the target the url names does not change.
+the target the url names does not change. A url that will not split, which
+config refuses before this runs, names no port. Built once, by `make_upstream`,
+into `allocator`.
 */
 @(private)
-doh_authority :: proc(hostname, url: string) -> string {
-	host := hostname
-	if _, is6 := netx.parse_ip6_address(hostname); is6 {
-		host = fmt.tprintf("[%s]", hostname)
+doh_authority :: proc(hostname, url: string, allocator := context.temp_allocator) -> string {
+	_, is6 := netx.parse_ip6_address(hostname)
+	_, url_host, _, split := netx.split_url(url)
+	_, port, ported := netx.split_port(url_host)
+	bare := !split || !ported || port == 443 || port == 0
+	switch {
+	case is6 && bare:
+		return fmt.aprintf("[%s]", hostname, allocator = allocator)
+	case is6:
+		return fmt.aprintf("[%s]:%d", hostname, port, allocator = allocator)
+	case bare:
+		return fmt.aprintf("%s", hostname, allocator = allocator)
 	}
-	_, url_host, _, _ := netx.split_url(url)
-	_, port, _ := netx.split_port(url_host)
-	if port == 443 || port == 0 {
-		return host
-	}
-	return fmt.tprintf("%s:%d", host, port)
+	return fmt.aprintf("%s:%d", hostname, port, allocator = allocator)
 }
 
 /*

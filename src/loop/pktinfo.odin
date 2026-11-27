@@ -3,6 +3,7 @@ package loop
 import "base:intrinsics"
 import "core:net"
 import "core:sys/linux"
+import "elodin:netx"
 
 /*
 The local end of a datagram: the address it was sent to, and for IPv6 the
@@ -53,6 +54,22 @@ Cmsg_Hdr :: struct {
 	len:   uint,
 	level: i32,
 	type:  i32,
+}
+
+/*
+`to` as a socket address, and the length of the family it holds; ok false for an
+address that is neither IPv4 nor IPv6.
+*/
+sock_addr :: proc(to: net.Endpoint) -> (addr: linux.Sock_Addr_Any, size: i32, ok: bool) {
+	switch a in to.address {
+	case net.IP4_Address:
+		addr.ipv4 = {sin_family = .INET, sin_port = u16be(to.port), sin_addr = ([4]u8)(a)}
+		return addr, size_of(linux.Sock_Addr_In), true
+	case net.IP6_Address:
+		addr.ipv6 = {sin6_family = .INET6, sin6_port = u16be(to.port), sin6_addr = transmute([16]u8)a}
+		return addr, size_of(linux.Sock_Addr_In6), true
+	}
+	return {}, 0, false
 }
 
 @(private = "file")
@@ -148,7 +165,7 @@ local_of :: proc(control: []u8) -> (local: Udp_Local) {
 			local = {address = net.IP4_Address(info.spec_dst)}
 		case h.level == IPPROTO_IPV6 && h.type == IPV6_PKTINFO && len(data) >= size_of(In6_Pktinfo):
 			info := intrinsics.unaligned_load((^In6_Pktinfo)(raw_data(data)))
-			if !v4_mapped(info.addr) && info.addr[0] != 0xff {
+			if _, mapped := netx.unmap_bytes(info.addr); !mapped && info.addr[0] != 0xff {
 				local = {address = transmute(net.IP6_Address)info.addr, ifindex = info.ifindex}
 			}
 		}
@@ -161,17 +178,6 @@ local_of :: proc(control: []u8) -> (local: Udp_Local) {
 	return
 }
 
-@(private = "file")
-v4_mapped :: proc(a: [16]u8) -> bool {
-	a := a
-	for b in a[:10] {
-		if b != 0 {
-			return false
-		}
-	}
-	return a[10] == 0xff && a[11] == 0xff
-}
-
 /*
 One `sendmsg` to `to`, from `from` when its address is known: an IPv4 one as
 `IP_PKTINFO`'s `ipi_spec_dst`, an IPv6 one as `IPV6_PKTINFO`. The interface is
@@ -181,16 +187,8 @@ as IPv4 and reads the `IP_PKTINFO` there.
 */
 @(private)
 sendmsg_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint, from: Udp_Local) -> (int, net.UDP_Send_Error) {
-	addr: linux.Sock_Addr_Any
-	namelen: i32
-	switch a in to.address {
-	case net.IP4_Address:
-		addr.ipv4 = {sin_family = .INET, sin_port = u16be(to.port), sin_addr = ([4]u8)(a)}
-		namelen = size_of(linux.Sock_Addr_In)
-	case net.IP6_Address:
-		addr.ipv6 = {sin6_family = .INET6, sin6_port = u16be(to.port), sin6_addr = transmute([16]u8)a}
-		namelen = size_of(linux.Sock_Addr_In6)
-	case:
+	addr, namelen, ok := sock_addr(to)
+	if !ok {
 		return 0, .Invalid_Argument
 	}
 	control: [CONTROL_WORDS]uint

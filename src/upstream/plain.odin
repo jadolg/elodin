@@ -146,7 +146,8 @@ exchange_udp :: proc(
 			continue
 		}
 
-		flags := transmute(dns.Flags)(u16(buf[2]) << 8 | u16(buf[3]))
+		// A reply too short for its flags never got past `response_accepted`.
+		flags, _ := dns.peek_flags(buf[:n])
 		/*
 		On what is left of the exchange, not a timeout of its own (issues #376,
 		#449): a TC that arrives late leaves the retry little, and it fails as

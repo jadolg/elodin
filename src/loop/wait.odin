@@ -46,7 +46,7 @@ Wait until `fd` may be read or written, as `events` asks, or until `deadline`.
 The zero deadline is none.
 
 On a fiber this parks it on the loop's epoll; anywhere else - a plain thread, a
-test - it is `poll(2)` on the one descriptor, so code that waits through here
+test - it is `ppoll(2)` on the one descriptor, so code that waits through here
 behaves the same on both and the tests that drive it from a thread of their own
 still mean what they did.
 
@@ -188,28 +188,6 @@ watch_wake_all :: proc(w: ^Fd_Watch) {
 	clear(&w.waiters)
 }
 
-/*
-`ppoll(2)` with a timeout in milliseconds, -1 for none.
-
-Not `core:sys/linux`'s `poll`, which on arm64 builds the `timespec` for
-`ppoll` from a negative timeout by casting it to unsigned: "no timeout" becomes
-a timeout of some 18 quadrillion seconds, which the kernel refuses with EINVAL,
-and every wait with no deadline failed at once. A NULL `timespec` is what
-`ppoll` takes for none, and `ppoll` serves both architectures.
-*/
-@(private)
-ppoll :: proc(fds: []linux.Poll_Fd, timeout_ms: i32) -> (i32, linux.Errno) {
-	ts: linux.Time_Spec
-	tsp: ^linux.Time_Spec
-	if timeout_ms >= 0 {
-		ts = linux.Time_Spec{uint(timeout_ms / 1000), uint(timeout_ms % 1000) * 1_000_000}
-		tsp = &ts
-	}
-	ret := intrinsics.syscall(linux.SYS_ppoll, uintptr(raw_data(fds)), uintptr(len(fds)), uintptr(tsp), 0, 0)
-	n, err := syscall_result(ret)
-	return i32(n), err
-}
-
 // A raw system call's return: the kernel reports an error as -1 to -4095.
 @(private)
 syscall_result :: proc "contextless" (ret: uintptr) -> (int, linux.Errno) {
@@ -245,16 +223,26 @@ poll_fd :: proc(fd: linux.Fd, events: Events, deadline: Tick) -> Wait_Result {
 		want += {.OUT}
 	}
 	for {
-		ms := i32(-1)
+		/*
+		`ppoll`, not `core:sys/linux`'s `poll`, which on arm64 builds the
+		`timespec` for `ppoll` from a negative timeout by casting it to unsigned:
+		"no timeout" becomes some 18 quadrillion seconds, which the kernel refuses
+		with EINVAL. A nil `timespec` is what `ppoll` takes for none, and it
+		serves both architectures.
+		*/
+		ts: linux.Time_Spec
+		tsp: ^linux.Time_Spec
 		if deadline != (Tick{}) {
 			left := time.tick_diff(tick_now(), deadline)
 			if left <= 0 {
 				return .Timeout
 			}
-			ms = ms_ceil(left, max(i32))
+			ms := ms_ceil(left, max(i32))
+			ts = linux.Time_Spec{uint(ms / 1000), uint(ms % 1000) * 1_000_000}
+			tsp = &ts
 		}
 		fds := [1]linux.Poll_Fd{{fd = fd, events = want}}
-		n, err := ppoll(fds[:], ms)
+		n, err := linux.ppoll(fds[:], tsp, nil)
 		if err == .EINTR {
 			continue
 		}

@@ -140,6 +140,9 @@ H2_Conn :: struct {
 
 Upstream :: struct {
 	spec:         config.Upstream_Spec,
+	// The `:authority` and `Host` a DoH request carries (`doh_authority`),
+	// built once from `spec`; empty for the other kinds.
+	authority:    string,
 	// Written by `resolve_endpoint` under `mu` and read through `endpoint_of`;
 	// `resolved`, once set, is never cleared, and is read with an acquire load.
 	endpoint:     net.Endpoint,
@@ -300,8 +303,20 @@ make_upstream :: proc(
 	err: Error,
 ) {
 	u = new(Upstream, allocator)
+	if u == nil {
+		return nil, .Out_Of_Memory
+	}
 	u.spec = clone_spec(spec, allocator)
 	u.allocator = allocator
+	if spec.kind == .HTTPS {
+		u.authority = doh_authority(u.spec.hostname, u.spec.url, allocator)
+		// Empty only when the formatting found no room: a DoH upstream with no
+		// authority would send an empty Host or `:authority` until a reload.
+		if u.authority == "" {
+			destroy(u)
+			return nil, .Out_Of_Memory
+		}
+	}
 	u.max_idle = max(max_idle, 0)
 	u.idle_timeout = idle_timeout
 	u.idle = make([dynamic]Idle_Conn, 0, max(max_idle, 1), allocator)
@@ -339,6 +354,7 @@ destroy :: proc(u: ^Upstream) {
 	teardown_h2(u)
 	tlsx.context_destroy(u.tls_ctx)
 	free_spec(u.spec, u.allocator)
+	delete(u.authority, u.allocator)
 	free(u, u.allocator)
 }
 
@@ -1193,7 +1209,8 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 
 	stale_h2 := take_idle_h2_locked(u, all)
 	// Reserved whole; with no room, all are left for the next sweep rather
-	// than retired under the lock, which a TLS close_notify would park on.
+	// than retired under the lock: retiring writes a GOAWAY under the h2
+	// client's own lock (`h2.client_goaway`), which can park.
 	drained, drained_listed := dns.alloc_list([dynamic]^H2_Conn, len(u.h2_draining), context.temp_allocator)
 	#reverse for hc, i in u.h2_draining {
 		if !drained_listed {

@@ -270,9 +270,9 @@ opens_connection :: proc(h: Frame_Header) -> bool {
 }
 
 /*
-The connection error a PING, SETTINGS or PRIORITY frame's shape draws, checked
-the same by both ends ahead of what the frame says (RFC 9113 sections 6.3, 6.5,
-6.7).
+The connection error a PING, SETTINGS, PRIORITY, RST_STREAM or GOAWAY frame's
+shape draws, checked the same by both ends ahead of what the frame says (RFC
+9113 sections 6.3, 6.4, 6.5, 6.7, 6.8).
 
 A PRIORITY of the wrong length is a stream error in 6.3, and is made a
 connection error here, which 5.4 allows ("An endpoint MAY choose to treat a
@@ -302,6 +302,13 @@ frame_shape_error :: proc(h: Frame_Header) -> (code: Error_Code, bad: bool) {
 		case h.stream_id == 0:
 			return .Protocol_Error, true
 		case h.length != PRIORITY_SIZE:
+			return .Frame_Size_Error, true
+		}
+	case .Rst_Stream:
+		switch {
+		case h.stream_id == 0:
+			return .Protocol_Error, true
+		case h.length != RST_STREAM_SIZE:
 			return .Frame_Size_Error, true
 		}
 	case .Goaway:
@@ -514,14 +521,17 @@ window for good, or seeing the connection end with no reason given.
 */
 
 @(private)
-rst_stream_frame :: proc(stream_id: u32, code: Error_Code) -> (f: [FRAME_HEADER_SIZE + 4]u8) {
-	put_frame_header(f[:], 4, .Rst_Stream, 0, stream_id)
+rst_stream_frame :: proc(stream_id: u32, code: Error_Code) -> (f: [FRAME_HEADER_SIZE + RST_STREAM_SIZE]u8) {
+	put_frame_header(f[:], RST_STREAM_SIZE, .Rst_Stream, 0, stream_id)
 	put_u32(f[FRAME_HEADER_SIZE:], u32(code))
 	return
 }
 
 // A GOAWAY's last stream id and error code, before any debug data (RFC 9113 6.8).
 GOAWAY_FIXED_SIZE :: 8
+
+// An RST_STREAM's payload: its error code alone (RFC 9113 6.4).
+RST_STREAM_SIZE :: 4
 
 @(private)
 goaway_frame :: proc(last_stream_id: u32, code: Error_Code) -> (f: [FRAME_HEADER_SIZE + GOAWAY_FIXED_SIZE]u8) {
