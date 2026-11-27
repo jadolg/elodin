@@ -76,18 +76,23 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   loaded is left out, and the other lists are built again without it (`list
   NAME: there is no memory to hold it; building the other lists without it`),
   as AdGuard Home goes on with the filters that load. Where one that loaded
-  before runs out, the lists that never loaded are left out first, to make
-  room (`list NAME: left out, to make room for the lists already in effect`).
-  A list is never in effect cut short. A build after the first downloads
-  nothing, reading the copies the first saved; a download that was being read
-  when memory ran out is not cached, and a download that runs out of memory
-  counts as a failed one, which the cached copy stands in for. The list says
-  why first (`list NAME: there is no memory to read "PATH"`, `list NAME: there
-  is no memory to read the cached copy`).
-- With no memory for the operator's own rules or for the rule sets themselves,
-  the load is dropped and the rules already in effect are kept (`filter: there
-  is no memory to build the rule sets; keeping the rules already in effect`, or
-  `...; no rules are in effect until a retry succeeds` where there are none).
+  before runs out, or the operator's own rules do, the lists that never loaded
+  are left out first, the last loaded first, to make room (`list NAME: left
+  out, to make room for the lists already in effect and the operator's
+  rules`). A list is never in effect cut short. A build after the first
+  downloads only the lists no earlier one reached, reading the copies the
+  earlier ones saved, and a list read that way keeps what its download found
+  (a copy standing in for a failed download is still stale). A download there
+  is no memory to fetch counts as a failed one, which the cached copy stands
+  in for; one fetched there is no memory to hold is not cached, and its list is
+  left out or holds the refresh back as above. The list says why first (`list
+  NAME: there is no memory to read "PATH"`, `list NAME: there is no memory to
+  read the cached copy`).
+- With no memory for the operator's own rules (and no list left to leave out)
+  or for the rule sets themselves, the load is dropped and the rules already
+  in effect are kept (`filter: there is no memory to build the rule sets;
+  keeping the rules already in effect`, or `...; no rules are in effect until
+  a retry succeeds` where there are none).
   With none to record which lists loaded, it is dropped too, unless no rule is
   in effect: then the sets are used, and the retry records them.
 - A refresh where some downloaded list is unavailable, or was served from its

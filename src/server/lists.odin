@@ -75,25 +75,30 @@ for destroying whatever that swap displaces. When `loads` is given it has one
 slot per list, `blocking.lists` then `blocking.allowlists`, and says how each
 one fared.
 
-A list `left_out` (by the same slots, when given) is not loaded, and is
-`.No_Memory` in `loads`. `whole` is false when there was no memory to build the
-sets whole: to read a list, or to hold a rule. The lists after the one that ran
-out, and the operator's rules, are not tried; the one that ran out is
-`.No_Memory` in `loads` and so is each not tried (`ran_out_of_memory` finds
-it). Both sets are nil when there is no memory to make them.
+`passes`, by the same slots when given, carries what earlier builds of one
+rebuild did (`List_Pass`): a list left out is not loaded and is `.No_Memory` in
+`loads`. `whole` is false when there was no memory to build the sets whole: to
+read a list, or to hold a rule. The lists after the one that ran out, and the
+operator's rules, are not tried; the one that ran out is `.No_Memory` in `loads`
+(`ran_out_of_memory` finds it). Both sets are nil when there is no memory to
+make them.
 */
 build_filter_sets :: proc(
 	cfg: ^config.Config,
 	allow_network: bool,
 	loads: []List_Load = nil,
-	left_out: []bool = nil,
+	passes: []List_Pass = nil,
 ) -> (
 	block, allow: ^filter.Set,
 	whole: bool,
 ) {
 	move_query_named_caches(cfg)
-	for &load in loads {
-		load = .No_Memory
+	for &load, i in loads {
+		// A list an earlier build read keeps what that one found until it is
+		// read again (`load_lists`).
+		if passes == nil || !passes[i].read || passes[i].left_out {
+			load = .No_Memory
+		}
 	}
 	block = filter.set_make()
 	allow = filter.set_make()
@@ -102,23 +107,51 @@ build_filter_sets :: proc(
 		filter.set_destroy(allow)
 		return nil, nil, false
 	}
-	whole = load_lists(cfg, block, allow, allow_network, loads, left_out) && add_operator_rules(cfg, block, allow)
+	whole = load_lists(cfg, block, allow, allow_network, loads, passes) && add_operator_rules(cfg, block, allow)
 	return
 }
 
-// Load every list not `left_out` into the sets, saying in `loads` how each
-// fared; false at the first that is `.No_Memory`.
+// What the builds of one rebuild have done with a list so far.
+List_Pass :: struct {
+	// There was no memory for it: it is not loaded again in this rebuild.
+	left_out: bool,
+	// An earlier build read it, downloading as that one could. A later one
+	// reads the copy it saved rather than download again, and keeps the load
+	// it found: a copy read again is not a download.
+	read:     bool,
+}
+
+/*
+Load every list not left out into the sets, saying in `loads` how each fared;
+false at the first that is `.No_Memory`. One no earlier build read downloads as
+`allow_network` says; one read before reads its copy, and keeps the load that
+read found where this one only reads that copy again: a download that did not
+fit, with an older copy that does, is `.Stale`.
+*/
 @(private)
-load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load, left_out: []bool) -> bool {
+load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load, passes: []List_Pass) -> bool {
 	lists := len(cfg.blocking.lists)
 	for i in 0 ..< lists + len(cfg.blocking.allow_lists) {
-		if left_out != nil && left_out[i] {
+		read := passes != nil && passes[i].read
+		if passes != nil && passes[i].left_out {
 			continue
 		}
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
-		load := load_one_list(cfg, list, block, allow, allow_network, i >= lists)
+		load := load_one_list(cfg, list, block, allow, allow_network && !read, i >= lists)
+		if read && loads != nil {
+			before := loads[i]
+			switch {
+			case load == .Current && before == .No_Memory:
+				load = .Stale
+			case load == .Current && (before == .Current || before == .Stale), load == .Unavailable && before == .Empty:
+				load = before
+			}
+		}
 		if loads != nil {
 			loads[i] = load
+		}
+		if passes != nil {
+			passes[i].read = true
 		}
 		if load == .No_Memory {
 			return false
@@ -128,12 +161,12 @@ load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network
 }
 
 // The slot of the list a build that was not whole ran out of memory on, or -1
-// when it ran out elsewhere: the first `.No_Memory` not `left_out`, since every
+// when it ran out elsewhere: the first `.No_Memory` not left out, since every
 // list before it was loaded.
 @(private)
-ran_out_of_memory :: proc(loads: []List_Load, left_out: []bool) -> int {
+ran_out_of_memory :: proc(loads: []List_Load, passes: []List_Pass) -> int {
 	for load, i in loads {
-		if load == .No_Memory && !left_out[i] {
+		if load == .No_Memory && !passes[i].left_out {
 			return i
 		}
 	}
@@ -856,12 +889,12 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 	lists := len(cfg.blocking.lists)
 	loads, lerr := make([]List_Load, lists + len(cfg.blocking.allow_lists))
 	defer delete(loads)
-	left_out, oerr := make([]bool, len(loads))
-	defer delete(left_out)
+	passes, perr := make([]List_Pass, len(loads))
+	defer delete(passes)
 	block, allow: ^filter.Set
 	whole: bool
-	if lerr == nil && oerr == nil {
-		block, allow, whole = build_what_fits(s, cfg, allow_network, loads, left_out)
+	if lerr == nil && perr == nil {
+		block, allow, whole = build_what_fits(s, cfg, allow_network, loads, passes)
 	} else {
 		warn_no_memory(s)
 	}
@@ -937,13 +970,13 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 /*
 Build the sets, leaving out each list there is no memory for that never loaded
 (`lists_loaded`) and building the others again without it, as AdGuard Home goes
-on with the filters that load. Where one that loaded before ran out, every list
-that never loaded is left out first, since those hold no rule in effect and may
-be what took the memory. `left_out` says which were. A build after the first
-downloads nothing, reading the copies the first one saved. Not `whole`, saying
-why, when one that loaded before ran out with none left to leave out, or the
-operator's rules or the sets themselves did; the sets are then the caller's to
-destroy.
+on with the filters that load. Where one that loaded before ran out, or the
+operator's rules did, a list that never loaded is left out first, the last one
+loaded, since those hold no rule in effect and may be what took the memory.
+`passes` says which were. A build after the first downloads only the lists no
+earlier one reached (`load_lists`). Not `whole`, saying why, when one that
+loaded before or the operator's rules ran out with no list left to leave out,
+or the sets themselves did; the sets are then the caller's to destroy.
 */
 @(private)
 build_what_fits :: proc(
@@ -951,28 +984,32 @@ build_what_fits :: proc(
 	cfg: ^config.Config,
 	allow_network: bool,
 	loads: []List_Load,
-	left_out: []bool,
+	passes: []List_Pass,
 ) -> (
 	block, allow: ^filter.Set,
 	whole: bool,
 ) {
 	lists := len(cfg.blocking.lists)
-	for network := allow_network; ; network = false {
-		block, allow, whole = build_filter_sets(cfg, network, loads, left_out)
+	for {
+		block, allow, whole = build_filter_sets(cfg, allow_network, loads, passes)
 		if whole || block == nil {
 			break
 		}
-		i := ran_out_of_memory(loads, left_out)
-		if i < 0 {
-			break
+		i := ran_out_of_memory(loads, passes)
+		list: config.Block_List
+		if i >= 0 {
+			list = cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
 		}
-		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
 		switch {
-		case !s.lists_loaded[list_key(list, i >= lists)]:
+		case i >= 0 && !s.lists_loaded[list_key(list, i >= lists)]:
 			logx.warnf("list %s: there is no memory to hold it; building the other lists without it", list.name)
-			left_out[i] = true
-		case !leave_out_new(s, cfg, loads, left_out):
+			passes[i].left_out = true
+		case leave_out_newest(s, cfg, loads, passes):
+		case i >= 0:
 			logx.warnf("list %s: loaded before and there is no memory to hold it now; keeping the rules already in effect", list.name)
+			return
+		case:
+			warn_no_memory(s)
 			return
 		}
 		filter.set_destroy(block)
@@ -985,23 +1022,24 @@ build_what_fits :: proc(
 }
 
 /*
-Leave out every list the last build loaded that has not loaded before, saying
-so, to make room for the ones that have; false when there was none.
+Leave out the last list the last build loaded that has not loaded before,
+saying so, to make room for the ones that have and the operator's own rules;
+false when there is none.
 */
 @(private)
-leave_out_new :: proc(s: ^Server, cfg: ^config.Config, loads: []List_Load, left_out: []bool) -> (any: bool) {
+leave_out_newest :: proc(s: ^Server, cfg: ^config.Config, loads: []List_Load, passes: []List_Pass) -> bool {
 	lists := len(cfg.blocking.lists)
-	for load, i in loads {
+	#reverse for load, i in loads {
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
 		// Only one that put rules in the sets takes memory from the others.
-		if (load != .Current && load != .Stale) || !list.enabled || s.lists_loaded[list_key(list, i >= lists)] {
+		if (load != .Current && load != .Stale) || passes[i].left_out || !list.enabled || s.lists_loaded[list_key(list, i >= lists)] {
 			continue
 		}
-		logx.warnf("list %s: left out, to make room for the lists already in effect", list.name)
-		left_out[i] = true
-		any = true
+		logx.warnf("list %s: left out, to make room for the lists already in effect and the operator's rules", list.name)
+		passes[i].left_out = true
+		return true
 	}
-	return
+	return false
 }
 
 /*

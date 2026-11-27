@@ -29,6 +29,10 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	defer filter.set_destroy(block)
 	allow := filter.set_make()
 	defer filter.set_destroy(allow)
+	// No memory for a set is no input's doing.
+	if block == nil || allow == nil {
+		return 0
+	}
 
 	_ = filter.parse_list(block, allow, text, format)
 	_ = filter.parse_rule(block, allow, text)
